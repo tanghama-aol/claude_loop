@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>多 Agent 任务台</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="shell">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">Agent Loop Console</p>
+                <h1>多 Agent 任务台</h1>
+            </div>
+            <div class="topbar-actions">
+                <span id="serverClock" class="clock">--:--:--</span>
+                <button class="ghost" type="button" data-refresh>刷新</button>
+            </div>
+        </header>
+
+        <aside class="rail">
+            <button class="nav active" type="button" data-view="dashboard">总览</button>
+            <button class="nav" type="button" data-view="profiles">Profiles</button>
+            <button class="nav" type="button" data-view="tasks">任务</button>
+            <button class="nav" type="button" data-view="editor">编辑</button>
+            <button class="nav" type="button" data-view="runtime">运行</button>
+            <button class="nav" type="button" data-view="settings">目录</button>
+        </aside>
+
+        <main class="workspace">
+            <section id="dashboard" class="view active">
+                <div class="metrics" id="metrics"></div>
+                <div class="split">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>任务状态</h2>
+                            <span class="hint">实时轮询</span>
+                        </div>
+                        <div id="taskBoard" class="task-board"></div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>事件流</h2>
+                            <span class="hint">最近 200 条</span>
+                        </div>
+                        <div id="eventFeed" class="event-feed"></div>
+                    </section>
+                </div>
+            </section>
+
+            <section id="profiles" class="view">
+                <div class="split wide-left">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>Agent Profiles</h2>
+                            <button class="ghost" type="button" id="newProfile">新建</button>
+                        </div>
+                        <div id="profileList" class="profile-list"></div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>Profile 配置</h2>
+                            <span class="hint">环境变量默认隐藏</span>
+                        </div>
+                        <form id="profileForm" class="form-grid">
+                            <input type="hidden" name="id">
+                            <label>
+                                名称
+                                <input name="name" required placeholder="claude-default">
+                            </label>
+                            <label>
+                                类型
+                                <select name="agentType">
+                                    <option value="claude">Claude</option>
+                                    <option value="codex">Codex</option>
+                                    <option value="gemini">Gemini</option>
+                                </select>
+                            </label>
+                            <label>
+                                运行命令
+                                <input name="command" required placeholder="claude">
+                            </label>
+                            <label>
+                                超时秒数
+                                <input name="timeoutSeconds" type="number" min="1" step="1" value="1800">
+                            </label>
+                            <label class="full">
+                                参数
+                                <input name="args" placeholder="--dangerously-skip-permissions -p {prompt}">
+                            </label>
+                            <label class="full sensitive-row">
+                                环境变量
+                                <textarea name="envText" rows="5" class="secret" placeholder="API_KEY=..."></textarea>
+                                <button class="mini" type="button" id="toggleEnv">显示/隐藏</button>
+                            </label>
+                            <label class="full">
+                                Prompt 模板
+                                <textarea name="promptTemplate" rows="8"></textarea>
+                            </label>
+                            <label class="checkline">
+                                <input name="enabled" type="checkbox" checked>
+                                启用
+                            </label>
+                            <label class="checkline">
+                                <input name="nonInteractive" type="checkbox" checked>
+                                非交互模式
+                            </label>
+                            <div class="form-actions full">
+                                <button type="submit">保存 Profile</button>
+                                <button class="ghost" type="button" id="duplicateProfile">复制</button>
+                                <button class="danger" type="button" id="deleteProfile">删除</button>
+                            </div>
+                        </form>
+                    </section>
+                </div>
+            </section>
+
+            <section id="tasks" class="view">
+                <div class="split wide-right">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>创建任务</h2>
+                            <span class="hint">生成 Markdown 目标文件</span>
+                        </div>
+                        <form id="taskForm" class="form-grid single">
+                            <label>
+                                标题
+                                <input name="title" required placeholder="P3-真实笔顺评分">
+                            </label>
+                            <label>
+                                目标文件名
+                                <input name="targetFileName" placeholder="P3-真实笔顺评分.md">
+                            </label>
+                            <label>
+                                工作目录
+                                <select name="directory"></select>
+                            </label>
+                            <label>
+                                拆解 Profile
+                                <select name="decomposeProfileId"></select>
+                            </label>
+                            <label class="full">
+                                任务需求
+                                <textarea name="requirement" rows="13" required placeholder="输入原始需求，系统会生成可编辑的任务目标文件。"></textarea>
+                            </label>
+                            <button type="submit">生成任务文件</button>
+                        </form>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>任务列表</h2>
+                            <span id="taskCount" class="hint">0 个任务</span>
+                        </div>
+                        <div id="taskList" class="task-list"></div>
+                    </section>
+                </div>
+            </section>
+
+            <section id="editor" class="view">
+                <section class="panel editor-panel">
+                    <div class="panel-head">
+                        <div>
+                            <h2>目标文件编辑</h2>
+                            <p id="editorPath" class="pathline">未选择任务</p>
+                        </div>
+                        <div class="inline-actions">
+                            <select id="editorTask"></select>
+                            <button type="button" id="loadFile">载入</button>
+                            <button type="button" id="saveFile">保存</button>
+                        </div>
+                    </div>
+                    <textarea id="fileEditor" class="file-editor" spellcheck="false"></textarea>
+                </section>
+            </section>
+
+            <section id="runtime" class="view">
+                <div class="split wide-left">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>运行控制</h2>
+                            <span class="hint">任务互相隔离</span>
+                        </div>
+                        <div class="control-stack">
+                            <label>
+                                任务
+                                <select id="runTask"></select>
+                            </label>
+                            <label>
+                                执行 Profile
+                                <select id="runProfile"></select>
+                            </label>
+                            <div class="button-row">
+                                <button type="button" id="startTask">启动</button>
+                                <button class="ghost" type="button" id="decomposeTask">拆解</button>
+                                <button class="danger" type="button" id="stopTask">停止</button>
+                            </div>
+                            <div id="runDetail" class="run-detail"></div>
+                        </div>
+                    </section>
+                    <section class="panel log-panel">
+                        <div class="panel-head">
+                            <h2>运行日志</h2>
+                            <button class="ghost" type="button" id="copyLog">复制</button>
+                        </div>
+                        <pre id="logView" class="log-view"></pre>
+                    </section>
+                </div>
+            </section>
+
+            <section id="settings" class="view">
+                <div class="split">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>工作目录</h2>
+                            <span class="hint">任务只能选择已配置目录</span>
+                        </div>
+                        <form id="directoryForm" class="directory-form">
+                            <input name="directory" required placeholder="/home/user/project">
+                            <button type="submit">添加目录</button>
+                        </form>
+                        <div id="directoryList" class="directory-list"></div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-head">
+                            <h2>安全边界</h2>
+                        </div>
+                        <ul class="rules">
+                            <li>命令以非 shell 模式启动，参数来自 Profile 配置。</li>
+                            <li>任务文件只能写入任务选择的工作目录。</li>
+                            <li>每个任务拥有独立日志、状态和进程控制。</li>
+                            <li>高风险参数需要显式写入 Profile。</li>
+                        </ul>
+                    </section>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+    <script src="/app.js"></script>
+</body>
+</html>

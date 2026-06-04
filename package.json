@@ -1,0 +1,17 @@
+{
+  "name": "claude_loop",
+  "version": "1.0.0",
+  "description": "Web console for looping Claude, Codex, and Gemini agents over Markdown task files.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check public/app.js && node --check lib/core.js"
+  },
+  "keywords": [
+    "agent",
+    "automation",
+    "task-runner"
+  ],
+  "license": "MIT"
+}

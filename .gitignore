@@ -1,0 +1,11 @@
+.claude-loop-data/
+.agents/
+.codex/
+.git/
+.gitrepo/
+.omc/
+node_modules/
+npm-debug.log*
+.DS_Store
+*.log
+coverage/
