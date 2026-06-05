@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TASK_FILE="P3-真实笔顺评分.md"
+TASK_FILE="claude_loop_task.md"
 PROMPT="1.从 ${TASK_FILE} 获取一条任务进行工作，完成后将任务标记为完成，不要启动子agent，直接在主agent中完成，成功完成后修改 ${TASK_FILE}，失败则不修改，输出错误。
 2.如果任务完成，则输出\"任务完成\"
 3.如果目标文件中任务全部完成，输出\"全部任务完成\""

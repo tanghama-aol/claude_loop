@@ -97,6 +97,16 @@ textarea {
     outline: none;
 }
 
+select[multiple] {
+    min-height: 126px;
+    padding: 6px;
+}
+
+select[multiple] option {
+    border-radius: 4px;
+    padding: 6px 8px;
+}
+
 textarea {
     resize: vertical;
     line-height: 1.55;
@@ -329,6 +339,14 @@ label {
     gap: 10px;
 }
 
+.task-actions {
+    display: flex;
+    align-items: center;
+    justify-content: end;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 .task-title,
 .profile-title {
     margin: 0;
@@ -359,17 +377,25 @@ label {
     white-space: nowrap;
 }
 
-.badge.running {
+.badge.running,
+.badge.agent_running {
     color: #fff;
     border-color: var(--green);
     background: var(--green);
 }
 
 .badge.retry_wait,
-.badge.completed {
+.badge.completed,
+.badge.idle_waiting {
     color: #201408;
     border-color: var(--amber);
     background: #ffd58d;
+}
+
+.badge.loop_not_started {
+    color: var(--ink);
+    border-color: var(--line);
+    background: var(--steel);
 }
 
 .badge.all_done {
@@ -494,6 +520,26 @@ textarea.secret.revealed {
 }
 
 .detail-row span:last-child {
+    overflow-wrap: anywhere;
+}
+
+.detail-row-block {
+    grid-template-columns: 1fr;
+}
+
+.detail-pre {
+    max-height: 220px;
+    margin: 0;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px;
+    color: var(--ink);
+    background: #fffefa;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 

@@ -2,9 +2,13 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
+    CODEX_AUTO_CONFIRM_FLAG,
+    configEnvForProfile,
+    createDefaultProfiles,
     fillTemplate,
     generateTaskMarkdown,
     maskEnvText,
+    nextProfileId,
     parseArgs,
     parseEnvText,
     safeTaskFileName,
@@ -29,6 +33,25 @@ test("fillTemplate replaces supported placeholder formats", () => {
     assert.equal(result, "file=tasks.md; cn=tasks.md; prompt=hello");
 });
 
+test("nextProfileId rotates through configured profiles", () => {
+    assert.equal(nextProfileId("a", ["a", "b", "c"]), "b");
+    assert.equal(nextProfileId("c", ["a", "b", "c"]), "a");
+    assert.equal(nextProfileId("missing", ["a", "b"]), "a");
+});
+
+test("configEnvForProfile maps agent config directories", () => {
+    assert.deepEqual(configEnvForProfile({ agentType: "claude", configDirectory: "/tmp/claude" }), {
+        CLAUDE_CONFIG_DIR: "/tmp/claude",
+    });
+    assert.deepEqual(configEnvForProfile({ agentType: "codex", configDirectory: "/tmp/codex" }), {
+        CODEX_HOME: "/tmp/codex",
+    });
+    assert.deepEqual(configEnvForProfile({ agentType: "gemini", configDirectory: "/tmp/gemini" }), {
+        GEMINI_CONFIG_DIR: "/tmp/gemini",
+        GEMINI_CLI_HOME: "/tmp/gemini",
+    });
+});
+
 test("safeTaskFileName strips path traversal and adds markdown extension", () => {
     assert.equal(safeTaskFileName("../P3-真实笔顺评分"), "P3-真实笔顺评分.md");
 });
@@ -50,4 +73,10 @@ test("generateTaskMarkdown creates editable checklist", () => {
     assert.match(content, /^# Web 应用/);
     assert.match(content, /- \[ \] 1\. 实现 Profile 管理/);
     assert.match(content, /完成标准/);
+});
+
+test("default codex profile bypasses confirmations", () => {
+    const codexProfile = createDefaultProfiles("/tmp/project").find((profile) => profile.id === "profile_codex_default");
+    assert.ok(codexProfile);
+    assert.match(codexProfile.args, new RegExp(CODEX_AUTO_CONFIRM_FLAG));
 });

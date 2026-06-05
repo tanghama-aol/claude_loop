@@ -89,6 +89,10 @@
                                 参数
                                 <input name="args" placeholder="--dangerously-skip-permissions -p {prompt}">
                             </label>
+                            <label class="full">
+                                配置目录
+                                <input name="configDirectory" placeholder="/home/user/.claude">
+                            </label>
                             <label class="full sensitive-row">
                                 环境变量
                                 <textarea name="envText" rows="5" class="secret" placeholder="API_KEY=..."></textarea>
@@ -140,6 +144,10 @@
                                 拆解 Profile
                                 <select name="decomposeProfileId"></select>
                             </label>
+                            <label>
+                                执行 Profiles
+                                <select name="runProfileIds" multiple size="4"></select>
+                            </label>
                             <label class="full">
                                 任务需求
                                 <textarea name="requirement" rows="13" required placeholder="输入原始需求，系统会生成可编辑的任务目标文件。"></textarea>
@@ -187,8 +195,12 @@
                                 <select id="runTask"></select>
                             </label>
                             <label>
-                                执行 Profile
-                                <select id="runProfile"></select>
+                                执行 Profiles
+                                <select id="runProfiles" multiple size="5"></select>
+                            </label>
+                            <label>
+                                拆解 Profile
+                                <select id="decomposeProfile"></select>
                             </label>
                             <div class="button-row">
                                 <button type="button" id="startTask">启动</button>
