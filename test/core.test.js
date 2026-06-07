@@ -2,7 +2,9 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
+    ALL_DONE_MARKER,
     CODEX_AUTO_CONFIRM_FLAG,
+    DEFAULT_RUN_PROMPT,
     configEnvForProfile,
     createDefaultProfiles,
     fillTemplate,
@@ -31,6 +33,18 @@ test("fillTemplate replaces supported placeholder formats", () => {
         prompt: "hello",
     });
     assert.equal(result, "file=tasks.md; cn=tasks.md; prompt=hello");
+});
+
+test("fillTemplate preserves dollar signs in replacement values", () => {
+    const result = fillTemplate("{prompt}", {
+        prompt: "literal $$ value",
+    });
+    assert.equal(result, "literal $$ value");
+});
+
+test("default run prompt uses the command-safe all-done marker", () => {
+    assert.equal(ALL_DONE_MARKER, "GGGG全部完成GGGG");
+    assert.match(DEFAULT_RUN_PROMPT, /GGGG全部完成GGGG/);
 });
 
 test("nextProfileId rotates through configured profiles", () => {

@@ -125,7 +125,7 @@
                     <section class="panel">
                         <div class="panel-head">
                             <h2>创建任务</h2>
-                            <span class="hint">生成 Markdown 目标文件</span>
+                            <span class="hint">Markdown 目标文件</span>
                         </div>
                         <form id="taskForm" class="form-grid single">
                             <label>
@@ -141,18 +141,35 @@
                                 <select name="directory"></select>
                             </label>
                             <label>
-                                拆解 Profile
+                                任务来源
+                                <select name="sourceMode" id="taskSourceMode">
+                                    <option value="agent">Agent 生成</option>
+                                    <option value="existing">使用工作目录文件</option>
+                                    <option value="upload">从电脑选择文件</option>
+                                </select>
+                            </label>
+                            <div id="taskSourceHelp" class="source-mode-help full" aria-live="polite"></div>
+                            <label class="task-generation-field">
+                                生成 Profile
                                 <select name="decomposeProfileId"></select>
                             </label>
                             <label>
                                 执行 Profiles
                                 <select name="runProfileIds" multiple size="4"></select>
                             </label>
+                            <label class="full task-upload-field" hidden>
+                                选择文件
+                                <input name="sourceFile" type="file" accept=".md,.markdown,text/markdown,text/plain">
+                            </label>
                             <label class="full">
                                 任务需求
-                                <textarea name="requirement" rows="13" required placeholder="输入原始需求，系统会生成可编辑的任务目标文件。"></textarea>
+                                <textarea name="requirement" rows="13" required placeholder="输入原始需求，生成 Profile 会创建可编辑的任务目标文件。"></textarea>
                             </label>
-                            <button type="submit">生成任务文件</button>
+                            <label class="checkline full task-overwrite-field">
+                                <input name="overwrite" type="checkbox">
+                                覆盖同名文件
+                            </label>
+                            <button type="submit" id="taskSubmitButton">调用 Agent 生成</button>
                         </form>
                     </section>
                     <section class="panel">
@@ -199,12 +216,12 @@
                                 <select id="runProfiles" multiple size="5"></select>
                             </label>
                             <label>
-                                拆解 Profile
+                                生成 Profile
                                 <select id="decomposeProfile"></select>
                             </label>
                             <div class="button-row">
                                 <button type="button" id="startTask">启动</button>
-                                <button class="ghost" type="button" id="decomposeTask">拆解</button>
+                                <button class="ghost" type="button" id="decomposeTask">生成目标文件</button>
                                 <button class="danger" type="button" id="stopTask">停止</button>
                             </div>
                             <div id="runDetail" class="run-detail"></div>

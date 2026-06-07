@@ -443,6 +443,17 @@ label {
     grid-column: 1 / -1;
 }
 
+.source-mode-help {
+    margin-top: -6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: var(--muted);
+    background: #fffefa;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
 .checkline {
     display: flex;
     align-items: center;

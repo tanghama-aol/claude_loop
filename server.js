@@ -6,11 +6,14 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const {
+    ALL_DONE_MARKER,
     CODEX_AUTO_CONFIRM_FLAG,
-    DEFAULT_DECOMPOSE_PROMPT,
+    DEFAULT_GENERATE_PROMPT,
     DEFAULT_CODEX_ARGS,
     DEFAULT_RUN_PROMPT,
+    LEGACY_ALL_DONE_MARKERS,
     LEGACY_CODEX_ARGS,
+    LEGACY_RUN_PROMPT,
     configEnvForProfile,
     createDefaultProfiles,
     fillTemplate,
@@ -88,6 +91,7 @@ function createApp(options = {}) {
             && String(normalized.command || "") === "codex"
             && String(normalized.args || "") === LEGACY_CODEX_ARGS;
         if (isLegacyDefaultCodex) normalized.args = DEFAULT_CODEX_ARGS;
+        if (normalized.promptTemplate === LEGACY_RUN_PROMPT) normalized.promptTemplate = DEFAULT_RUN_PROMPT;
         return normalized;
     }
 
@@ -296,6 +300,23 @@ function createApp(options = {}) {
         return filePath;
     }
 
+    function normalizeTaskSourceMode(value, body = {}) {
+        if (body.loadExisting === true) return "existing";
+        const mode = String(value || "").trim().toLowerCase();
+        if (["agent", "existing", "upload", "template"].includes(mode)) return mode;
+        return "agent";
+    }
+
+    function buildTaskGenerationPrompt(task) {
+        return fillTemplate(DEFAULT_GENERATE_PROMPT, {
+            targetFile: task.targetFileName,
+            taskFile: task.targetFileName,
+            requirement: task.requirement,
+            title: task.title,
+            workingDirectory: task.directory,
+        });
+    }
+
     function appendTaskLog(task, message) {
         if (!task.logFile) return;
         const logPath = path.join(logDir, task.logFile);
@@ -310,6 +331,117 @@ function createApp(options = {}) {
         return JSON.stringify(value);
     }
 
+    function stripCommandQuotes(command) {
+        const value = String(command || "").trim();
+        if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) {
+            return value.slice(1, -1);
+        }
+        return value;
+    }
+
+    function windowsPathValue(env) {
+        const keys = Object.keys(env || {}).filter((name) => name.toLowerCase() === "path");
+        const key = keys[keys.length - 1];
+        return key ? String(env[key] || "") : "";
+    }
+
+    function windowsCommandCandidates(command) {
+        const ext = path.extname(command).toLowerCase();
+        if (ext === ".cmd") {
+            return [`${command.slice(0, -4)}.ps1`, command];
+        }
+        if (ext) return [command];
+        return [".exe", ".ps1", ".cmd", ".bat", ".com", ""].map((suffix) => `${command}${suffix}`);
+    }
+
+    function resolveWindowsCommandPath(command, env, cwd) {
+        const commandText = stripCommandQuotes(command);
+        if (process.platform !== "win32" || !commandText) return commandText;
+
+        const isPathLike = /[\\/]/.test(commandText);
+        const directories = [];
+        if (isPathLike) {
+            const directory = path.dirname(commandText);
+            directories.push(path.resolve(cwd || rootDir, directory));
+        } else {
+            directories.push(path.dirname(process.execPath));
+            directories.push(...windowsPathValue(env).split(path.delimiter));
+        }
+
+        const seenDirectories = new Set();
+        for (const rawDirectory of directories) {
+            if (!rawDirectory) continue;
+            const directory = path.resolve(cwd || rootDir, rawDirectory);
+            const key = directory.toLowerCase();
+            if (seenDirectories.has(key)) continue;
+            seenDirectories.add(key);
+
+            const baseName = isPathLike ? path.basename(commandText) : commandText;
+            for (const candidate of windowsCommandCandidates(baseName)) {
+                const filePath = path.join(directory, candidate);
+                if (safeStat(filePath)?.isFile()) return filePath;
+            }
+        }
+
+        return commandText;
+    }
+
+    function powershellHostPath() {
+        const systemRoot = process.env.SystemRoot || "C:\\Windows";
+        const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        return safeStat(powershell)?.isFile() ? powershell : "powershell.exe";
+    }
+
+    function quoteCmdArgument(value) {
+        const text = String(value ?? "").replace(/\r?\n/g, " ");
+        if (!text) return "\"\"";
+        return `"${text.replace(/"/g, "\\\"").replace(/%/g, "%%")}"`;
+    }
+
+    function prepareSpawnSpecForPlatform(spawnSpec, env, cwd) {
+        if (spawnSpec.platformPrepared) return spawnSpec;
+        if (process.platform !== "win32") return spawnSpec;
+
+        const resolvedCommand = resolveWindowsCommandPath(spawnSpec.command, env, cwd);
+        const ext = path.extname(resolvedCommand).toLowerCase();
+        if (ext === ".ps1") {
+            const command = powershellHostPath();
+            const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", resolvedCommand, ...spawnSpec.args];
+            return {
+                command,
+                args,
+                summary: [command, ...args].map(quoteCommandArg).join(" ").trim(),
+                platformPrepared: true,
+            };
+        }
+        if (ext === ".cmd" || ext === ".bat") {
+            const command = process.env.ComSpec || "cmd.exe";
+            const line = [resolvedCommand, ...spawnSpec.args].map(quoteCmdArgument).join(" ");
+            const args = ["/d", "/s", "/c", line];
+            return {
+                command,
+                args,
+                summary: [command, ...args].map(quoteCommandArg).join(" ").trim(),
+                platformPrepared: true,
+            };
+        }
+
+        return {
+            command: resolvedCommand,
+            args: spawnSpec.args,
+            summary: [resolvedCommand, ...spawnSpec.args].map(quoteCommandArg).join(" ").trim(),
+            platformPrepared: true,
+        };
+    }
+
+    function environmentForProfile(profile) {
+        return {
+            ...process.env,
+            ...parseEnvText(profile.envText || ""),
+            ...configEnvForProfile(profile),
+        };
+    }
+
     function formatOutputChunk(stream, text) {
         const normalized = String(text || "").replace(/\s+$/g, "");
         if (!normalized) return `${stream}: <empty chunk>`;
@@ -317,6 +449,11 @@ function createApp(options = {}) {
             .split(/\r?\n/)
             .map((line) => `${stream}: ${line}`)
             .join("\n");
+    }
+
+    function isAllDoneOutput(output) {
+        const text = String(output || "");
+        return [ALL_DONE_MARKER, ...LEGACY_ALL_DONE_MARKERS].some((marker) => marker && text.includes(marker));
     }
 
     function profileConfigDescription(profile) {
@@ -342,7 +479,8 @@ function createApp(options = {}) {
     }
 
     function isCodexCommand(profile) {
-        return path.basename(String(profile.command || "")).toLowerCase() === "codex";
+        const baseName = path.basename(stripCommandQuotes(profile.command || "")).toLowerCase();
+        return baseName === "codex" || baseName === "codex.exe" || baseName === "codex.cmd" || baseName === "codex.ps1";
     }
 
     function addNonInteractiveArgs(profile, args) {
@@ -366,29 +504,46 @@ function createApp(options = {}) {
         });
         if (!hasPrompt) renderedArgs.push("-p", prompt);
         return {
-            command: profile.command,
+            command: stripCommandQuotes(profile.command),
             args: renderedArgs,
-            summary: [profile.command, ...renderedArgs].map(quoteCommandArg).join(" ").trim(),
+            summary: [stripCommandQuotes(profile.command), ...renderedArgs].map(quoteCommandArg).join(" ").trim(),
         };
     }
 
     function runProfileCommand({ profile, task, prompt, spawnSpec = null, onOutput = () => {}, onLifecycle = null }) {
         return new Promise((resolve) => {
-            const actualSpawnSpec = spawnSpec || buildSpawn(profile, prompt);
-            const env = {
-                ...process.env,
-                ...parseEnvText(profile.envText || ""),
-                ...configEnvForProfile(profile),
-            };
+            const env = environmentForProfile(profile);
+            const actualSpawnSpec = prepareSpawnSpecForPlatform(spawnSpec || buildSpawn(profile, prompt), env, task.directory);
             const timeoutMs = Math.max(1, Number(profile.timeoutSeconds || 1800)) * 1000;
             const startedAt = Date.now();
             const processStartedAt = nowISO();
-            const child = childProcess.spawn(actualSpawnSpec.command, actualSpawnSpec.args, {
-                cwd: task.directory,
-                env,
-                shell: false,
-                stdio: ["ignore", "pipe", "pipe"],
-            });
+            let child;
+            try {
+                child = childProcess.spawn(actualSpawnSpec.command, actualSpawnSpec.args, {
+                    cwd: task.directory,
+                    env,
+                    shell: false,
+                    stdio: ["ignore", "pipe", "pipe"],
+                });
+            } catch (error) {
+                const message = error?.message || String(error);
+                if (onLifecycle) onLifecycle(`Agent 启动错误：${message}`);
+                onOutput(message, "error");
+                resolve({
+                    exitCode: 127,
+                    signal: null,
+                    timedOut: false,
+                    output: `\n${message}`,
+                    commandSummary: actualSpawnSpec.summary,
+                    durationMs: Date.now() - startedAt,
+                    firstOutputAt: null,
+                    lastOutputAt: nowISO(),
+                    outputChunks: 1,
+                    stderrBytes: 0,
+                    stdoutBytes: 0,
+                });
+                return;
+            }
             const runner = runners.get(task.id);
             if (runner) {
                 runner.child = child;
@@ -509,6 +664,122 @@ function createApp(options = {}) {
         });
     }
 
+    async function runTaskFileGeneration(taskId, profileId, options = {}) {
+        const requireNonEmpty = options.requireNonEmpty !== false;
+        let state = loadState();
+        let task = findTask(state, taskId);
+        if (!task) {
+            const error = new Error("任务不存在");
+            error.statusCode = 404;
+            throw error;
+        }
+        const profile = findProfile(state, profileId || task.decomposeProfileId);
+        if (!profile) {
+            const error = new Error("请选择可用的生成 Profile");
+            error.statusCode = 400;
+            throw error;
+        }
+
+        const beforeHash = fileHash(task.filePath);
+        const prompt = buildTaskGenerationPrompt(task);
+        let spawnSpec = null;
+        try {
+            spawnSpec = prepareSpawnSpecForPlatform(buildSpawn(profile, prompt), environmentForProfile(profile), task.directory);
+        } catch (error) {
+            task.status = STATUS.failed;
+            task.lastOutput = error.message;
+            task.updatedAt = nowISO();
+            addEvent(state, "failed", task.id, `生成启动失败：${error.message}`);
+            saveState(state);
+            appendTaskLog(task, `生成启动失败：${error.message}`);
+            error.statusCode = 400;
+            throw error;
+        }
+
+        task.status = STATUS.running;
+        task.nextRunAt = null;
+        task.lastPrompt = prompt;
+        task.lastCommand = spawnSpec.summary;
+        task.lastProfileId = profile.id;
+        task.lastProfileName = profile.name;
+        task.lastProfileAgentType = profile.agentType;
+        task.decomposeProfileId = profile.id;
+        task.updatedAt = nowISO();
+        saveState(state);
+
+        appendTaskLog(task, [
+            `开始生成目标文件：${profile.name} (${profile.agentType})`,
+            profileConfigDescription(profile),
+            `工作目录：${task.directory}`,
+            `命令：${spawnSpec.summary}`,
+            promptBlock(prompt),
+        ].join("\n"));
+
+        const result = await runProfileCommand({
+            profile,
+            task,
+            prompt,
+            spawnSpec,
+            onLifecycle: (message) => appendTaskLog(task, `generate ${message}`),
+            onOutput: (text, stream) => appendTaskLog(task, formatOutputChunk(`generate ${stream}`, text)),
+        });
+
+        state = loadState();
+        task = findTask(state, taskId);
+        if (!task) {
+            return { ok: false, failed: true, result, task: null };
+        }
+
+        const stat = safeStat(task.filePath);
+        const content = stat?.isFile() ? fs.readFileSync(task.filePath, "utf8") : "";
+        const afterHash = fileHash(task.filePath);
+        const fileMissing = !stat?.isFile();
+        const fileEmpty = requireNonEmpty && content.trim().length === 0;
+        const failed = result.exitCode !== 0 || fileMissing || fileEmpty;
+
+        task.status = failed ? STATUS.failed : STATUS.notStarted;
+        task.nextRunAt = null;
+        task.lastExitCode = result.exitCode;
+        task.lastOutput = result.output.slice(-4000);
+        task.lastCommand = result.commandSummary;
+        task.lastPrompt = prompt;
+        task.lastProfileId = profile.id;
+        task.lastProfileName = profile.name;
+        task.lastProfileAgentType = profile.agentType;
+        task.lastOutputAt = result.lastOutputAt || null;
+        task.lastRunDurationMs = result.durationMs;
+        task.lastOutputChunks = result.outputChunks;
+        task.lastStdoutBytes = result.stdoutBytes;
+        task.lastStderrBytes = result.stderrBytes;
+        task.decomposeProfileId = profile.id;
+        task.fileMtime = stat?.mtime?.toISOString() || null;
+        task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
+        task.updatedAt = nowISO();
+
+        if (failed) {
+            const reason = result.exitCode !== 0
+                ? `exitCode=${result.exitCode ?? "-"}`
+                : fileMissing
+                    ? "目标文件未生成"
+                    : "目标文件为空";
+            addEvent(state, "failed", task.id, `生成目标文件失败：${reason}`);
+            appendTaskLog(task, `生成目标文件失败：${reason}`);
+        } else {
+            const changed = beforeHash !== afterHash ? "已更新" : "未检测到内容变化";
+            addEvent(state, "generate", task.id, `生成目标文件完成：${task.title}`);
+            appendTaskLog(task, `生成目标文件完成：${changed}`);
+        }
+        saveState(state);
+
+        return {
+            ok: !failed,
+            failed,
+            fileChanged: beforeHash !== afterHash,
+            result,
+            task,
+        };
+    }
+
     function scheduleNext(taskId, delayMs) {
         const runner = runners.get(taskId);
         if (!runner || runner.stopped) return;
@@ -556,7 +827,7 @@ function createApp(options = {}) {
         let spawnSpec = null;
         try {
             prompt = buildPrompt(profile, task);
-            spawnSpec = buildSpawn(profile, prompt);
+            spawnSpec = prepareSpawnSpecForPlatform(buildSpawn(profile, prompt), environmentForProfile(profile), task.directory);
         } catch (error) {
             task.status = STATUS.failed;
             task.lastOutput = error.message;
@@ -635,13 +906,13 @@ function createApp(options = {}) {
             return;
         }
 
-        if (output.includes("全部任务完成")) {
+        if (isAllDoneOutput(output)) {
             task.status = STATUS.allDone;
             task.nextRunAt = null;
             task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
             addEvent(state, "all_done", taskId, "目标文件中任务全部完成");
             saveState(state);
-            appendTaskLog(task, "全部任务完成，停止循环");
+            appendTaskLog(task, "全部完成，停止循环");
             runners.delete(taskId);
             return;
         }
@@ -830,12 +1101,9 @@ function createApp(options = {}) {
             const directory = resolveDirectory(state, body.directory || rootDir);
             const title = String(body.title || "任务目标").trim();
             const requirement = String(body.requirement || "").trim();
+            const sourceMode = normalizeTaskSourceMode(body.sourceMode, body);
             const targetFileName = safeTaskFileName(body.targetFileName || `${title}.md`);
             const filePath = resolveTaskFile(directory, targetFileName);
-            if (safeStat(filePath) && body.overwrite !== true) {
-                sendJson(response, 409, { error: "目标任务文件已存在，请换一个文件名或确认覆盖" });
-                return;
-            }
             const explicitRunProfileIds = normalizeProfileIdList(body.runProfileIds);
             const requestedRunProfileIds = explicitRunProfileIds.length
                 ? explicitRunProfileIds
@@ -845,15 +1113,49 @@ function createApp(options = {}) {
                 sendJson(response, 400, { error: "请选择可用的执行 Profile" });
                 return;
             }
-            fs.writeFileSync(filePath, generateTaskMarkdown({ title, requirement }), "utf8");
+            const generationProfile = sourceMode === "agent" ? findProfile(state, body.decomposeProfileId || runProfileIds[0]) : null;
+            if (sourceMode === "agent" && !generationProfile) {
+                sendJson(response, 400, { error: "请选择可用的生成 Profile" });
+                return;
+            }
+            if (sourceMode === "agent" && !requirement) {
+                sendJson(response, 400, { error: "Agent 生成模式需要填写任务需求" });
+                return;
+            }
+
+            const existingStat = safeStat(filePath);
+            const hasExistingFile = Boolean(existingStat?.isFile());
+            if (sourceMode === "existing") {
+                if (!hasExistingFile) {
+                    sendJson(response, 400, { error: "目标任务文件不存在，无法载入" });
+                    return;
+                }
+            } else if (hasExistingFile && body.overwrite !== true) {
+                sendJson(response, 409, { error: "目标任务文件已存在，请换一个文件名或确认覆盖" });
+                return;
+            }
+
+            if (sourceMode === "upload") {
+                if (!Object.prototype.hasOwnProperty.call(body, "sourceContent")) {
+                    sendJson(response, 400, { error: "请先选择要导入的任务目标文件" });
+                    return;
+                }
+                fs.writeFileSync(filePath, String(body.sourceContent ?? ""), "utf8");
+            } else if (sourceMode === "template") {
+                fs.writeFileSync(filePath, generateTaskMarkdown({ title, requirement }), "utf8");
+            } else if (sourceMode === "agent") {
+                fs.writeFileSync(filePath, "", "utf8");
+            }
+
             const task = {
                 id: makeId("task"),
                 title,
                 requirement,
+                sourceMode,
                 targetFileName,
                 filePath,
                 directory,
-                decomposeProfileId: body.decomposeProfileId || "",
+                decomposeProfileId: generationProfile?.id || body.decomposeProfileId || "",
                 runProfileId: runProfileIds[0] || "",
                 runProfileIds,
                 status: STATUS.notStarted,
@@ -869,9 +1171,32 @@ function createApp(options = {}) {
                 updatedAt: nowISO(),
             };
             state.tasks.unshift(task);
-            addEvent(state, "task", task.id, `创建任务：${task.title}`);
+            const createMessages = {
+                agent: `创建任务并准备 Agent 生成：${task.title}`,
+                existing: `载入任务文件：${task.title}`,
+                upload: `导入任务文件：${task.title}`,
+                template: `创建任务：${task.title}`,
+            };
+            addEvent(state, "task", task.id, createMessages[sourceMode] || `创建任务：${task.title}`);
             saveState(state);
-            appendTaskLog(task, `创建任务文件：${filePath}`);
+            appendTaskLog(task, `${createMessages[sourceMode] || "创建任务"}\n目标文件：${filePath}`);
+
+            if (sourceMode === "agent") {
+                const generation = await runTaskFileGeneration(task.id, generationProfile.id);
+                sendJson(response, 200, {
+                    ok: generation.ok,
+                    task: generation.task || task,
+                    generation: {
+                        ok: generation.ok,
+                        failed: generation.failed,
+                        exitCode: generation.result.exitCode,
+                        fileChanged: generation.fileChanged,
+                        output: generation.result.output,
+                    },
+                });
+                return;
+            }
+
             sendJson(response, 200, { ok: true, task });
             return;
         }
@@ -993,62 +1318,24 @@ function createApp(options = {}) {
             return;
         }
 
-        const decomposeMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/decompose$/);
-        if (method === "POST" && decomposeMatch) {
+        const generateMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/(?:decompose|generate)$/);
+        if (method === "POST" && generateMatch) {
             const body = await readJson(request);
             const state = loadState();
-            const task = findTask(state, decodeURIComponent(decomposeMatch[1]));
+            const task = findTask(state, decodeURIComponent(generateMatch[1]));
             if (!task) {
                 sendJson(response, 404, { error: "任务不存在" });
                 return;
             }
-            const profile = findProfile(state, body.profileId || task.decomposeProfileId);
-            if (!profile) {
-                sendJson(response, 400, { error: "请选择可用的拆解 Profile" });
-                return;
-            }
-            const prompt = fillTemplate(DEFAULT_DECOMPOSE_PROMPT, {
-                targetFile: task.targetFileName,
-                taskFile: task.targetFileName,
-                requirement: task.requirement,
-                title: task.title,
-                workingDirectory: task.directory,
+            const generation = await runTaskFileGeneration(task.id, body.profileId || task.decomposeProfileId);
+            sendJson(response, 200, {
+                ok: generation.ok,
+                failed: generation.failed,
+                exitCode: generation.result.exitCode,
+                output: generation.result.output,
+                fileChanged: generation.fileChanged,
+                task: generation.task,
             });
-            let spawnSpec = null;
-            try {
-                spawnSpec = buildSpawn(profile, prompt);
-            } catch (error) {
-                appendTaskLog(task, `拆解启动失败：${error.message}`);
-                sendJson(response, 400, { error: error.message });
-                return;
-            }
-            appendTaskLog(task, [
-                `开始拆解：${profile.name} (${profile.agentType})`,
-                profileConfigDescription(profile),
-                `工作目录：${task.directory}`,
-                `命令：${spawnSpec.summary}`,
-                promptBlock(prompt),
-            ].join("\n"));
-            const result = await runProfileCommand({
-                profile,
-                task,
-                prompt,
-                spawnSpec,
-                onLifecycle: (message) => appendTaskLog(task, `decompose ${message}`),
-                onOutput: (text, stream) => appendTaskLog(task, formatOutputChunk(`decompose ${stream}`, text)),
-            });
-            const latest = loadState();
-            const latestTask = findTask(latest, task.id);
-            if (latestTask && result.output.trim()) {
-                fs.writeFileSync(latestTask.filePath, result.output.trim() + "\n", "utf8");
-                latestTask.lastExitCode = result.exitCode;
-                latestTask.lastOutput = result.output.slice(-4000);
-                latestTask.decomposeProfileId = profile.id;
-                latestTask.updatedAt = nowISO();
-                addEvent(latest, "decompose", latestTask.id, `完成任务拆解：${latestTask.title}`);
-                saveState(latest);
-            }
-            sendJson(response, 200, { ok: true, exitCode: result.exitCode, output: result.output });
             return;
         }
 

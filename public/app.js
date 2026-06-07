@@ -351,6 +351,44 @@ function resetProfileForm(profile = null) {
     state.selectedProfileId = profile?.id || "";
 }
 
+function syncTaskSourceMode() {
+    const form = $("#taskForm");
+    const mode = form.elements.sourceMode.value || "agent";
+    const isAgent = mode === "agent";
+    const isUpload = mode === "upload";
+    const sourceHelp = {
+        agent: "由生成 Profile 根据任务需求创建新的 Markdown 目标文件。",
+        existing: "使用所选工作目录中已经存在的 Markdown 文件；请在目标文件名填写该文件名，不会复制文件内容。",
+        upload: "从电脑选择一个 Markdown 文件，并复制保存到所选工作目录；目标文件名默认使用所选文件名，也可以手动改名。",
+    };
+    $$(".task-generation-field").forEach((node) => {
+        node.hidden = !isAgent;
+    });
+    $$(".task-upload-field").forEach((node) => {
+        node.hidden = !isUpload;
+    });
+    form.elements.requirement.required = isAgent;
+    form.elements.decomposeProfileId.required = isAgent;
+    form.elements.sourceFile.required = isUpload;
+    $("#taskSubmitButton").textContent = isAgent
+        ? "调用 Agent 生成"
+        : isUpload
+            ? "导入所选文件"
+            : "载入工作目录文件";
+    $("#taskSourceHelp").textContent = sourceHelp[mode] || sourceHelp.agent;
+}
+
+function applySelectedTaskFile(file) {
+    if (!file) return;
+    const form = $("#taskForm");
+    if (!form.elements.targetFileName.value.trim()) {
+        form.elements.targetFileName.value = file.name;
+    }
+    if (!form.elements.title.value.trim()) {
+        form.elements.title.value = file.name.replace(/\.[^.]+$/, "") || file.name;
+    }
+}
+
 async function loadFile(taskId) {
     const task = (state.data?.tasks || []).find((item) => item.id === taskId);
     if (!task) return;
@@ -418,17 +456,41 @@ function bindEvents() {
         toast("Profile 已删除");
     });
 
+    $("#taskSourceMode").addEventListener("change", syncTaskSourceMode);
+    $("#taskForm input[name='sourceFile']").addEventListener("change", (event) => {
+        applySelectedTaskFile(event.target.files?.[0]);
+    });
     $("#taskForm").addEventListener("submit", async (event) => {
         event.preventDefault();
-        const formData = new FormData(event.currentTarget);
+        const form = event.currentTarget;
+        const formData = new FormData(form);
         const body = Object.fromEntries(formData.entries());
+        delete body.sourceFile;
         body.runProfileIds = formData.getAll("runProfileIds").filter(Boolean);
+        body.overwrite = form.elements.overwrite.checked;
+        body.sourceMode = form.elements.sourceMode.value || "agent";
+        if (body.sourceMode === "upload") {
+            const file = form.elements.sourceFile.files?.[0];
+            if (!file) return toast("请选择任务目标文件");
+            applySelectedTaskFile(file);
+            if (!String(body.targetFileName || "").trim()) body.targetFileName = file.name;
+            if (!String(body.title || "").trim()) body.title = file.name.replace(/\.[^.]+$/, "") || file.name;
+            body.sourceContent = await file.text();
+        }
         const result = await api("/api/tasks", { method: "POST", body });
         state.selectedTaskId = result.task.id;
         await refresh();
         await loadFile(result.task.id);
         switchView("editor");
-        toast("任务文件已生成");
+        if (result.generation?.failed) {
+            toast(`任务文件生成失败：exitCode ${result.generation.exitCode ?? "-"}`);
+        } else if (body.sourceMode === "existing") {
+            toast("任务文件已载入");
+        } else if (body.sourceMode === "upload") {
+            toast("任务文件已导入");
+        } else {
+            toast("任务文件已生成");
+        }
     });
 
     $("#taskList").addEventListener("click", async (event) => {
@@ -489,14 +551,14 @@ function bindEvents() {
         const taskId = $("#runTask").value;
         const profileId = $("#decomposeProfile").value || selectedValues($("#runProfiles"))[0];
         if (!taskId || !profileId) return toast("请选择任务和 Profile");
-        await api(`/api/tasks/${encodeURIComponent(taskId)}/decompose`, {
+        const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/generate`, {
             method: "POST",
             body: { profileId },
         });
         await refresh();
         await loadFile(taskId);
         await loadLog(taskId);
-        toast("拆解命令已完成");
+        toast(result.failed ? `生成目标文件失败：exitCode ${result.exitCode ?? "-"}` : "目标文件已生成");
     });
     $("#copyLog").addEventListener("click", async () => {
         await navigator.clipboard.writeText($("#logView").textContent || "");
@@ -530,6 +592,7 @@ function tickClock() {
 
 async function boot() {
     bindEvents();
+    syncTaskSourceMode();
     tickClock();
     setInterval(tickClock, 1000);
     await refresh();

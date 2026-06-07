@@ -5,7 +5,12 @@ const path = require("node:path");
 const test = require("node:test");
 
 const { RUNTIME_STATE, createApp } = require("../server");
-const { DEFAULT_CODEX_ARGS, LEGACY_CODEX_ARGS } = require("../lib/core");
+const {
+    DEFAULT_CODEX_ARGS,
+    DEFAULT_RUN_PROMPT,
+    LEGACY_CODEX_ARGS,
+    LEGACY_RUN_PROMPT,
+} = require("../lib/core");
 
 async function request(server, pathName, options = {}) {
     const response = await server.inject({
@@ -32,9 +37,22 @@ async function waitFor(fn, { timeoutMs = 2500, intervalMs = 25 } = {}) {
 
 function writeAgentScript(directory, name, content) {
     const filePath = path.join(directory, name);
-    fs.writeFileSync(filePath, `#!/bin/sh\n${content}\n`, "utf8");
-    fs.chmodSync(filePath, 0o755);
-    return filePath;
+    fs.writeFileSync(filePath, [
+        "const fs = require(\"node:fs\");",
+        "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
+        "",
+        "(async () => {",
+        content,
+        "})().catch((error) => {",
+        "    console.error(error && error.stack ? error.stack : error);",
+        "    process.exit(1);",
+        "});",
+    ].join("\n"), "utf8");
+    return {
+        command: process.execPath,
+        args: `${JSON.stringify(filePath)} {prompt}`,
+        filePath,
+    };
 }
 
 test("server creates task files and supports editing", async (t) => {
@@ -54,6 +72,27 @@ test("server creates task files and supports editing", async (t) => {
     const state = await request(server, "/api/state");
     assert.equal(state.directories[0], tempRoot);
     assert.ok(state.profiles.length >= 3);
+    const generatorScript = writeAgentScript(tempRoot, "agent-generate.sh", [
+        "fs.writeFileSync(\"测试任务.md\", [",
+        "    \"# 测试任务\",",
+        "    \"\",",
+        "    \"- [ ] 实现任务文件生成\",",
+        "    \"  - 完成标准：文件已生成。\",",
+        "    \"\",",
+        "].join(\"\\n\"), \"utf8\");",
+        "console.log(\"任务目标文件已生成\");",
+    ].join("\n"));
+    const generatorProfile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "task-generator",
+            agentType: "claude",
+            command: generatorScript.command,
+            args: generatorScript.args,
+            timeoutSeconds: 1,
+            enabled: true,
+        },
+    });
 
     const created = await request(server, "/api/tasks", {
         method: "POST",
@@ -62,9 +101,13 @@ test("server creates task files and supports editing", async (t) => {
             requirement: "实现任务文件生成",
             targetFileName: "测试任务.md",
             directory: tempRoot,
-            decomposeProfileId: state.profiles[0].id,
+            sourceMode: "agent",
+            decomposeProfileId: generatorProfile.profile.id,
+            runProfileIds: [generatorProfile.profile.id],
         },
     });
+    assert.equal(created.ok, true);
+    assert.equal(created.generation.ok, true);
     assert.equal(created.task.status, "not_started");
     assert.ok(fs.existsSync(path.join(tempRoot, "测试任务.md")));
 
@@ -83,6 +126,154 @@ test("server creates task files and supports editing", async (t) => {
     assert.equal(edited.content, "# 已编辑\n");
 });
 
+test("server can create a task from an existing target file", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    fs.writeFileSync(path.join(tempRoot, "existing-task.md"), "# 已有任务\n\n- [ ] 保留内容\n", "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "已有任务",
+            targetFileName: "existing-task.md",
+            directory: tempRoot,
+            sourceMode: "existing",
+        },
+    });
+    assert.equal(created.task.sourceMode, "existing");
+    assert.equal(created.task.status, "not_started");
+
+    const file = await request(server, `/api/tasks/${created.task.id}/file`);
+    assert.equal(file.content, "# 已有任务\n\n- [ ] 保留内容\n");
+});
+
+test("server asks generator profile to write target file instead of using stdout as content", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const script = writeAgentScript(tempRoot, "agent-rewrite.sh", [
+        "fs.writeFileSync(\"rewrite-task.md\", [",
+        "    \"# Agent 写入\",",
+        "    \"\",",
+        "    \"- [ ] 由生成 Profile 创建\",",
+        "    \"\",",
+        "].join(\"\\n\"), \"utf8\");",
+        "console.log(\"stdout 不应覆盖文件\");",
+    ].join("\n"));
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "rewrite-agent",
+            agentType: "codex",
+            command: script.command,
+            args: script.args,
+            timeoutSeconds: 1,
+            enabled: true,
+        },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "重写任务",
+            requirement: "生成目标文件",
+            targetFileName: "rewrite-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+
+    const generated = await request(server, `/api/tasks/${created.task.id}/generate`, {
+        method: "POST",
+        body: { profileId: profile.profile.id },
+    });
+    assert.equal(generated.ok, true);
+    assert.equal(generated.failed, false);
+
+    const file = await request(server, `/api/tasks/${created.task.id}/file`);
+    assert.match(file.content, /# Agent 写入/);
+    assert.doesNotMatch(file.content, /stdout 不应覆盖文件/);
+});
+
+test("server resolves Windows PowerShell command shims", { skip: process.platform !== "win32" }, async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    fs.writeFileSync(path.join(tempRoot, "fake-codex.ps1"), [
+        "$marker = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(\"5YWo6YOo5a6M5oiQ\"))",
+        "Write-Output ('GGGG' + $marker + 'GGGG')",
+    ].join("\r\n"), "utf8");
+
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "fake-codex",
+            agentType: "codex",
+            command: "fake-codex",
+            args: "{prompt}",
+            envText: `PATH=${tempRoot}${path.delimiter}${process.env.PATH || ""}`,
+            timeoutSeconds: 5,
+            enabled: true,
+        },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "windows-shim",
+            requirement: "run a PowerShell shim",
+            targetFileName: "windows-shim.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+
+    const task = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+    });
+    assert.equal(task.lastExitCode, 0);
+    assert.match(task.lastCommand, /powershell\.exe/i);
+    assert.match(task.lastCommand, /fake-codex\.ps1/i);
+});
+
 test("server migrates legacy default codex profile to auto-confirm args", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
@@ -97,7 +288,7 @@ test("server migrates legacy default codex profile to auto-confirm args", async 
             command: "codex",
             args: LEGACY_CODEX_ARGS,
             envText: "",
-            promptTemplate: "",
+            promptTemplate: LEGACY_RUN_PROMPT,
             timeoutSeconds: 1800,
             enabled: true,
             nonInteractive: true,
@@ -124,6 +315,7 @@ test("server migrates legacy default codex profile to auto-confirm args", async 
 
     const state = await request(server, "/api/state");
     assert.equal(state.profiles[0].args, DEFAULT_CODEX_ARGS);
+    assert.equal(state.profiles[0].promptTemplate, DEFAULT_RUN_PROMPT);
 });
 
 test("server closes agent stdin so commands do not wait for additional input", async (t) => {
@@ -140,12 +332,12 @@ test("server closes agent stdin so commands do not wait for additional input", a
         fs.rmSync(tempData, { recursive: true, force: true });
     });
     const script = writeAgentScript(tempRoot, "agent-stdin.sh", [
-        "if read line; then",
-        "  echo \"stdin-open:$line\"",
-        "else",
-        "  echo stdin-closed",
-        "fi",
-        "echo 全部任务完成",
+        "let input = \"\";",
+        "process.stdin.setEncoding(\"utf8\");",
+        "process.stdin.on(\"data\", (chunk) => { input += chunk; });",
+        "await new Promise((resolve) => process.stdin.on(\"end\", resolve));",
+        "console.log(input ? `stdin-open:${input.trim()}` : \"stdin-closed\");",
+        "console.log(\"GGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -153,8 +345,8 @@ test("server closes agent stdin so commands do not wait for additional input", a
         body: {
             name: "stdin-agent",
             agentType: "claude",
-            command: script,
-            args: "{prompt}",
+            command: script.command,
+            args: script.args,
             timeoutSeconds: 1,
             enabled: true,
         },
@@ -166,6 +358,7 @@ test("server closes agent stdin so commands do not wait for additional input", a
             requirement: "确认 stdin 不阻塞",
             targetFileName: "stdin-task.md",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: profile.profile.id,
             runProfileIds: [profile.profile.id],
         },
@@ -184,6 +377,57 @@ test("server closes agent stdin so commands do not wait for additional input", a
     assert.match(task.lastOutput, /stdin-closed/);
 });
 
+test("server still accepts the legacy all-done marker", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const script = writeAgentScript(tempRoot, "agent-legacy-all-done.sh", "console.log(\"全部任务完成\");");
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "legacy-all-done-agent",
+            agentType: "claude",
+            command: script.command,
+            args: script.args,
+            timeoutSeconds: 1,
+            enabled: true,
+        },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "legacy all done",
+            requirement: "legacy marker compatibility",
+            targetFileName: "legacy-all-done.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+
+    const task = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+    });
+    assert.equal(task.lastExitCode, 0);
+});
+
 test("server exposes active agent process while a task is running", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
@@ -197,15 +441,19 @@ test("server exposes active agent process while a task is running", async (t) =>
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const script = writeAgentScript(tempRoot, "agent-sleep.sh", "echo started\nsleep 1\necho 全部任务完成");
+    const script = writeAgentScript(tempRoot, "agent-sleep.sh", [
+        "console.log(\"started\");",
+        "await sleep(1000);",
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
         method: "POST",
         body: {
             name: "sleep-agent",
             agentType: "claude",
-            command: script,
-            args: "{prompt}",
+            command: script.command,
+            args: script.args,
             enabled: true,
         },
     });
@@ -216,6 +464,7 @@ test("server exposes active agent process while a task is running", async (t) =>
             requirement: "检查运行中进程",
             targetFileName: "process-task.md",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: profile.profile.id,
             runProfileIds: [profile.profile.id],
         },
@@ -258,15 +507,15 @@ test("server reports idle waiting while loop is between agent runs", async (t) =
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const script = writeAgentScript(tempRoot, "agent-once.sh", "echo 任务完成");
+    const script = writeAgentScript(tempRoot, "agent-once.sh", "console.log(\"任务完成\");");
 
     const profile = await request(server, "/api/profiles", {
         method: "POST",
         body: {
             name: "once-agent",
             agentType: "codex",
-            command: script,
-            args: "{prompt}",
+            command: script.command,
+            args: script.args,
             enabled: true,
         },
     });
@@ -277,6 +526,7 @@ test("server reports idle waiting while loop is between agent runs", async (t) =
             requirement: "检查等待状态",
             targetFileName: "idle-task.md",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: profile.profile.id,
             runProfileIds: [profile.profile.id],
         },
@@ -316,16 +566,16 @@ test("server logs real prompt and rotates to next profile after failure", async 
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const failScript = writeAgentScript(tempRoot, "agent-429.sh", "echo 429");
-    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "echo 全部任务完成");
+    const failScript = writeAgentScript(tempRoot, "agent-429.sh", "console.log(\"429\");");
+    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "console.log(\"GGGG全部完成GGGG\");");
 
     const failProfile = await request(server, "/api/profiles", {
         method: "POST",
         body: {
             name: "node-429",
             agentType: "claude",
-            command: failScript,
-            args: "{prompt}",
+            command: failScript.command,
+            args: failScript.args,
             enabled: true,
         },
     });
@@ -334,8 +584,8 @@ test("server logs real prompt and rotates to next profile after failure", async 
         body: {
             name: "node-next",
             agentType: "codex",
-            command: nextScript,
-            args: "{prompt}",
+            command: nextScript.command,
+            args: nextScript.args,
             enabled: true,
         },
     });
@@ -346,6 +596,7 @@ test("server logs real prompt and rotates to next profile after failure", async 
             requirement: "检查真实 prompt",
             targetFileName: "rotate-task.md",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: failProfile.profile.id,
             runProfileIds: [failProfile.profile.id, nextProfile.profile.id],
         },
@@ -384,15 +635,18 @@ test("server applies profile config directory to agent environment", async (t) =
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const script = writeAgentScript(tempRoot, "agent-config.sh", "echo \"$CODEX_HOME\"\necho 全部任务完成");
+    const script = writeAgentScript(tempRoot, "agent-config.sh", [
+        "console.log(process.env.CODEX_HOME || \"\");",
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
         method: "POST",
         body: {
             name: "codex-config-dir",
             agentType: "codex",
-            command: script,
-            args: "{prompt}",
+            command: script.command,
+            args: script.args,
             configDirectory,
             enabled: true,
         },
@@ -406,6 +660,7 @@ test("server applies profile config directory to agent environment", async (t) =
             requirement: "检查配置目录",
             targetFileName: "config-dir-task.md",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: profile.profile.id,
             runProfileIds: [profile.profile.id],
         },
@@ -425,7 +680,7 @@ test("server applies profile config directory to agent environment", async (t) =
     assert.match(log.content, new RegExp(configDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(log.content, /配置目录：.*CODEX_HOME/);
     assert.match(log.content, /Prompt 开始/);
-    assert.match(log.content, /stdout: 全部任务完成/);
+    assert.match(log.content, /stdout: GGGG全部完成GGGG/);
 });
 
 test("server rejects task files outside configured directory", async (t) => {
@@ -450,6 +705,7 @@ test("server rejects task files outside configured directory", async (t) => {
             requirement: "路径检查",
             targetFileName: "../escape",
             directory: tempRoot,
+            sourceMode: "template",
             decomposeProfileId: state.profiles[0].id,
         },
     });
