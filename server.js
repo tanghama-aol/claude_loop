@@ -29,6 +29,7 @@ const {
 
 const STATUS = {
     notStarted: "not_started",
+    scheduled: "scheduled",
     running: "running",
     retryWait: "retry_wait",
     completed: "completed",
@@ -43,6 +44,10 @@ const RUNTIME_STATE = {
     loopNotStarted: "loop_not_started",
 };
 
+const PING_PROMPT = "hello";
+const PING_INTERVAL_MS = 60 * 60 * 1000;
+const PING_SCHEDULER_TICK_MS = 60 * 1000;
+
 function createApp(options = {}) {
     const rootDir = path.resolve(options.rootDir || process.cwd());
     const dataDir = path.resolve(options.dataDir || process.env.CLAUDE_LOOP_DATA_DIR || path.join(rootDir, ".claude-loop-data"));
@@ -50,6 +55,8 @@ function createApp(options = {}) {
     const logDir = path.join(dataDir, "logs");
     const stateFile = path.join(dataDir, "state.json");
     const runners = new Map();
+    let pingTimer = null;
+    let pingInProgress = false;
 
     fs.mkdirSync(logDir, { recursive: true });
 
@@ -60,6 +67,7 @@ function createApp(options = {}) {
             profiles: createDefaultProfiles(rootDir),
             tasks: [],
             events: [],
+            pingRecords: [],
             createdAt: nowISO(),
             updatedAt: nowISO(),
         };
@@ -80,8 +88,14 @@ function createApp(options = {}) {
 
     function normalizeProfile(profile) {
         const rawConfigDirectory = String(profile?.configDirectory || "").trim();
+        const pingIntervalMinutes = Math.max(1, Number(profile?.pingIntervalMinutes || 60));
         const normalized = {
             ...profile,
+            baseUrl: String(profile?.baseUrl || "").trim(),
+            apiToken: String(profile?.apiToken || ""),
+            modelName: String(profile?.modelName || "").trim(),
+            pingIntervalMinutes,
+            pingEnabled: profile?.pingEnabled !== false,
             configDirectory: rawConfigDirectory ? path.resolve(rawConfigDirectory) : "",
             defaultDirectory: path.resolve(profile?.defaultDirectory || rootDir),
         };
@@ -116,6 +130,7 @@ function createApp(options = {}) {
             : createDefaultProfiles(rootDir);
         normalized.tasks = Array.isArray(normalized.tasks) ? normalized.tasks.map(normalizeTask) : [];
         normalized.events = Array.isArray(normalized.events) ? normalized.events : [];
+        normalized.pingRecords = Array.isArray(normalized.pingRecords) ? normalized.pingRecords : [];
         normalized.updatedAt = normalized.updatedAt || nowISO();
         return normalized;
     }
@@ -249,21 +264,77 @@ function createApp(options = {}) {
         };
     }
 
+    function maskToken(value = "") {
+        const text = String(value || "");
+        if (!text) return "";
+        const tail = text.slice(-4);
+        return `${"*".repeat(Math.max(8, text.length - 4))}${tail}`;
+    }
+
+    function padLocal(value) {
+        return String(value).padStart(2, "0");
+    }
+
+    function localMinuteParts(value = new Date()) {
+        const date = value instanceof Date ? value : new Date(value);
+        const year = date.getFullYear();
+        const month = padLocal(date.getMonth() + 1);
+        const day = padLocal(date.getDate());
+        const hour = padLocal(date.getHours());
+        const minute = padLocal(date.getMinutes());
+        return {
+            date: `${year}-${month}-${day}`,
+            minute: `${year}-${month}-${day} ${hour}:${minute}`,
+        };
+    }
+
+    function pingDays(records = []) {
+        const groups = new Map();
+        for (const record of records) {
+            const date = record.date || String(record.minute || "").slice(0, 10);
+            if (!date) continue;
+            if (!groups.has(date)) {
+                groups.set(date, {
+                    date,
+                    total: 0,
+                    success: 0,
+                    failed: 0,
+                    records: [],
+                });
+            }
+            const group = groups.get(date);
+            group.total += 1;
+            if (record.success) group.success += 1;
+            else group.failed += 1;
+            group.records.push(record);
+        }
+        return Array.from(groups.values()).sort((left, right) => right.date.localeCompare(left.date));
+    }
+
+    function profileForClient(profile) {
+        const { apiToken, ...publicProfile } = profile;
+        return {
+            ...publicProfile,
+            apiTokenConfigured: Boolean(apiToken),
+            apiTokenPreview: maskToken(apiToken),
+            envPreview: maskEnvText(profile.envText || ""),
+            envKeys: Object.keys(parseEnvText(profile.envText || "")),
+        };
+    }
+
     function publicState() {
         const state = loadState();
         return {
             ...state,
-            profiles: state.profiles.map((profile) => ({
-                ...profile,
-                envPreview: maskEnvText(profile.envText || ""),
-                envKeys: Object.keys(parseEnvText(profile.envText || "")),
-            })),
+            profiles: state.profiles.map(profileForClient),
             tasks: state.tasks.map((task) => ({
                 ...task,
                 ...runtimeInfoForTask(task),
                 logSize: task.logFile ? safeStat(path.join(logDir, task.logFile))?.size || 0 : 0,
                 fileMtime: task.filePath ? safeStat(task.filePath)?.mtime?.toISOString() || null : null,
             })),
+            pingDays: pingDays(state.pingRecords),
+            pingRunning: pingInProgress,
         };
     }
 
@@ -434,11 +505,56 @@ function createApp(options = {}) {
         };
     }
 
+    function modelTestEnvForProfile(profile) {
+        const baseUrl = String(profile?.baseUrl || "").trim();
+        const apiToken = String(profile?.apiToken || "");
+        const modelName = String(profile?.modelName || "").trim();
+        const agentType = String(profile?.agentType || "").trim().toLowerCase();
+        const env = {};
+        if (baseUrl) env.AGENT_BASE_URL = baseUrl;
+        if (apiToken) env.AGENT_TOKEN = apiToken;
+        if (modelName) env.AGENT_MODEL = modelName;
+        if (agentType === "codex") {
+            if (baseUrl) {
+                env.CODEX_BASE_URL = baseUrl;
+                env.OPENAI_BASE_URL = baseUrl;
+            }
+            if (apiToken) {
+                env.CODEX_API_KEY = apiToken;
+                env.OPENAI_API_KEY = apiToken;
+            }
+            if (modelName) {
+                env.CODEX_MODEL = modelName;
+                env.OPENAI_MODEL = modelName;
+            }
+        }
+        if (agentType === "claude" || agentType === "claudecode") {
+            if (baseUrl) {
+                env.CLAUDE_BASE_URL = baseUrl;
+                env.CLAUDE_CODE_BASE_URL = baseUrl;
+                env.ANTHROPIC_BASE_URL = baseUrl;
+            }
+            if (apiToken) {
+                env.CLAUDE_TOKEN = apiToken;
+                env.CLAUDE_CODE_TOKEN = apiToken;
+                env.ANTHROPIC_AUTH_TOKEN = apiToken;
+                env.ANTHROPIC_API_KEY = apiToken;
+            }
+            if (modelName) {
+                env.CLAUDE_MODEL = modelName;
+                env.CLAUDE_CODE_MODEL = modelName;
+                env.ANTHROPIC_MODEL = modelName;
+            }
+        }
+        return env;
+    }
+
     function environmentForProfile(profile) {
         return {
             ...process.env,
             ...parseEnvText(profile.envText || ""),
             ...configEnvForProfile(profile),
+            ...modelTestEnvForProfile(profile),
         };
     }
 
@@ -664,6 +780,122 @@ function createApp(options = {}) {
         });
     }
 
+    function isPingProfile(profile) {
+        const agentType = String(profile?.agentType || "").trim().toLowerCase();
+        return profile?.enabled !== false && profile?.pingEnabled !== false && ["claude", "claudecode", "codex"].includes(agentType);
+    }
+
+    function lastPingRecordForProfile(records, profileId) {
+        return (records || [])
+            .filter((record) => record.profileId === profileId && record.createdAt)
+            .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))[0] || null;
+    }
+
+    function isProfileDueForPing(profile, records, now = new Date()) {
+        const lastRecord = lastPingRecordForProfile(records, profile.id);
+        if (!lastRecord) return true;
+        const lastTime = new Date(lastRecord.createdAt).getTime();
+        if (Number.isNaN(lastTime)) return true;
+        const intervalMs = Math.max(1, Number(profile.pingIntervalMinutes || 60)) * 60 * 1000;
+        return now.getTime() - lastTime >= intervalMs;
+    }
+
+    async function pingProfile(profile) {
+        const timestamp = new Date();
+        const { date, minute } = localMinuteParts(timestamp);
+        const task = {
+            id: makeId("ping"),
+            title: `ping ${profile.name}`,
+            targetFileName: "",
+            requirement: "",
+            directory: path.resolve(profile.defaultDirectory || rootDir),
+        };
+        runners.set(task.id, {
+            stopped: false,
+            child: null,
+            timer: null,
+            startedAt: nowISO(),
+            idleSince: null,
+            nextRunAt: null,
+            activeProcess: null,
+            currentRunStartedAt: null,
+            lastAgentExitAt: null,
+            lastAgentExitCode: null,
+            lastAgentSignal: null,
+        });
+        try {
+            const result = await runProfileCommand({
+                profile,
+                task,
+                prompt: PING_PROMPT,
+            });
+            const output = String(result.output || "");
+            return {
+                id: makeId("ping_record"),
+                createdAt: timestamp.toISOString(),
+                date,
+                minute,
+                prompt: PING_PROMPT,
+                profileId: profile.id,
+                profileName: profile.name,
+                agentType: profile.agentType,
+                modelName: profile.modelName || "",
+                model: profile.modelName || `${profile.name} (${profile.agentType})`,
+                baseUrl: profile.baseUrl || "",
+                pingIntervalMinutes: Math.max(1, Number(profile.pingIntervalMinutes || 60)),
+                success: result.exitCode === 0 && output.trim().length > 0,
+                exitCode: result.exitCode,
+                signal: result.signal || null,
+                durationMs: result.durationMs,
+                outputTail: output.slice(-1000),
+                command: result.commandSummary,
+            };
+        } finally {
+            runners.delete(task.id);
+        }
+    }
+
+    async function runPingRound(runOptions = {}) {
+        if (pingInProgress) {
+            const error = new Error("Ping 姝ｅ湪杩愯");
+            error.statusCode = 409;
+            throw error;
+        }
+        pingInProgress = true;
+        try {
+            let state = loadState();
+            const now = new Date();
+            const profiles = state.profiles
+                .filter(isPingProfile)
+                .filter((profile) => runOptions.dueOnly !== true || isProfileDueForPing(profile, state.pingRecords, now));
+            const records = [];
+            for (const profile of profiles) {
+                records.push(await pingProfile(profile));
+            }
+            if (records.length === 0) return records;
+            state = loadState();
+            state.pingRecords = [...records, ...(state.pingRecords || [])].slice(0, 5000);
+            addEvent(state, "ping", null, `Ping Profiles锛?{records.filter((record) => record.success).length}/${records.length} 鎴愬姛`);
+            saveState(state);
+            return records;
+        } finally {
+            pingInProgress = false;
+        }
+    }
+
+    function startPingScheduler() {
+        if (options.disablePingScheduler === true) return;
+        const intervalMs = Math.max(1000, Number(options.pingSchedulerTickMs || PING_SCHEDULER_TICK_MS));
+        pingTimer = setInterval(() => {
+            runPingRound({ dueOnly: true }).catch((error) => {
+                const state = loadState();
+                addEvent(state, "ping", null, `Ping 澶辫触锛?{error.message}`);
+                saveState(state);
+            });
+        }, intervalMs);
+        pingTimer.unref();
+    }
+
     async function runTaskFileGeneration(taskId, profileId, options = {}) {
         const requireNonEmpty = options.requireNonEmpty !== false;
         let state = loadState();
@@ -785,6 +1017,21 @@ function createApp(options = {}) {
         if (!runner || runner.stopped) return;
         runner.idleSince = nowISO();
         runner.nextRunAt = new Date(Date.now() + delayMs).toISOString();
+        runner.timer = setTimeout(() => {
+            runner.timer = null;
+            runner.nextRunAt = null;
+            runner.idleSince = null;
+            runTaskLoop(taskId);
+        }, delayMs);
+        runner.timer.unref();
+    }
+
+    function scheduleInitialRun(taskId, startAt) {
+        const runner = runners.get(taskId);
+        if (!runner || runner.stopped) return;
+        const delayMs = Math.max(0, startAt.getTime() - Date.now());
+        runner.idleSince = nowISO();
+        runner.nextRunAt = startAt.toISOString();
         runner.timer = setTimeout(() => {
             runner.timer = null;
             runner.nextRunAt = null;
@@ -1018,11 +1265,23 @@ function createApp(options = {}) {
             return;
         }
 
+        if (method === "POST" && pathname === "/api/pings/run") {
+            const records = await runPingRound();
+            sendJson(response, 200, {
+                ok: true,
+                records,
+                pingDays: pingDays(records),
+            });
+            return;
+        }
+
         if (method === "POST" && pathname === "/api/profiles") {
             const body = await readJson(request);
             const state = loadState();
             const existing = body.id ? state.profiles.find((profile) => profile.id === body.id) : null;
             const rawConfigDirectory = String(body.configDirectory ?? existing?.configDirectory ?? "").trim();
+            const rawApiToken = String(body.apiToken ?? "");
+            const apiToken = existing && rawApiToken === "" ? String(existing.apiToken || "") : rawApiToken;
             const profile = {
                 id: existing?.id || makeId("profile"),
                 name: String(body.name || existing?.name || "new-profile").trim(),
@@ -1032,6 +1291,11 @@ function createApp(options = {}) {
                 envText: String(body.envText ?? existing?.envText ?? ""),
                 promptTemplate: String(body.promptTemplate || existing?.promptTemplate || DEFAULT_RUN_PROMPT),
                 timeoutSeconds: Math.max(1, Number(body.timeoutSeconds || existing?.timeoutSeconds || 1800)),
+                baseUrl: String(body.baseUrl ?? existing?.baseUrl ?? "").trim(),
+                apiToken,
+                modelName: String(body.modelName ?? existing?.modelName ?? "").trim(),
+                pingIntervalMinutes: Math.max(1, Number(body.pingIntervalMinutes || existing?.pingIntervalMinutes || 60)),
+                pingEnabled: body.pingEnabled !== false,
                 enabled: body.enabled !== false,
                 nonInteractive: body.nonInteractive !== false,
                 defaultDirectory: path.resolve(body.defaultDirectory || existing?.defaultDirectory || rootDir),
@@ -1050,7 +1314,7 @@ function createApp(options = {}) {
             }
             addEvent(state, "profile", null, `保存 Profile：${profile.name}`);
             saveState(state);
-            sendJson(response, 200, { ok: true, profile });
+            sendJson(response, 200, { ok: true, profile: profileForClient(profile) });
             return;
         }
 
@@ -1268,29 +1532,48 @@ function createApp(options = {}) {
                 sendJson(response, 400, { error: "请选择可用的执行 Profile" });
                 return;
             }
+            const rawStartAt = String(body.startAt || "").trim();
+            const startAt = rawStartAt ? new Date(rawStartAt) : null;
+            if (rawStartAt && Number.isNaN(startAt.getTime())) {
+                sendJson(response, 400, { error: "预约启动时间无效" });
+                return;
+            }
+            const shouldSchedule = startAt && startAt.getTime() > Date.now();
+            const scheduledStartAt = shouldSchedule ? startAt.toISOString() : null;
+            const startedAt = nowISO();
             task.runProfileIds = usableIds;
             task.runProfileId = usableIds[0];
-            task.status = STATUS.running;
+            task.status = shouldSchedule ? STATUS.scheduled : STATUS.running;
             task.retryCount = task.retryCount || 0;
-            task.nextRunAt = null;
-            addEvent(state, "started", task.id, `启动任务：${task.title}`);
+            task.nextRunAt = scheduledStartAt;
+            addEvent(
+                state,
+                shouldSchedule ? "scheduled" : "started",
+                task.id,
+                shouldSchedule ? `预约启动任务：${task.title}` : `启动任务：${task.title}`,
+            );
             saveState(state);
-            const startedAt = nowISO();
             runners.set(task.id, {
                 stopped: false,
                 child: null,
                 timer: null,
                 startedAt,
                 idleSince: startedAt,
-                nextRunAt: null,
+                nextRunAt: scheduledStartAt,
                 activeProcess: null,
                 currentRunStartedAt: null,
                 lastAgentExitAt: null,
                 lastAgentExitCode: null,
                 lastAgentSignal: null,
             });
+            if (shouldSchedule) {
+                scheduleInitialRun(task.id, startAt);
+                appendTaskLog(task, `预约启动时间：${scheduledStartAt}`);
+                sendJson(response, 200, { ok: true, runProfileIds: usableIds, scheduledStartAt });
+                return;
+            }
             setImmediate(() => runTaskLoop(task.id));
-            sendJson(response, 200, { ok: true, runProfileIds: usableIds });
+            sendJson(response, 200, { ok: true, runProfileIds: usableIds, scheduledStartAt: null });
             return;
         }
 
@@ -1398,12 +1681,18 @@ function createApp(options = {}) {
     };
 
     server.closeRunners = () => {
+        if (pingTimer) {
+            clearInterval(pingTimer);
+            pingTimer = null;
+        }
         for (const runner of runners.values()) {
             if (runner.timer) clearTimeout(runner.timer);
             if (runner.child) runner.child.kill("SIGTERM");
         }
         runners.clear();
     };
+
+    startPingScheduler();
 
     return server;
 }

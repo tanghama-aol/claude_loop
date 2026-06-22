@@ -1,5 +1,6 @@
 const statusText = {
     not_started: "未开始",
+    scheduled: "已预约",
     running: "运行中",
     retry_wait: "等待重试",
     completed: "已完成",
@@ -46,6 +47,30 @@ function formatTime(value) {
     } catch {
         return value;
     }
+}
+
+function parseScheduleInput(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return null;
+    return date;
+}
+
+function datetimeLocalValue(date) {
+    const pad = (value) => String(value).padStart(2, "0");
+    return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate()),
+    ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function syncScheduleInput() {
+    const input = $("#scheduleStartAt");
+    if (!input) return;
+    const minimum = new Date(Date.now() + 60000);
+    input.min = datetimeLocalValue(minimum);
 }
 
 function toast(message) {
@@ -111,6 +136,7 @@ function taskRuntimeState(task) {
 }
 
 function taskRuntimeLabel(task) {
+    if (task?.status === "scheduled") return "预约等待中";
     const runtimeState = taskRuntimeState(task);
     return runtimeStateText[runtimeState] || runtimeState;
 }
@@ -127,6 +153,10 @@ function profileNames(ids) {
         .filter(Boolean)
         .map((id) => findProfileName(id));
     return names.length ? names.join(" -> ") : "-";
+}
+
+function successText(value) {
+    return value ? "成功" : "失败";
 }
 
 function getSelectedTask() {
@@ -229,11 +259,61 @@ function renderProfiles() {
                 <span>ENV ${profile.envKeys?.length || 0}</span>
             </div>
             <div class="meta">
+                <span>模型 ${escapeHtml(profile.modelName || "-")}</span>
+                <span>Base ${escapeHtml(profile.baseUrl || "-")}</span>
+                <span>Token ${profile.apiTokenConfigured ? escapeHtml(profile.apiTokenPreview || "已配置") : "-"}</span>
+                <span>测试 ${profile.pingEnabled === false ? "关闭" : `${profile.pingIntervalMinutes || 60} 分钟`}</span>
                 <span>配置 ${escapeHtml(profile.configDirectory || "-")}</span>
             </div>
             <button class="ghost" type="button" data-edit-profile="${escapeHtml(profile.id)}">编辑</button>
         </article>
     `).join("") || `<div class="empty">暂无 Profile。</div>`;
+}
+
+function renderPings() {
+    const records = state.data?.pingRecords || [];
+    const days = state.data?.pingDays || [];
+    const runButton = $("#runPing");
+    if (runButton) runButton.disabled = state.data?.pingRunning === true;
+    $("#pingSummary").textContent = records.length
+        ? `${records.length} 条记录 · 最近 ${records[0].minute || formatTime(records[0].createdAt)}`
+        : "0 条记录";
+    $("#pingDays").innerHTML = days.map((day) => `
+        <article class="ping-day">
+            <div class="ping-day-head">
+                <div>
+                    <p class="ping-date">${escapeHtml(day.date)}</p>
+                    <div class="meta">
+                        <span>总计 ${day.total}</span>
+                        <span>成功 ${day.success}</span>
+                        <span>失败 ${day.failed}</span>
+                    </div>
+                </div>
+            </div>
+            <div class="ping-table" role="table" aria-label="${escapeHtml(day.date)} Ping 记录">
+                <div class="ping-row ping-row-head" role="row">
+                    <span role="columnheader">年月日时分</span>
+                    <span role="columnheader">大模型</span>
+                    <span role="columnheader">Base URL</span>
+                    <span role="columnheader">间隔</span>
+                    <span role="columnheader">是否成功</span>
+                    <span role="columnheader">退出码</span>
+                </div>
+                ${day.records.map((record) => `
+                    <div class="ping-row" role="row">
+                        <span role="cell">${escapeHtml(record.minute || formatTime(record.createdAt))}</span>
+                        <span role="cell">${escapeHtml(record.model || `${record.profileName} (${record.agentType})`)}</span>
+                        <span role="cell">${escapeHtml(record.baseUrl || "-")}</span>
+                        <span role="cell">${record.pingIntervalMinutes || 60} 分钟</span>
+                        <span role="cell">
+                            <span class="badge ${record.success ? "ping_success" : "ping_failed"}">${successText(record.success)}</span>
+                        </span>
+                        <span role="cell">${record.exitCode ?? "-"}</span>
+                    </div>
+                `).join("")}
+            </div>
+        </article>
+    `).join("") || `<div class="empty">暂无 Ping 记录。</div>`;
 }
 
 function renderSelectors() {
@@ -324,6 +404,7 @@ function renderAll() {
     renderTasks();
     renderEvents();
     renderProfiles();
+    renderPings();
     renderSelectors();
     renderDirectories();
     renderRunDetail();
@@ -342,12 +423,20 @@ function resetProfileForm(profile = null) {
     form.elements.agentType.value = profile?.agentType || "claude";
     form.elements.command.value = profile?.command || "claude";
     form.elements.args.value = profile?.args || "-p {prompt}";
+    form.elements.baseUrl.value = profile?.baseUrl || "";
+    form.elements.apiToken.value = "";
+    form.elements.apiToken.placeholder = profile?.apiTokenConfigured
+        ? `已配置 ${profile.apiTokenPreview || "Token"}；留空保留`
+        : "留空表示不设置 Token";
+    form.elements.modelName.value = profile?.modelName || "";
+    form.elements.pingIntervalMinutes.value = profile?.pingIntervalMinutes || 60;
     form.elements.configDirectory.value = profile?.configDirectory || "";
     form.elements.envText.value = profile?.envText || "";
     form.elements.promptTemplate.value = profile?.promptTemplate || "";
     form.elements.timeoutSeconds.value = profile?.timeoutSeconds || 1800;
     form.elements.enabled.checked = profile?.enabled !== false;
     form.elements.nonInteractive.checked = profile?.nonInteractive !== false;
+    form.elements.pingEnabled.checked = profile?.pingEnabled !== false;
     state.selectedProfileId = profile?.id || "";
 }
 
@@ -438,6 +527,8 @@ function bindEvents() {
         body.enabled = form.elements.enabled.checked;
         body.nonInteractive = form.elements.nonInteractive.checked;
         body.timeoutSeconds = Number(body.timeoutSeconds || 1800);
+        body.pingEnabled = form.elements.pingEnabled.checked;
+        body.pingIntervalMinutes = Number(body.pingIntervalMinutes || 60);
         await api("/api/profiles", { method: "POST", body });
         await refresh();
         toast("Profile 已保存");
@@ -539,6 +630,21 @@ function bindEvents() {
         await loadLog(taskId);
         toast("任务已启动");
     });
+    $("#scheduleTask").addEventListener("click", async () => {
+        const taskId = $("#runTask").value;
+        const profileIds = selectedValues($("#runProfiles"));
+        const startAt = parseScheduleInput($("#scheduleStartAt").value);
+        if (!taskId || profileIds.length === 0) return toast("请选择任务和 Profile");
+        if (!startAt) return toast("请选择预约启动时间");
+        if (startAt.getTime() <= Date.now()) return toast("请选择未来的预约时间");
+        await api(`/api/tasks/${encodeURIComponent(taskId)}/start`, {
+            method: "POST",
+            body: { profileIds, startAt: startAt.toISOString() },
+        });
+        await refresh();
+        await loadLog(taskId);
+        toast("任务已预约");
+    });
     $("#stopTask").addEventListener("click", async () => {
         const taskId = $("#runTask").value;
         if (!taskId) return toast("请选择任务");
@@ -565,6 +671,18 @@ function bindEvents() {
         toast("日志已复制");
     });
 
+    $("#runPing").addEventListener("click", async () => {
+        const button = $("#runPing");
+        button.disabled = true;
+        try {
+            const result = await api("/api/pings/run", { method: "POST" });
+            await refresh();
+            toast(`Ping 完成：${result.records.filter((record) => record.success).length}/${result.records.length} 成功`);
+        } finally {
+            button.disabled = false;
+        }
+    });
+
     $("#directoryForm").addEventListener("submit", async (event) => {
         event.preventDefault();
         const body = Object.fromEntries(new FormData(event.currentTarget).entries());
@@ -588,6 +706,7 @@ function tickClock() {
         minute: "2-digit",
         second: "2-digit",
     }).format(new Date());
+    syncScheduleInput();
 }
 
 async function boot() {

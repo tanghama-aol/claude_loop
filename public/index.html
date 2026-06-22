@@ -25,6 +25,7 @@
             <button class="nav" type="button" data-view="tasks">任务</button>
             <button class="nav" type="button" data-view="editor">编辑</button>
             <button class="nav" type="button" data-view="runtime">运行</button>
+            <button class="nav" type="button" data-view="pings">Ping</button>
             <button class="nav" type="button" data-view="settings">目录</button>
         </aside>
 
@@ -85,9 +86,25 @@
                                 超时秒数
                                 <input name="timeoutSeconds" type="number" min="1" step="1" value="1800">
                             </label>
+                            <label>
+                                模型名称
+                                <input name="modelName" placeholder="gpt-4.1 / claude-sonnet-4">
+                            </label>
+                            <label>
+                                测试间隔（分钟）
+                                <input name="pingIntervalMinutes" type="number" min="1" step="1" value="60">
+                            </label>
                             <label class="full">
                                 参数
                                 <input name="args" placeholder="--dangerously-skip-permissions -p {prompt}">
+                            </label>
+                            <label class="full">
+                                Base URL
+                                <input name="baseUrl" placeholder="https://api.example.com/v1">
+                            </label>
+                            <label class="full">
+                                Token
+                                <input name="apiToken" type="password" placeholder="留空会保留已保存 Token">
                             </label>
                             <label class="full">
                                 配置目录
@@ -109,6 +126,10 @@
                             <label class="checkline">
                                 <input name="nonInteractive" type="checkbox" checked>
                                 非交互模式
+                            </label>
+                            <label class="checkline">
+                                <input name="pingEnabled" type="checkbox" checked>
+                                启用定时测试
                             </label>
                             <div class="form-actions full">
                                 <button type="submit">保存 Profile</button>
@@ -219,8 +240,13 @@
                                 生成 Profile
                                 <select id="decomposeProfile"></select>
                             </label>
+                            <label>
+                                预约启动时间
+                                <input id="scheduleStartAt" type="datetime-local">
+                            </label>
                             <div class="button-row">
                                 <button type="button" id="startTask">启动</button>
+                                <button class="ghost" type="button" id="scheduleTask">预约启动</button>
                                 <button class="ghost" type="button" id="decomposeTask">生成目标文件</button>
                                 <button class="danger" type="button" id="stopTask">停止</button>
                             </div>
@@ -235,6 +261,22 @@
                         <pre id="logView" class="log-view"></pre>
                     </section>
                 </div>
+            </section>
+
+            <section id="pings" class="view">
+                <section class="panel">
+                    <div class="panel-head">
+                        <div>
+                            <h2>大模型 Ping</h2>
+                            <p class="pathline">每小时向 Claude Code 和 Codex Profiles 发送 hello</p>
+                        </div>
+                        <div class="inline-actions">
+                            <span id="pingSummary" class="hint">0 条记录</span>
+                            <button type="button" id="runPing">立即 Ping</button>
+                        </div>
+                    </div>
+                    <div id="pingDays" class="ping-days"></div>
+                </section>
             </section>
 
             <section id="settings" class="view">

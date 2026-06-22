@@ -521,6 +521,73 @@ textarea.secret.revealed {
     margin-top: 10px;
 }
 
+.ping-days {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+}
+
+.ping-day {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fffefa;
+    overflow: hidden;
+}
+
+.ping-day-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px;
+    border-bottom: 1px solid var(--line);
+}
+
+.ping-date {
+    margin: 0;
+    font-family: var(--mono);
+    font-weight: 800;
+}
+
+.ping-table {
+    display: grid;
+    overflow-x: auto;
+}
+
+.ping-row {
+    display: grid;
+    grid-template-columns: 170px minmax(180px, 0.8fr) minmax(240px, 1fr) 96px 108px 80px;
+    gap: 12px;
+    align-items: center;
+    min-width: 900px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.ping-row:last-child {
+    border-bottom: 0;
+}
+
+.ping-row-head {
+    color: var(--muted);
+    background: var(--steel);
+    font-weight: 800;
+}
+
+.badge.ping_success {
+    color: #fff;
+    border-color: var(--green);
+    background: var(--green);
+}
+
+.badge.ping_failed {
+    color: #fff;
+    border-color: var(--red);
+    background: var(--red);
+}
+
 .detail-row {
     display: grid;
     grid-template-columns: 104px minmax(0, 1fr);
