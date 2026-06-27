@@ -44,7 +44,38 @@ const RUNTIME_STATE = {
     loopNotStarted: "loop_not_started",
 };
 
-const PING_PROMPT = "hello";
+const PING_QUESTIONS = [
+    "What is 1+1?",
+    "What color is the sky on a clear day?",
+    "Name one day of the week.",
+    "What is the opposite of hot?",
+    "How many legs does a chair usually have?",
+    "What do people use to write on paper?",
+    "Name one fruit.",
+    "What is 2+2?",
+    "What animal says meow?",
+    "What do you drink when you are thirsty?",
+    "Name one primary color.",
+    "What is the first month of the year?",
+    "How many minutes are in one hour?",
+    "What do you call frozen water?",
+    "Name one season.",
+    "What is 5 minus 2?",
+    "What do bees make?",
+    "What do you wear on your feet?",
+    "Name one planet.",
+    "What is the opposite of up?",
+    "How many days are in a week?",
+    "What do you use to see in the dark?",
+    "Name one common pet.",
+    "What is 10 divided by 2?",
+    "What do plants need from the sun?",
+    "Name one ocean.",
+    "What is the opposite of yes?",
+    "What do you call a baby dog?",
+    "How many wheels does a bicycle have?",
+    "What is the last letter of the English alphabet?",
+];
 const PING_INTERVAL_MS = 60 * 60 * 1000;
 const PING_SCHEDULER_TICK_MS = 60 * 1000;
 
@@ -68,6 +99,7 @@ function createApp(options = {}) {
             tasks: [],
             events: [],
             pingRecords: [],
+            pingSettings: { enabled: true },
             createdAt: nowISO(),
             updatedAt: nowISO(),
         };
@@ -131,6 +163,9 @@ function createApp(options = {}) {
         normalized.tasks = Array.isArray(normalized.tasks) ? normalized.tasks.map(normalizeTask) : [];
         normalized.events = Array.isArray(normalized.events) ? normalized.events : [];
         normalized.pingRecords = Array.isArray(normalized.pingRecords) ? normalized.pingRecords : [];
+        normalized.pingSettings = {
+            enabled: normalized.pingSettings?.enabled !== false,
+        };
         normalized.updatedAt = normalized.updatedAt || nowISO();
         return normalized;
     }
@@ -288,6 +323,14 @@ function createApp(options = {}) {
         };
     }
 
+    function selectPingPrompt() {
+        const randomFn = typeof options.pingQuestionRandom === "function" ? options.pingQuestionRandom : Math.random;
+        const raw = Number(randomFn());
+        const normalized = Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 0.999999999999) : 0;
+        const index = Math.floor(normalized * PING_QUESTIONS.length);
+        return PING_QUESTIONS[index] || PING_QUESTIONS[0];
+    }
+
     function pingDays(records = []) {
         const groups = new Map();
         for (const record of records) {
@@ -334,6 +377,8 @@ function createApp(options = {}) {
                 fileMtime: task.filePath ? safeStat(task.filePath)?.mtime?.toISOString() || null : null,
             })),
             pingDays: pingDays(state.pingRecords),
+            pingSettings: state.pingSettings,
+            pingQuestionCount: PING_QUESTIONS.length,
             pingRunning: pingInProgress,
         };
     }
@@ -824,10 +869,11 @@ function createApp(options = {}) {
             lastAgentSignal: null,
         });
         try {
+            const prompt = selectPingPrompt();
             const result = await runProfileCommand({
                 profile,
                 task,
-                prompt: PING_PROMPT,
+                prompt,
             });
             const output = String(result.output || "");
             return {
@@ -835,7 +881,7 @@ function createApp(options = {}) {
                 createdAt: timestamp.toISOString(),
                 date,
                 minute,
-                prompt: PING_PROMPT,
+                prompt,
                 profileId: profile.id,
                 profileName: profile.name,
                 agentType: profile.agentType,
@@ -864,6 +910,14 @@ function createApp(options = {}) {
         pingInProgress = true;
         try {
             let state = loadState();
+            if (state.pingSettings?.enabled === false) {
+                if (runOptions.manual === true) {
+                    const error = new Error("Ping feature is disabled");
+                    error.statusCode = 409;
+                    throw error;
+                }
+                return [];
+            }
             const now = new Date();
             const profiles = state.profiles
                 .filter(isPingProfile)
@@ -1266,12 +1320,25 @@ function createApp(options = {}) {
         }
 
         if (method === "POST" && pathname === "/api/pings/run") {
-            const records = await runPingRound();
+            const records = await runPingRound({ manual: true });
             sendJson(response, 200, {
                 ok: true,
                 records,
                 pingDays: pingDays(records),
             });
+            return;
+        }
+
+        if (method === "POST" && pathname === "/api/pings/settings") {
+            const body = await readJson(request);
+            const state = loadState();
+            state.pingSettings = {
+                ...(state.pingSettings || {}),
+                enabled: body.enabled !== false,
+            };
+            addEvent(state, "ping", null, state.pingSettings.enabled ? "Ping enabled" : "Ping disabled");
+            saveState(state);
+            sendJson(response, 200, { ok: true, pingSettings: state.pingSettings });
             return;
         }
 

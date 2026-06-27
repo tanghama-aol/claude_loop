@@ -543,6 +543,12 @@ textarea.secret.revealed {
     border-bottom: 1px solid var(--line);
 }
 
+.ping-toggle {
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
 .ping-date {
     margin: 0;
     font-family: var(--mono);
@@ -556,10 +562,10 @@ textarea.secret.revealed {
 
 .ping-row {
     display: grid;
-    grid-template-columns: 170px minmax(180px, 0.8fr) minmax(240px, 1fr) 96px 108px 80px;
+    grid-template-columns: 170px minmax(180px, 0.8fr) minmax(220px, 0.8fr) minmax(260px, 1fr) 96px 108px 80px;
     gap: 12px;
     align-items: center;
-    min-width: 900px;
+    min-width: 1180px;
     padding: 10px 12px;
     border-bottom: 1px solid var(--line);
     font-family: var(--mono);

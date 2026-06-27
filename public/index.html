@@ -267,12 +267,13 @@
                 <section class="panel">
                     <div class="panel-head">
                         <div>
-                            <h2>大模型 Ping</h2>
-                            <p class="pathline">每小时向 Claude Code 和 Codex Profiles 发送 hello</p>
+                            <h2>LLM Ping</h2>
+                            <p class="pathline">When enabled, ping Claude Code and Codex profiles with one random simple question.</p>
                         </div>
                         <div class="inline-actions">
-                            <span id="pingSummary" class="hint">0 条记录</span>
-                            <button type="button" id="runPing">立即 Ping</button>
+                            <label class="checkline ping-toggle"><input id="pingEnabled" type="checkbox" checked>Enable Ping</label>
+                            <span id="pingSummary" class="hint">0 records</span>
+                            <button type="button" id="runPing">Ping Now</button>
                         </div>
                     </div>
                     <div id="pingDays" class="ping-days"></div>

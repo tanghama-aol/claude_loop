@@ -273,38 +273,44 @@ function renderProfiles() {
 function renderPings() {
     const records = state.data?.pingRecords || [];
     const days = state.data?.pingDays || [];
+    const pingEnabled = state.data?.pingSettings?.enabled !== false;
     const runButton = $("#runPing");
-    if (runButton) runButton.disabled = state.data?.pingRunning === true;
-    $("#pingSummary").textContent = records.length
-        ? `${records.length} 条记录 · 最近 ${records[0].minute || formatTime(records[0].createdAt)}`
-        : "0 条记录";
+    const pingToggle = $("#pingEnabled");
+    if (runButton) runButton.disabled = state.data?.pingRunning === true || !pingEnabled;
+    if (pingToggle) pingToggle.checked = pingEnabled;
+    const baseSummary = records.length
+        ? `${records.length} records | latest ${records[0].minute || formatTime(records[0].createdAt)}`
+        : "0 records";
+    $("#pingSummary").textContent = `${pingEnabled ? "enabled" : "disabled"} | ${state.data?.pingQuestionCount || 0} questions | ${baseSummary}`;
     $("#pingDays").innerHTML = days.map((day) => `
         <article class="ping-day">
             <div class="ping-day-head">
                 <div>
                     <p class="ping-date">${escapeHtml(day.date)}</p>
                     <div class="meta">
-                        <span>总计 ${day.total}</span>
-                        <span>成功 ${day.success}</span>
-                        <span>失败 ${day.failed}</span>
+                        <span>total ${day.total}</span>
+                        <span>success ${day.success}</span>
+                        <span>failed ${day.failed}</span>
                     </div>
                 </div>
             </div>
-            <div class="ping-table" role="table" aria-label="${escapeHtml(day.date)} Ping 记录">
+            <div class="ping-table" role="table" aria-label="${escapeHtml(day.date)} Ping records">
                 <div class="ping-row ping-row-head" role="row">
-                    <span role="columnheader">年月日时分</span>
-                    <span role="columnheader">大模型</span>
+                    <span role="columnheader">minute</span>
+                    <span role="columnheader">model</span>
                     <span role="columnheader">Base URL</span>
-                    <span role="columnheader">间隔</span>
-                    <span role="columnheader">是否成功</span>
-                    <span role="columnheader">退出码</span>
+                    <span role="columnheader">question</span>
+                    <span role="columnheader">interval</span>
+                    <span role="columnheader">success</span>
+                    <span role="columnheader">exit</span>
                 </div>
                 ${day.records.map((record) => `
                     <div class="ping-row" role="row">
                         <span role="cell">${escapeHtml(record.minute || formatTime(record.createdAt))}</span>
                         <span role="cell">${escapeHtml(record.model || `${record.profileName} (${record.agentType})`)}</span>
                         <span role="cell">${escapeHtml(record.baseUrl || "-")}</span>
-                        <span role="cell">${record.pingIntervalMinutes || 60} 分钟</span>
+                        <span role="cell">${escapeHtml(record.prompt || "-")}</span>
+                        <span role="cell">${record.pingIntervalMinutes || 60} min</span>
                         <span role="cell">
                             <span class="badge ${record.success ? "ping_success" : "ping_failed"}">${successText(record.success)}</span>
                         </span>
@@ -313,7 +319,7 @@ function renderPings() {
                 `).join("")}
             </div>
         </article>
-    `).join("") || `<div class="empty">暂无 Ping 记录。</div>`;
+    `).join("") || `<div class="empty">No Ping records.</div>`;
 }
 
 function renderSelectors() {
@@ -669,6 +675,15 @@ function bindEvents() {
     $("#copyLog").addEventListener("click", async () => {
         await navigator.clipboard.writeText($("#logView").textContent || "");
         toast("日志已复制");
+    });
+
+    $("#pingEnabled").addEventListener("change", async (event) => {
+        await api("/api/pings/settings", {
+            method: "POST",
+            body: { enabled: event.target.checked },
+        });
+        await refresh();
+        toast(event.target.checked ? "Ping ???" : "Ping ???");
     });
 
     $("#runPing").addEventListener("click", async () => {

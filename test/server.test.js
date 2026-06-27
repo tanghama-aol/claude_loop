@@ -896,7 +896,9 @@ test("server pings enabled claude and codex profiles and groups records by day",
     assert.equal(result.records.find((record) => record.profileName === "claude-ping").success, true);
     assert.equal(result.records.find((record) => record.profileName === "codex-ping").success, false);
     assert.match(result.records[0].minute, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
-    assert.equal(result.records[0].prompt, "hello");
+    assert.equal(typeof result.records[0].prompt, "string");
+    assert.ok(result.records[0].prompt.length > 0);
+    assert.notEqual(result.records[0].prompt, "hello");
 
     const state = await request(server, "/api/state");
     assert.equal(state.pingRecords.length, 2);
@@ -905,6 +907,131 @@ test("server pings enabled claude and codex profiles and groups records by day",
     assert.equal(state.pingDays[0].success, 1);
     assert.equal(state.pingDays[0].failed, 1);
     assert.equal(state.pingDays[0].records.length, 2);
+});
+
+test("server can disable and re-enable the global ping feature", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const script = writeAgentScript(tempRoot, "agent-global-ping.sh", "console.log(\"pong\");");
+    fs.mkdirSync(tempData, { recursive: true });
+    fs.writeFileSync(path.join(tempData, "state.json"), JSON.stringify({
+        version: 1,
+        directories: [tempRoot],
+        profiles: [{
+            id: "profile_codex_ping_toggle",
+            name: "codex-ping-toggle",
+            agentType: "codex",
+            command: script.command,
+            args: script.args,
+            envText: "",
+            promptTemplate: DEFAULT_RUN_PROMPT,
+            timeoutSeconds: 1,
+            enabled: true,
+            nonInteractive: true,
+            defaultDirectory: tempRoot,
+            configDirectory: "",
+            pingEnabled: true,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        }],
+        tasks: [],
+        events: [],
+        pingRecords: [],
+        pingSettings: { enabled: true },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    }), "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const disabled = await request(server, "/api/pings/settings", {
+        method: "POST",
+        body: { enabled: false },
+    });
+    assert.equal(disabled.pingSettings.enabled, false);
+
+    const blocked = await server.inject({ method: "POST", path: "/api/pings/run" });
+    assert.equal(blocked.statusCode, 409);
+    assert.match(blocked.json().error, /Ping/);
+
+    const disabledState = await request(server, "/api/state");
+    assert.equal(disabledState.pingSettings.enabled, false);
+    assert.equal(disabledState.pingRecords.length, 0);
+
+    const enabled = await request(server, "/api/pings/settings", {
+        method: "POST",
+        body: { enabled: true },
+    });
+    assert.equal(enabled.pingSettings.enabled, true);
+
+    const result = await request(server, "/api/pings/run", { method: "POST" });
+    assert.equal(result.records.length, 1);
+    assert.equal(result.records[0].success, true);
+});
+
+test("server pings with one random prompt from the prepared 30 simple questions", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const script = writeAgentScript(tempRoot, "agent-random-prompt.sh", [
+        "console.log(process.argv.slice(2).join(\" \"));",
+    ].join("\n"));
+    fs.mkdirSync(tempData, { recursive: true });
+    fs.writeFileSync(path.join(tempData, "state.json"), JSON.stringify({
+        version: 1,
+        directories: [tempRoot],
+        profiles: [{
+            id: "profile_claude_random_prompt",
+            name: "claude-random-prompt",
+            agentType: "claude",
+            command: script.command,
+            args: script.args,
+            envText: "",
+            promptTemplate: DEFAULT_RUN_PROMPT,
+            timeoutSeconds: 1,
+            enabled: true,
+            nonInteractive: true,
+            defaultDirectory: tempRoot,
+            configDirectory: "",
+            pingEnabled: true,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        }],
+        tasks: [],
+        events: [],
+        pingRecords: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    }), "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const state = await request(server, "/api/state");
+    assert.equal(state.pingQuestionCount, 30);
+
+    const result = await request(server, "/api/pings/run", { method: "POST" });
+    assert.equal(result.records.length, 1);
+    assert.equal(result.records[0].prompt, "What is 1+1?");
+    assert.notEqual(result.records[0].prompt, "hello");
+    assert.match(result.records[0].outputTail, /What is 1\+1\?/);
 });
 
 test("server stores model test configuration and masks profile tokens", async (t) => {
