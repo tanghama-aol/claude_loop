@@ -614,7 +614,7 @@ function createApp(options = {}) {
 
     function isAllDoneOutput(output) {
         const text = String(output || "");
-        return [ALL_DONE_MARKER, ...LEGACY_ALL_DONE_MARKERS].some((marker) => marker && text.includes(marker));
+        return [ALL_DONE_MARKER+ALL_DONE_MARKER].some((marker) => marker && text.includes(marker));
     }
 
     function profileConfigDescription(profile) {
