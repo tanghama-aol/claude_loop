@@ -1,25 +1,68 @@
-const statusText = {
-    not_started: "未开始",
-    scheduled: "已预约",
-    running: "运行中",
-    retry_wait: "等待重试",
-    completed: "已完成",
-    all_done: "全部完成",
-    stopped: "已停止",
-    failed: "执行失败",
-};
+let browserStorage = null;
+try {
+    browserStorage = window.localStorage;
+} catch {
+    browserStorage = null;
+}
 
-const runtimeStateText = {
-    agent_running: "Agent 运行中",
-    idle_waiting: "空闲等待中",
-    loop_not_started: "循环未启动",
+const i18n = AgentLoopI18n.createI18n({
+    storage: browserStorage,
+    navigatorLanguage: navigator.language,
+    documentRef: document,
+});
+const t = (key, params = {}) => i18n.t(key, params);
+const MEDIA_FORMAT_OPTIONS = {
+    image: ["png", "jpg", "webp", "gif", "avif"],
+    video: ["mp4", "webm", "mov", "mkv", "m4v"],
 };
+const TERMINAL_EVENT_TYPES = new Set(["stdout", "stderr", "error"]);
+const COMMAND_EVENT_TYPES = new Set(["command", "prompt", "profile_config"]);
+const WARNING_EVENT_TYPES = new Set(["retry_wait", "profile_switched", "timeout", "no_output"]);
+const ERROR_EVENT_TYPES = new Set(["stderr", "error", "process_error", "task_failed", "generation_failed"]);
+const RESULT_EVENT_TYPES = new Set(["task_completed", "task_all_done", "generation_completed"]);
+const STOP_EVENT_TYPES = new Set(["task_stopped", "user_stopped"]);
+const LOG_METADATA_KEYS = [
+    "pid",
+    "exitCode",
+    "signal",
+    "durationMs",
+    "outputChunks",
+    "stdoutBytes",
+    "stderrBytes",
+    "retryCount",
+    "delayMs",
+    "stallCount",
+    "reason",
+    "directory",
+    "cwd",
+];
+const MAX_LEGACY_LOG_RENDER_CHARS = 256 * 1024;
 
 const state = {
     data: null,
     selectedProfileId: "",
     selectedTaskId: "",
     activeView: "dashboard",
+    log: {
+        taskId: "",
+        runId: "",
+        events: [],
+        content: "",
+        contentBytes: 0,
+        contentReturnedBytes: 0,
+        contentOmittedBytes: 0,
+        contentTruncated: false,
+        runs: [],
+        format: "empty",
+        status: "missing",
+        warnings: [],
+        nextCursor: 0,
+        loading: false,
+        error: "",
+        following: true,
+        requestId: 0,
+        abortController: null,
+    },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -37,7 +80,7 @@ function escapeHtml(value) {
 function formatTime(value) {
     if (!value) return "-";
     try {
-        return new Intl.DateTimeFormat("zh-CN", {
+        return new Intl.DateTimeFormat(i18n.getLocale(), {
             month: "2-digit",
             day: "2-digit",
             hour: "2-digit",
@@ -47,6 +90,381 @@ function formatTime(value) {
     } catch {
         return value;
     }
+}
+
+function translatedOr(key, fallback, params = {}) {
+    const translated = t(key, params);
+    return translated === key ? fallback : translated;
+}
+
+function formatDuration(value) {
+    const milliseconds = Number(value);
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) return String(value ?? "-");
+    if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+    if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)} s`;
+    const minutes = Math.floor(milliseconds / 60000);
+    const seconds = Math.round((milliseconds % 60000) / 1000);
+    return `${minutes}m ${seconds}s`;
+}
+
+function formatLogBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return String(value ?? "-");
+    return formatBytes(bytes);
+}
+
+function eventTypeLabel(type) {
+    const normalized = String(type || "system").trim().toLowerCase() || "system";
+    const fallback = normalized
+        .split("_")
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+    return translatedOr(`logEvent.${normalized}`, fallback || "System");
+}
+
+function phaseLabel(phase) {
+    const normalized = String(phase || "run").trim().toLowerCase() || "run";
+    return translatedOr(`logPhase.${normalized}`, normalized);
+}
+
+function streamLabel(stream) {
+    const normalized = String(stream || "").trim().toLowerCase();
+    return normalized ? translatedOr(`logStream.${normalized}`, normalized) : "";
+}
+
+function logEventKind(event) {
+    const type = String(event?.type || "system").toLowerCase();
+    const stream = String(event?.stream || "").toLowerCase();
+    if (ERROR_EVENT_TYPES.has(type) || stream === "stderr" || stream === "error") return "error";
+    if (RESULT_EVENT_TYPES.has(type)) return "result";
+    if (STOP_EVENT_TYPES.has(type)) return "stopped";
+    if (WARNING_EVENT_TYPES.has(type)) return "warning";
+    if (COMMAND_EVENT_TYPES.has(type)) return "input";
+    if (type === "stdout" || stream === "stdout") return "agent";
+    if (["task_created", "task_file_saved", "task_items_appended"].includes(type)) return "setup";
+    if (["agent_selected", "generation_started", "process_started", "first_output", "process_exit", "task_started", "task_scheduled"].includes(type)) return "stage";
+    return "system";
+}
+
+function eventProfileSummary(profile) {
+    if (!profile || typeof profile !== "object") return "";
+    return [profile.name, profile.provider || profile.agentType, profile.modelName]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+        .join(" · ");
+}
+
+function sameEventProfile(left, right) {
+    return String(left?.profile?.id || left?.profile?.name || "")
+        === String(right?.profile?.id || right?.profile?.name || "");
+}
+
+function joinLogChunks(left, right) {
+    const first = String(left || "");
+    const second = String(right || "");
+    if (!first) return second;
+    if (!second) return first;
+    return first.endsWith("\n") || second.startsWith("\n") ? `${first}${second}` : `${first}\n${second}`;
+}
+
+function legacyLogPreview(value) {
+    const content = String(value || "");
+    if (content.length <= MAX_LEGACY_LOG_RENDER_CHARS) {
+        return { content, truncated: false };
+    }
+    return {
+        content: content.slice(-MAX_LEGACY_LOG_RENDER_CHARS),
+        truncated: true,
+    };
+}
+
+function coalesceLogEvents(events) {
+    const groups = [];
+    for (const rawEvent of events || []) {
+        const event = rawEvent && typeof rawEvent === "object" ? { ...rawEvent } : null;
+        if (!event) continue;
+        const type = String(event.type || "system").toLowerCase();
+        const previous = groups[groups.length - 1];
+        const canMerge = previous
+            && TERMINAL_EVENT_TYPES.has(type)
+            && String(previous.type || "").toLowerCase() === type
+            && String(previous.stream || "") === String(event.stream || "")
+            && String(previous.runId || "") === String(event.runId || "")
+            && String(previous.phase || "") === String(event.phase || "")
+            && sameEventProfile(previous, event);
+        if (!canMerge) {
+            groups.push({
+                ...event,
+                _chunkCount: 1,
+                _lastSequence: Number(event.sequence || 0),
+                _lastTimestamp: event.timestamp || null,
+            });
+            continue;
+        }
+        previous.text = joinLogChunks(previous.text, event.text);
+        previous._chunkCount += 1;
+        previous._lastSequence = Number(event.sequence || previous._lastSequence || 0);
+        previous._lastTimestamp = event.timestamp || previous._lastTimestamp;
+    }
+    return groups;
+}
+
+function metadataLabel(key) {
+    return translatedOr(`logMeta.${key}`, key);
+}
+
+function metadataValue(key, value) {
+    if (key === "durationMs" || key === "delayMs") return formatDuration(value);
+    if (key === "stdoutBytes" || key === "stderrBytes") return formatLogBytes(value);
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function visibleLogMetadata(event) {
+    const metadata = event?.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata)
+        ? event.metadata
+        : {};
+    return LOG_METADATA_KEYS
+        .filter((key) => Object.prototype.hasOwnProperty.call(metadata, key) && metadata[key] !== null && metadata[key] !== "")
+        .map((key) => [key, metadataValue(key, metadata[key])]);
+}
+
+function logSequenceLabel(event) {
+    const start = Number(event?.sequence || 0);
+    const end = Number(event?._lastSequence || start);
+    if (!start) return "";
+    return start === end ? `#${start}` : `#${start}–${end}`;
+}
+
+function renderLogEventText(event) {
+    const text = String(event?.text ?? "");
+    const lines = text ? text.split(/\r?\n/).length : 0;
+    const isLong = text.length > 900 || lines > 12;
+    const pre = `<pre class="log-event-text">${escapeHtml(text || "-")}</pre>`;
+    if (!isLong) return pre;
+    const lead = (text.split(/\r?\n/).find((line) => line.trim()) || "")
+        .trim()
+        .slice(0, 110);
+    const summary = translatedOr("runtime.expandLog", `${lines} lines`, { count: lines });
+    const open = logEventKind(event) === "agent" || logEventKind(event) === "error" ? " open" : "";
+    return `
+        <details class="log-event-details"${open}>
+            <summary><span>${escapeHtml(summary)}</span>${lead ? `<code>${escapeHtml(lead)}</code>` : ""}</summary>
+            ${pre}
+        </details>
+    `;
+}
+
+function renderLogEventExtras(event) {
+    const metadata = event?.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata)
+        ? event.metadata
+        : {};
+    const items = Array.isArray(metadata.items) ? metadata.items : [];
+    const artifacts = Array.isArray(metadata.artifacts) ? metadata.artifacts : [];
+    const blocks = [];
+    if (items.length > 0) {
+        blocks.push(`
+            <section class="log-event-list">
+                <strong>${escapeHtml(t("runtime.appendedItemsLabel"))}</strong>
+                <ol>${items.slice(0, 100).map((item) => `<li>${escapeHtml(typeof item === "string" ? item : item?.text || item?.title || JSON.stringify(item))}</li>`).join("")}</ol>
+                ${items.length > 100 ? `<span>${escapeHtml(t("runtime.moreItems", { count: items.length - 100 }))}</span>` : ""}
+            </section>
+        `);
+    }
+    if (artifacts.length > 0) {
+        blocks.push(`
+            <div class="log-event-artifacts"><b>${escapeHtml(t("runtime.artifactsLabel"))}</b>${artifacts.map((item) => `<code>${escapeHtml(item)}</code>`).join("")}</div>
+        `);
+    }
+    return blocks.join("");
+}
+
+function renderLogEvent(event) {
+    const kind = logEventKind(event);
+    const profile = eventProfileSummary(event.profile);
+    const stream = streamLabel(event.stream);
+    const metadata = visibleLogMetadata(event);
+    const chunkLabel = Number(event._chunkCount || 1) > 1
+        ? translatedOr("runtime.logChunks", `${event._chunkCount} chunks`, { count: event._chunkCount })
+        : "";
+    return `
+        <article class="log-event log-event-${escapeHtml(kind)}" data-event-type="${escapeHtml(event.type || "system")}" data-sequence="${escapeHtml(event.sequence || "")}">
+            <div class="log-event-rail" aria-hidden="true">
+                <span class="log-event-dot"></span>
+                <span class="log-event-sequence">${escapeHtml(logSequenceLabel(event))}</span>
+            </div>
+            <div class="log-event-body">
+                <header class="log-event-head">
+                    <div class="log-event-identity">
+                        <span class="log-event-label">${escapeHtml(eventTypeLabel(event.type))}</span>
+                        <span class="log-event-phase">${escapeHtml(phaseLabel(event.phase))}</span>
+                        ${stream ? `<span class="log-stream-chip log-stream-${escapeHtml(event.stream)}">${escapeHtml(stream)}</span>` : ""}
+                        ${chunkLabel ? `<span class="log-chunk-count">${escapeHtml(chunkLabel)}</span>` : ""}
+                    </div>
+                    <time datetime="${escapeHtml(event.timestamp || "")}">${escapeHtml(formatTime(event.timestamp))}</time>
+                </header>
+                ${profile ? `<div class="log-event-profile"><span class="agent-orb"></span>${escapeHtml(profile)}</div>` : ""}
+                ${renderLogEventText(event)}
+                ${renderLogEventExtras(event)}
+                ${metadata.length ? `
+                    <div class="log-event-metadata">
+                        ${metadata.map(([key, value]) => `<span><b>${escapeHtml(metadataLabel(key))}</b>${escapeHtml(value)}</span>`).join("")}
+                    </div>
+                ` : ""}
+            </div>
+        </article>
+    `;
+}
+
+function isLogNearBottom(node, threshold = 56) {
+    if (!node) return true;
+    return node.scrollHeight - node.scrollTop - node.clientHeight <= threshold;
+}
+
+function setLogFollowing(following, scroll = false) {
+    state.log.following = Boolean(following);
+    const view = $("#logView");
+    if (scroll && view) view.scrollTop = view.scrollHeight;
+    const button = $("#followLog");
+    if (!button) return;
+    button.classList.toggle("paused", !state.log.following);
+    button.setAttribute("aria-pressed", String(state.log.following));
+    button.textContent = state.log.following
+        ? t("runtime.pauseFollow")
+        : t("runtime.followLatest");
+}
+
+function runOptionLabel(run) {
+    const status = statusLabel(run?.status || "running");
+    const time = formatTime(run?.startedAt || run?.scheduledAt || run?.lastEventAt);
+    const events = Number(run?.eventCount || 0);
+    return `${time} · ${status} · ${translatedOr("runtime.eventCount", `${events} events`, { count: events })}`;
+}
+
+function runSummaryLabel(run) {
+    if (!run) return t("runtime.allRuns");
+    const status = statusLabel(run.status || "running");
+    return `${formatTime(run.startedAt || run.scheduledAt || run.lastEventAt)} · ${status}`;
+}
+
+function renderLogRunOptions() {
+    const select = $("#logRunSelect");
+    if (!select) return;
+    const selected = state.log.runId || "";
+    const options = [
+        `<option value="" ${selected ? "" : "selected"}>${escapeHtml(t("runtime.allRuns"))}</option>`,
+        ...(state.log.runs || []).map((run) => `
+            <option value="${escapeHtml(run.runId)}" ${run.runId === selected ? "selected" : ""}>${escapeHtml(runOptionLabel(run))}</option>
+        `),
+    ];
+    select.innerHTML = options.join("");
+    select.disabled = !state.log.taskId || state.log.loading;
+}
+
+function renderLogNotice() {
+    const notice = $("#logNotice");
+    if (!notice) return;
+    const warningMessages = (state.log.warnings || [])
+        .map((warning) => warning?.message || warning?.code || "")
+        .filter(Boolean);
+    const messages = state.log.error ? [state.log.error] : warningMessages;
+    if (messages.length === 0) {
+        notice.hidden = true;
+        notice.textContent = "";
+        notice.className = "log-notice";
+        return;
+    }
+    notice.hidden = false;
+    notice.className = `log-notice ${state.log.error ? "log-notice-error" : "log-notice-warning"}`;
+    notice.textContent = messages.join(" · ");
+}
+
+function renderConversationLog({ forceFollow = false } = {}) {
+    const view = $("#logView");
+    if (!view) return;
+    const previousScrollTop = view.scrollTop;
+    const shouldFollow = forceFollow || state.log.following;
+    view.setAttribute("aria-busy", String(state.log.loading));
+
+    if (state.log.loading && state.log.events.length === 0 && !state.log.content) {
+        view.innerHTML = `
+            <div class="log-state log-state-loading">
+                <span class="loading-pulse"></span>
+                <strong>${escapeHtml(t("runtime.logLoading"))}</strong>
+                <span>${escapeHtml(t("runtime.logLoadingHint"))}</span>
+            </div>
+        `;
+    } else if (state.log.error && state.log.events.length === 0 && !state.log.content) {
+        view.innerHTML = `
+            <div class="log-state log-state-error">
+                <strong>${escapeHtml(t("runtime.logFailed"))}</strong>
+                <span>${escapeHtml(state.log.error)}</span>
+            </div>
+        `;
+    } else if (state.log.events.length > 0) {
+        const groupedEvents = coalesceLogEvents(state.log.events);
+        view.innerHTML = `
+            <div class="conversation-intro">
+                <span class="conversation-kicker">${escapeHtml(t("runtime.workflowKicker"))}</span>
+                <strong>${escapeHtml(translatedOr("runtime.workflowLoaded", "Workflow loaded", { count: state.log.events.length }))}</strong>
+                <span>${escapeHtml(t("runtime.workflowHint"))}</span>
+            </div>
+            <div class="log-timeline">
+                ${groupedEvents.map(renderLogEvent).join("")}
+            </div>
+        `;
+    } else if (state.log.content) {
+        view.innerHTML = `
+            <div class="conversation-intro legacy-intro">
+                <span class="conversation-kicker">${escapeHtml(t("runtime.legacyKicker"))}</span>
+                <strong>${escapeHtml(t("runtime.legacyLog"))}</strong>
+                <span>${escapeHtml(t("runtime.legacyLogHint"))}</span>
+            </div>
+            <pre class="legacy-log-view">${escapeHtml(state.log.content)}</pre>
+        `;
+    } else {
+        view.innerHTML = `
+            <div class="log-state log-state-empty">
+                <strong>${escapeHtml(t("log.empty"))}</strong>
+                <span>${escapeHtml(t("runtime.logEmptyHint"))}</span>
+            </div>
+        `;
+    }
+
+    const eventCount = state.log.events.length;
+    const format = translatedOr(`logFormat.${state.log.format}`, state.log.format || "empty");
+    const runLabel = state.log.runId
+        ? runSummaryLabel((state.log.runs || []).find((run) => run.runId === state.log.runId) || { runId: state.log.runId })
+        : t("runtime.allRuns");
+    $("#logSummary").textContent = state.log.taskId
+        ? `${translatedOr("runtime.eventCount", `${eventCount} events`, { count: eventCount })} · ${runLabel} · ${format}`
+        : t("runtime.noTask");
+    $("#logCursor").textContent = state.log.taskId
+        ? `${translatedOr("runtime.cursor", "Cursor", { value: state.log.nextCursor || 0 })} · ${state.log.loading ? t("runtime.syncing") : t("runtime.synced")}`
+        : "";
+    renderLogRunOptions();
+    renderLogNotice();
+    setLogFollowing(state.log.following);
+
+    if (shouldFollow) {
+        view.scrollTop = view.scrollHeight;
+    } else {
+        view.scrollTop = previousScrollTop;
+    }
+}
+
+function logPlainText() {
+    if (state.log.events.length === 0) return state.log.content || "";
+    return state.log.events.map((event) => {
+        const profile = eventProfileSummary(event.profile);
+        const heading = [event.timestamp, event.type, profile].filter(Boolean).join(" · ");
+        return `[${heading}]\n${String(event.text || "")}`;
+    }).join("\n\n");
 }
 
 function parseScheduleInput(value) {
@@ -90,19 +508,43 @@ async function api(path, options = {}) {
         body: options.body ? JSON.stringify(options.body) : undefined,
     });
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "请求失败");
+    if (!response.ok) throw new Error(payload.error || t("api.requestFailed"));
     return payload;
 }
 
-function profileOptions(selected = "") {
+function modalityLabel(modality) {
+    const key = `modality.${modality}`;
+    const translated = t(key);
+    return translated === key ? modality : translated;
+}
+
+function profileSupports(profile, modality = "text") {
+    const outputs = Array.isArray(profile?.outputModalities) && profile.outputModalities.length
+        ? profile.outputModalities
+        : ["text"];
+    return outputs.includes(modality);
+}
+
+function profileOptions(selected = "", outputModality = "") {
     const profiles = state.data?.profiles || [];
     const selectedIds = new Set((Array.isArray(selected) ? selected : [selected])
         .map((id) => String(id || ""))
         .filter(Boolean));
     return profiles
-        .filter((profile) => profile.enabled !== false)
-        .map((profile) => `<option value="${escapeHtml(profile.id)}" ${selectedIds.has(profile.id) ? "selected" : ""}>${escapeHtml(profile.name)} · ${escapeHtml(profile.agentType)}</option>`)
+        .filter((profile) => profile.enabled !== false && (!outputModality || profileSupports(profile, outputModality)))
+        .map((profile) => {
+            const provider = profile.provider || profile.agentType;
+            const outputs = (profile.outputModalities || ["text"]).map(modalityLabel).join("+");
+            return `<option value="${escapeHtml(profile.id)}" ${selectedIds.has(profile.id) ? "selected" : ""}>${escapeHtml(profile.name)} · ${escapeHtml(provider)} · ${escapeHtml(outputs)}</option>`;
+        })
         .join("");
+}
+
+function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function directoryOptions(selected = "") {
@@ -136,15 +578,23 @@ function taskRuntimeState(task) {
 }
 
 function taskRuntimeLabel(task) {
-    if (task?.status === "scheduled") return "预约等待中";
+    if (task?.status === "scheduled") return t("runtimeState.scheduled");
     const runtimeState = taskRuntimeState(task);
-    return runtimeStateText[runtimeState] || runtimeState;
+    const key = `runtimeState.${runtimeState}`;
+    const translated = t(key);
+    return translated === key ? runtimeState : translated;
+}
+
+function statusLabel(status) {
+    const key = `status.${status}`;
+    const translated = t(key);
+    return translated === key ? status : translated;
 }
 
 function processSummary(processInfo) {
     if (!processInfo) return "-";
     const pid = processInfo.pid ? `PID ${processInfo.pid}` : "PID -";
-    const profile = [processInfo.profileName, processInfo.agentType].filter(Boolean).join(" · ");
+    const profile = [processInfo.profileName, processInfo.provider || processInfo.agentType, processInfo.modelName].filter(Boolean).join(" · ");
     return [pid, profile].filter(Boolean).join(" · ");
 }
 
@@ -156,7 +606,7 @@ function profileNames(ids) {
 }
 
 function successText(value) {
-    return value ? "成功" : "失败";
+    return value ? t("ping.successText") : t("ping.failureText");
 }
 
 function getSelectedTask() {
@@ -170,10 +620,10 @@ function renderMetrics() {
     const idleWaiting = tasks.filter((task) => taskRuntimeState(task) === "idle_waiting").length;
     const loopNotStarted = tasks.filter((task) => taskRuntimeState(task) === "loop_not_started").length;
     $("#metrics").innerHTML = [
-        ["Profiles", profiles.length, "可用运行配置"],
-        ["Agent 运行中", agentRunning, "当前子进程"],
-        ["空闲等待中", idleWaiting, "等待下一轮"],
-        ["循环未启动", loopNotStarted, "无活跃循环"],
+        [t("metric.profiles.label"), profiles.length, t("metric.profiles.caption")],
+        [t("metric.agentRunning.label"), agentRunning, t("metric.agentRunning.caption")],
+        [t("metric.idleWaiting.label"), idleWaiting, t("metric.idleWaiting.caption")],
+        [t("metric.loopNotStarted.label"), loopNotStarted, t("metric.loopNotStarted.caption")],
     ].map(([label, value, caption]) => `
         <div class="metric">
             <span>${label}</span>
@@ -185,7 +635,7 @@ function renderMetrics() {
 
 function renderTasks() {
     const tasks = state.data?.tasks || [];
-    const empty = `<div class="empty">暂无任务。</div>`;
+    const empty = `<div class="empty">${escapeHtml(t("empty.tasks"))}</div>`;
     const cards = tasks.map((task) => {
         const runtimeState = taskRuntimeState(task);
         const processMeta = task.activeProcess ? `<span>${escapeHtml(processSummary(task.activeProcess))}</span>` : "";
@@ -194,12 +644,14 @@ function renderTasks() {
             <div>
                 <p class="task-title">${escapeHtml(task.title)}</p>
                 <div class="meta">
+                    <span class="modality-chip ${escapeHtml(task.taskType || "text")}">${escapeHtml(modalityLabel(task.taskType || "text"))}</span>
                     <span>${escapeHtml(task.targetFileName)}</span>
                     <span>${escapeHtml(task.directory)}</span>
                     <span>${escapeHtml(profileNames(taskProfileIds(task)))}</span>
-                    <span>结果 ${escapeHtml(statusText[task.status] || task.status)}</span>
+                    <span>${escapeHtml(t("task.meta.result", { value: statusLabel(task.status) }))}</span>
                     ${processMeta}
-                    <span>重试 ${task.retryCount || 0}</span>
+                    ${(task.taskType || "text") !== "text" ? `<span>${escapeHtml(t("task.meta.artifacts", { count: task.artifactCount || 0 }))}</span>` : ""}
+                    <span>${escapeHtml(t("task.meta.retry", { count: task.retryCount || 0 }))}</span>
                 </div>
             </div>
             <span class="badge ${escapeHtml(runtimeState)}">${escapeHtml(taskRuntimeLabel(task))}</span>
@@ -214,20 +666,23 @@ function renderTasks() {
             <div>
                 <p class="task-title">${escapeHtml(task.title)}</p>
                 <div class="meta">
+                    <span class="modality-chip ${escapeHtml(task.taskType || "text")}">${escapeHtml(modalityLabel(task.taskType || "text"))}</span>
                     <span>${escapeHtml(task.targetFileName)}</span>
-                    <span>Profile ${escapeHtml(profileNames(taskProfileIds(task)))}</span>
-                    <span>结果 ${escapeHtml(statusText[task.status] || task.status)}</span>
+                    <span>${escapeHtml(t("task.meta.profile", { value: profileNames(taskProfileIds(task)) }))}</span>
+                    <span>${escapeHtml(t("task.meta.result", { value: statusLabel(task.status) }))}</span>
+                    ${(task.taskType || "text") !== "text" ? `<span>${escapeHtml(t("task.meta.artifacts", { count: task.artifactCount || 0 }))}</span>` : ""}
                     <span>${formatTime(task.updatedAt)}</span>
                 </div>
             </div>
             <div class="task-actions">
                 <span class="badge ${escapeHtml(runtimeState)}">${escapeHtml(taskRuntimeLabel(task))}</span>
-                <button class="ghost" type="button" data-open-task="${escapeHtml(task.id)}">打开</button>
+                <button class="ghost" type="button" data-open-history="${escapeHtml(task.id)}" data-open-task="${escapeHtml(task.id)}">${escapeHtml(t("common.logs"))}</button>
+                <button class="ghost" type="button" data-edit-task="${escapeHtml(task.id)}">${escapeHtml(t("common.edit"))}</button>
             </div>
         </article>
     `;
     }).join("") || empty;
-    $("#taskCount").textContent = `${tasks.length} 个任务`;
+    $("#taskCount").textContent = i18n.count("task.count", tasks.length);
 }
 
 function renderEvents() {
@@ -237,7 +692,7 @@ function renderEvents() {
             <time>${formatTime(event.createdAt)} · ${escapeHtml(event.type)}</time>
             <div>${escapeHtml(event.message)}</div>
         </article>
-    `).join("") || `<div class="empty">暂无事件。</div>`;
+    `).join("") || `<div class="empty">${escapeHtml(t("empty.events"))}</div>`;
 }
 
 function findProfileName(id) {
@@ -250,24 +705,31 @@ function renderProfiles() {
         <article class="profile-card">
             <p class="profile-title">${escapeHtml(profile.name)}</p>
             <div class="meta">
+                <span>${escapeHtml(profile.provider || "custom")}</span>
                 <span>${escapeHtml(profile.agentType)}</span>
                 <span>${escapeHtml(profile.command)}</span>
-                <span>${profile.enabled === false ? "禁用" : "启用"}</span>
+                <span>${escapeHtml(profile.enabled === false ? t("profile.state.disabled") : t("profile.state.enabled"))}</span>
             </div>
             <div class="meta">
                 <span>${escapeHtml(profile.args || "-")}</span>
                 <span>ENV ${profile.envKeys?.length || 0}</span>
             </div>
             <div class="meta">
-                <span>模型 ${escapeHtml(profile.modelName || "-")}</span>
-                <span>Base ${escapeHtml(profile.baseUrl || "-")}</span>
-                <span>Token ${profile.apiTokenConfigured ? escapeHtml(profile.apiTokenPreview || "已配置") : "-"}</span>
-                <span>测试 ${profile.pingEnabled === false ? "关闭" : `${profile.pingIntervalMinutes || 60} 分钟`}</span>
-                <span>配置 ${escapeHtml(profile.configDirectory || "-")}</span>
+                ${(profile.inputModalities || ["text"]).map((item) => `<span class="modality-chip ${escapeHtml(item)}">IN ${escapeHtml(modalityLabel(item))}</span>`).join("")}
+                ${(profile.outputModalities || ["text"]).map((item) => `<span class="modality-chip ${escapeHtml(item)}">OUT ${escapeHtml(modalityLabel(item))}</span>`).join("")}
             </div>
-            <button class="ghost" type="button" data-edit-profile="${escapeHtml(profile.id)}">编辑</button>
+            <div class="meta">
+                <span>${escapeHtml(t("profile.card.model", { value: profile.modelName || "-" }))}</span>
+                <span>Base ${escapeHtml(profile.baseUrl || "-")}</span>
+                <span>Token ${profile.apiTokenConfigured ? escapeHtml(profile.apiTokenPreview || t("profile.card.tokenConfigured")) : "-"}</span>
+                <span>${escapeHtml(profile.pingEnabled === false
+                    ? t("profile.card.testOff")
+                    : t("profile.card.testInterval", { minutes: profile.pingIntervalMinutes || 60 }))}</span>
+                <span>${escapeHtml(t("profile.card.config", { value: profile.configDirectory || "-" }))}</span>
+            </div>
+            <button class="ghost" type="button" data-edit-profile="${escapeHtml(profile.id)}">${escapeHtml(t("common.edit"))}</button>
         </article>
-    `).join("") || `<div class="empty">暂无 Profile。</div>`;
+    `).join("") || `<div class="empty">${escapeHtml(t("empty.profiles"))}</div>`;
 }
 
 function renderPings() {
@@ -279,30 +741,30 @@ function renderPings() {
     if (runButton) runButton.disabled = state.data?.pingRunning === true || !pingEnabled;
     if (pingToggle) pingToggle.checked = pingEnabled;
     const baseSummary = records.length
-        ? `${records.length} records | latest ${records[0].minute || formatTime(records[0].createdAt)}`
-        : "0 records";
-    $("#pingSummary").textContent = `${pingEnabled ? "enabled" : "disabled"} | ${state.data?.pingQuestionCount || 0} questions | ${baseSummary}`;
+        ? `${i18n.count("ping.records", records.length)} | ${t("ping.latest", { value: records[0].minute || formatTime(records[0].createdAt) })}`
+        : i18n.count("ping.records", 0);
+    $("#pingSummary").textContent = `${pingEnabled ? t("ping.enabled") : t("ping.disabled")} | ${t("ping.questions", { count: state.data?.pingQuestionCount || 0 })} | ${baseSummary}`;
     $("#pingDays").innerHTML = days.map((day) => `
         <article class="ping-day">
             <div class="ping-day-head">
                 <div>
                     <p class="ping-date">${escapeHtml(day.date)}</p>
                     <div class="meta">
-                        <span>total ${day.total}</span>
-                        <span>success ${day.success}</span>
-                        <span>failed ${day.failed}</span>
+                        <span>${escapeHtml(t("ping.total", { count: day.total }))}</span>
+                        <span>${escapeHtml(t("ping.success", { count: day.success }))}</span>
+                        <span>${escapeHtml(t("ping.failed", { count: day.failed }))}</span>
                     </div>
                 </div>
             </div>
-            <div class="ping-table" role="table" aria-label="${escapeHtml(day.date)} Ping records">
+            <div class="ping-table" role="table" aria-label="${escapeHtml(t("ping.recordsLabel", { date: day.date }))}">
                 <div class="ping-row ping-row-head" role="row">
-                    <span role="columnheader">minute</span>
-                    <span role="columnheader">model</span>
-                    <span role="columnheader">Base URL</span>
-                    <span role="columnheader">question</span>
-                    <span role="columnheader">interval</span>
-                    <span role="columnheader">success</span>
-                    <span role="columnheader">exit</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.minute"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.model"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.baseUrl"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.question"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.interval"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.success"))}</span>
+                    <span role="columnheader">${escapeHtml(t("ping.column.exit"))}</span>
                 </div>
                 ${day.records.map((record) => `
                     <div class="ping-row" role="row">
@@ -319,7 +781,7 @@ function renderPings() {
                 `).join("")}
             </div>
         </article>
-    `).join("") || `<div class="empty">No Ping records.</div>`;
+    `).join("") || `<div class="empty">${escapeHtml(t("empty.pings"))}</div>`;
 }
 
 function renderSelectors() {
@@ -328,18 +790,19 @@ function renderSelectors() {
     if (!state.selectedProfileId && firstProfile) state.selectedProfileId = firstProfile.id;
     if (!state.selectedTaskId && firstTask) state.selectedTaskId = firstTask.id;
     const selectedTask = getSelectedTask();
+    const taskFormType = $("#taskForm")?.elements.taskType?.value || "text";
 
     $$("select[name='directory']").forEach((select) => {
         const selected = select.value || state.data?.directories?.[0] || "";
         select.innerHTML = directoryOptions(selected);
     });
     $$("select[name='decomposeProfileId']").forEach((select) => {
-        select.innerHTML = profileOptions(select.value || state.selectedProfileId);
+        select.innerHTML = profileOptions(select.value || state.selectedProfileId, "text");
     });
     $$("select[name='runProfileIds']").forEach((select) => {
         const selected = selectedValues(select);
         const fallback = selected.length ? selected : [state.selectedProfileId].filter(Boolean);
-        select.innerHTML = profileOptions(fallback);
+        select.innerHTML = profileOptions(fallback, taskFormType);
     });
     $("#editorTask").innerHTML = taskOptions($("#editorTask").value || state.selectedTaskId);
     $("#runTask").innerHTML = taskOptions($("#runTask").value || state.selectedTaskId);
@@ -349,8 +812,8 @@ function renderSelectors() {
         : taskProfileIds(selectedTask).length
             ? taskProfileIds(selectedTask)
             : [state.selectedProfileId].filter(Boolean);
-    $("#runProfiles").innerHTML = profileOptions(runProfileIds);
-    $("#decomposeProfile").innerHTML = profileOptions($("#decomposeProfile").value || selectedTask?.decomposeProfileId || state.selectedProfileId);
+    $("#runProfiles").innerHTML = profileOptions(runProfileIds, selectedTask?.taskType || "text");
+    $("#decomposeProfile").innerHTML = profileOptions($("#decomposeProfile").value || selectedTask?.decomposeProfileId || state.selectedProfileId, "text");
 }
 
 function renderDirectories() {
@@ -358,51 +821,125 @@ function renderDirectories() {
     $("#directoryList").innerHTML = directories.map((directory, index) => `
         <div class="directory-item">
             <span>${escapeHtml(directory)}</span>
-            <button class="ghost" type="button" data-delete-dir="${encodeURIComponent(directory)}" ${index === 0 ? "disabled" : ""}>移除</button>
+            <button class="ghost" type="button" data-delete-dir="${encodeURIComponent(directory)}" ${index === 0 ? "disabled" : ""}>${escapeHtml(t("common.remove"))}</button>
         </div>
     `).join("");
 }
 
+function taskCanAppend(task) {
+    if (!task || task.isRunning || task.loopActive) return false;
+    return !["running", "scheduled", "retry_wait"].includes(String(task.status || ""));
+}
+
+function renderRuntimeContext(task) {
+    const subtitle = $("#runtimeTaskSubtitle");
+    const badge = $("#runtimeStatusBadge");
+    const appendButton = $("#appendTaskButton");
+    const appendItems = $("#appendTaskItems");
+    const appendStandard = $("#appendCompletionStandard");
+    const eligibility = $("#appendEligibility");
+    if (!task) {
+        if (subtitle) subtitle.textContent = t("runtime.noTask");
+        if (badge) {
+            badge.className = "badge loop_not_started";
+            badge.textContent = "-";
+        }
+        if (appendButton) appendButton.disabled = true;
+        if (appendItems) appendItems.disabled = true;
+        if (appendStandard) appendStandard.disabled = true;
+        if (eligibility) {
+            eligibility.className = "append-eligibility unavailable";
+            eligibility.textContent = t("runtime.appendUnavailable");
+        }
+        return;
+    }
+
+    if (subtitle) subtitle.textContent = `${task.targetFileName || task.title} · ${task.directory || "-"}`;
+    if (badge) {
+        badge.className = `badge ${taskRuntimeState(task)}`;
+        badge.textContent = taskRuntimeLabel(task);
+    }
+    const canAppend = taskCanAppend(task);
+    if (appendButton) appendButton.disabled = !canAppend;
+    if (appendItems) appendItems.disabled = !canAppend;
+    if (appendStandard) appendStandard.disabled = !canAppend;
+    if (eligibility) {
+        eligibility.className = `append-eligibility ${canAppend ? "available" : "unavailable"}`;
+        eligibility.textContent = canAppend ? t("runtime.appendAvailable") : t("runtime.appendBusy");
+    }
+}
+
 function renderRunDetail() {
     const task = getSelectedTask();
+    renderRuntimeContext(task);
     if (!task) {
-        $("#runDetail").innerHTML = `<div class="empty">未选择任务。</div>`;
+        $("#runDetail").innerHTML = `<div class="empty">${escapeHtml(t("empty.noTaskSelected"))}</div>`;
         return;
     }
     const processInfo = task.activeProcess || null;
     const processRows = processInfo
         ? [
-            ["Agent 进程", processSummary(processInfo)],
-            ["进程启动", formatTime(processInfo.startedAt)],
-            ["进程输出", processInfo.lastOutputAt ? `${formatTime(processInfo.lastOutputAt)} · ${processInfo.outputChunks || 0} chunks` : "-"],
-            ["进程目录", processInfo.cwd || "-"],
-            ["进程命令", processInfo.commandSummary || "-", "block"],
+            [t("detail.agentProcess"), processSummary(processInfo)],
+            [t("detail.processStarted"), formatTime(processInfo.startedAt)],
+            [t("detail.processOutput"), processInfo.lastOutputAt ? `${formatTime(processInfo.lastOutputAt)} · ${processInfo.outputChunks || 0} chunks` : "-"],
+            [t("detail.processDirectory"), processInfo.cwd || "-"],
+            [t("detail.processCommand"), processInfo.commandSummary || "-", "block"],
         ]
-        : [["Agent 进程", "-"]];
+        : [[t("detail.agentProcess"), "-"]];
+    const taskType = task.taskType || "text";
+    const artifacts = Array.isArray(task.artifacts) ? task.artifacts : [];
     const rows = [
-        ["运行状态", taskRuntimeLabel(task)],
-        ["任务结果", statusText[task.status] || task.status],
-        ["当前 Profile", findProfileName(task.runProfileId)],
-        ["Profile 列表", profileNames(taskProfileIds(task))],
-        ["上次 Agent", task.lastProfileName ? `${task.lastProfileName} · ${task.lastProfileAgentType || "-"}` : "-"],
+        [t("detail.runtimeStatus"), taskRuntimeLabel(task)],
+        [t("detail.taskResult"), statusLabel(task.status)],
+        [t("detail.taskType"), modalityLabel(taskType)],
+        [t("detail.currentProfile"), findProfileName(task.runProfileId)],
+        [t("detail.profileList"), profileNames(taskProfileIds(task))],
+        [t("detail.lastAgent"), task.lastProfileName
+            ? [task.lastProfileName, task.lastProfileProvider || task.lastProfileAgentType, task.lastProfileModelName].filter(Boolean).join(" · ")
+            : "-"],
         ...processRows,
-        ["工作目录", task.directory],
-        ["任务文件", task.filePath],
-        ["最近启动", formatTime(task.lastRunAt)],
-        ["最近输出", formatTime(task.lastOutputAt)],
-        ["下次运行", formatTime(task.runtimeNextRunAt || task.nextRunAt)],
-        ["退出码", task.lastExitCode ?? "-"],
-        ["输出统计", `${task.lastOutputChunks || 0} chunks / stdout ${task.lastStdoutBytes || 0} bytes / stderr ${task.lastStderrBytes || 0} bytes`],
-        ["最近命令", task.lastCommand || "-", "block"],
-        ["最近 Prompt", task.lastPrompt || "-", "block"],
-        ["输出尾部", task.lastOutput || "-", "block"],
+        [t("detail.workingDirectory"), task.directory],
+        [t("detail.taskFile"), task.filePath],
+        ...(taskType === "text" ? [] : [
+            [t("detail.artifactDirectory"), task.artifactDirectory || "-"],
+            [t("detail.outputTarget"), [task.outputFileName, task.resolution, task.aspectRatio].filter(Boolean).join(" · ") || "-"],
+        ]),
+        [t("detail.lastStarted"), formatTime(task.lastRunAt)],
+        [t("detail.lastOutput"), formatTime(task.lastOutputAt)],
+        [t("detail.nextRun"), formatTime(task.runtimeNextRunAt || task.nextRunAt)],
+        [t("detail.exitCode"), task.lastExitCode ?? "-"],
+        [t("detail.outputStats"), `${task.lastOutputChunks || 0} chunks / stdout ${task.lastStdoutBytes || 0} bytes / stderr ${task.lastStderrBytes || 0} bytes`],
+        [t("detail.lastCommand"), task.lastCommand || "-", "block"],
+        [t("detail.lastPrompt"), task.lastPrompt || "-", "block"],
+        [t("detail.outputTail"), task.lastOutput || "-", "block"],
     ];
+    const artifactSection = taskType === "text" ? "" : `
+        <section class="artifact-section">
+            <div class="artifact-section-head">
+                <strong>${escapeHtml(t("artifact.heading"))}</strong>
+                <span class="hint">${escapeHtml(t("artifact.count", { count: artifacts.length }))}</span>
+            </div>
+            <div class="artifact-gallery">
+                ${artifacts.map((artifact) => `
+                    <article class="artifact-card">
+                        ${artifact.mediaType === "video"
+                            ? `<video controls preload="metadata" src="${escapeHtml(artifact.url)}"></video>`
+                            : `<img loading="lazy" src="${escapeHtml(artifact.url)}" alt="${escapeHtml(artifact.name)}">`}
+                        <div class="artifact-caption">
+                            <a href="${escapeHtml(artifact.url)}" target="_blank" rel="noopener">${escapeHtml(artifact.relativePath || artifact.name)}</a>
+                            <span>${escapeHtml(formatBytes(artifact.size))} · ${escapeHtml(formatTime(artifact.mtime))}</span>
+                        </div>
+                    </article>
+                `).join("") || `<div class="empty">${escapeHtml(t("artifact.empty"))}</div>`}
+            </div>
+        </section>
+    `;
     $("#runDetail").innerHTML = rows.map(([label, value, kind]) => `
         <div class="detail-row ${kind === "block" ? "detail-row-block" : ""}">
             <span>${label}</span>
             ${kind === "block" ? `<pre class="detail-pre">${escapeHtml(value)}</pre>` : `<span>${escapeHtml(value)}</span>`}
         </div>
-    `).join("");
+    `).join("") + artifactSection;
 }
 
 function renderAll() {
@@ -421,28 +958,44 @@ async function refresh() {
     renderAll();
 }
 
+function updateTokenPlaceholder(profile = null) {
+    const input = $("#profileForm").elements.apiToken;
+    input.placeholder = profile?.apiTokenConfigured
+        ? t("profile.tokenConfiguredPlaceholder", { token: profile.apiTokenPreview || "Token" })
+        : t("profile.tokenEmptyPlaceholder");
+}
+
+function setCheckedValues(form, name, values) {
+    const selected = new Set(Array.isArray(values) && values.length ? values : ["text"]);
+    $$(`input[name='${name}']`, form).forEach((input) => {
+        input.checked = selected.has(input.value);
+    });
+}
+
 function resetProfileForm(profile = null) {
     const form = $("#profileForm");
     form.reset();
     form.elements.id.value = profile?.id || "";
     form.elements.name.value = profile?.name || "";
     form.elements.agentType.value = profile?.agentType || "claude";
+    form.elements.provider.value = profile?.provider || (profile?.agentType === "codex" ? "openai" : profile?.agentType === "gemini" ? "google" : "anthropic");
     form.elements.command.value = profile?.command || "claude";
     form.elements.args.value = profile?.args || "-p {prompt}";
     form.elements.baseUrl.value = profile?.baseUrl || "";
     form.elements.apiToken.value = "";
-    form.elements.apiToken.placeholder = profile?.apiTokenConfigured
-        ? `已配置 ${profile.apiTokenPreview || "Token"}；留空保留`
-        : "留空表示不设置 Token";
+    updateTokenPlaceholder(profile);
     form.elements.modelName.value = profile?.modelName || "";
     form.elements.pingIntervalMinutes.value = profile?.pingIntervalMinutes || 60;
     form.elements.configDirectory.value = profile?.configDirectory || "";
     form.elements.envText.value = profile?.envText || "";
     form.elements.promptTemplate.value = profile?.promptTemplate || "";
+    form.elements.mediaPromptTemplate.value = profile?.mediaPromptTemplate || "";
     form.elements.timeoutSeconds.value = profile?.timeoutSeconds || 1800;
     form.elements.enabled.checked = profile?.enabled !== false;
     form.elements.nonInteractive.checked = profile?.nonInteractive !== false;
     form.elements.pingEnabled.checked = profile?.pingEnabled !== false;
+    setCheckedValues(form, "inputModalities", profile?.inputModalities || ["text"]);
+    setCheckedValues(form, "outputModalities", profile?.outputModalities || ["text"]);
     state.selectedProfileId = profile?.id || "";
 }
 
@@ -452,9 +1005,9 @@ function syncTaskSourceMode() {
     const isAgent = mode === "agent";
     const isUpload = mode === "upload";
     const sourceHelp = {
-        agent: "由生成 Profile 根据任务需求创建新的 Markdown 目标文件。",
-        existing: "使用所选工作目录中已经存在的 Markdown 文件；请在目标文件名填写该文件名，不会复制文件内容。",
-        upload: "从电脑选择一个 Markdown 文件，并复制保存到所选工作目录；目标文件名默认使用所选文件名，也可以手动改名。",
+        agent: t("task.sourceHelp.agent"),
+        existing: t("task.sourceHelp.existing"),
+        upload: t("task.sourceHelp.upload"),
     };
     $$(".task-generation-field").forEach((node) => {
         node.hidden = !isAgent;
@@ -466,11 +1019,40 @@ function syncTaskSourceMode() {
     form.elements.decomposeProfileId.required = isAgent;
     form.elements.sourceFile.required = isUpload;
     $("#taskSubmitButton").textContent = isAgent
-        ? "调用 Agent 生成"
+        ? t("task.submit.generate")
         : isUpload
-            ? "导入所选文件"
-            : "载入工作目录文件";
+            ? t("task.submit.import")
+            : t("task.submit.load");
     $("#taskSourceHelp").textContent = sourceHelp[mode] || sourceHelp.agent;
+}
+
+function syncTaskType() {
+    const form = $("#taskForm");
+    if (!form) return;
+    const taskType = form.elements.taskType.value || "text";
+    const mediaSettings = $("#mediaTaskSettings");
+    mediaSettings.hidden = taskType === "text";
+    $$(".video-only", mediaSettings).forEach((node) => {
+        node.hidden = taskType !== "video";
+    });
+
+    const formatSelect = form.elements.outputFormat;
+    const formats = MEDIA_FORMAT_OPTIONS[taskType] || [];
+    const previousFormat = formatSelect.value;
+    formatSelect.innerHTML = formats.map((format) => `<option value="${format}">${format.toUpperCase()}</option>`).join("");
+    if (formats.includes(previousFormat)) formatSelect.value = previousFormat;
+
+    const previousType = form.dataset.taskType || "text";
+    const outputFileInput = form.elements.outputFileName;
+    if (taskType !== "text" && (previousType !== taskType || !outputFileInput.value.trim())) {
+        const canReplace = !outputFileInput.value.trim() || /^result\.[a-z0-9]+$/i.test(outputFileInput.value.trim());
+        if (canReplace) outputFileInput.value = `result.${formats[0] || "bin"}`;
+    }
+    form.dataset.taskType = taskType;
+
+    const runSelect = form.elements.runProfileIds;
+    const selected = selectedValues(runSelect);
+    runSelect.innerHTML = profileOptions(selected, taskType);
 }
 
 function applySelectedTaskFile(file) {
@@ -495,26 +1077,186 @@ async function loadFile(taskId) {
     $("#runTask").value = taskId;
 }
 
-async function loadLog(taskId) {
-    if (!taskId) {
-        $("#logView").textContent = "";
-        return;
+function mergeLogEvents(current, incoming) {
+    const byKey = new Map();
+    for (const event of [...(current || []), ...(incoming || [])]) {
+        if (!event || typeof event !== "object") continue;
+        const key = event.id || `${event.sequence || 0}:${event.timestamp || ""}:${event.type || ""}`;
+        byKey.set(key, event);
     }
-    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/log`);
-    $("#logView").textContent = result.content || "暂无日志。";
+    return Array.from(byKey.values()).sort((left, right) => {
+        const sequenceDifference = Number(left.sequence || 0) - Number(right.sequence || 0);
+        if (sequenceDifference !== 0) return sequenceDifference;
+        return String(left.timestamp || "").localeCompare(String(right.timestamp || ""));
+    });
+}
+
+function cancelLogRequest() {
+    const controller = state.log.abortController;
+    if (!controller) return;
+    state.log.abortController = null;
+    state.log.requestId += 1;
+    state.log.loading = false;
+    controller.abort();
+}
+
+async function loadLog(taskId, options = {}) {
+    cancelLogRequest();
+    if (!taskId) {
+        state.log.requestId += 1;
+        Object.assign(state.log, {
+            taskId: "",
+            runId: "",
+            events: [],
+            content: "",
+            contentBytes: 0,
+            contentReturnedBytes: 0,
+            contentOmittedBytes: 0,
+            contentTruncated: false,
+            runs: [],
+            format: "empty",
+            status: "missing",
+            warnings: [],
+            nextCursor: 0,
+            loading: false,
+            error: "",
+            following: true,
+        });
+        renderConversationLog();
+        return null;
+    }
+    const sameTask = state.log.taskId === taskId;
+    const requestedRunId = options.runId === undefined
+        ? sameTask ? state.log.runId : ""
+        : String(options.runId || "");
+    const incremental = options.incremental === true
+        && sameTask
+        && requestedRunId === state.log.runId
+        && !state.log.error;
+    const afterSequence = incremental ? Number(state.log.nextCursor || 0) : 0;
+    const requestId = state.log.requestId + 1;
+    const abortController = new AbortController();
+    state.log.requestId = requestId;
+    state.log.abortController = abortController;
+    state.log.taskId = taskId;
+    state.log.runId = requestedRunId;
+    state.log.loading = true;
+    state.log.error = "";
+    if (!incremental) {
+        state.log.events = [];
+        state.log.content = "";
+        state.log.contentBytes = 0;
+        state.log.contentReturnedBytes = 0;
+        state.log.contentOmittedBytes = 0;
+        state.log.contentTruncated = false;
+        state.log.runs = [];
+        state.log.format = "empty";
+        state.log.status = "missing";
+        state.log.nextCursor = 0;
+        state.log.warnings = [];
+        state.log.following = true;
+        renderConversationLog({ forceFollow: true });
+    } else {
+        renderLogRunOptions();
+    }
+
+    const params = new URLSearchParams();
+    if (requestedRunId) params.set("runId", requestedRunId);
+    if (afterSequence > 0) params.set("after", String(afterSequence));
+    const query = params.toString();
+    try {
+        const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/log${query ? `?${query}` : ""}`, {
+            signal: abortController.signal,
+        });
+        if (requestId !== state.log.requestId) return null;
+        state.log.abortController = null;
+        const incomingEvents = Array.isArray(result.events) ? result.events : [];
+        state.log.events = incremental
+            ? mergeLogEvents(state.log.events, incomingEvents)
+            : mergeLogEvents([], incomingEvents);
+        const contentPreview = legacyLogPreview(result.content || state.log.content || "");
+        state.log.content = contentPreview.content;
+        state.log.contentBytes = Number(result.contentBytes || 0);
+        state.log.contentReturnedBytes = Number(result.contentReturnedBytes || 0);
+        state.log.contentOmittedBytes = Number(result.contentOmittedBytes || 0);
+        state.log.contentTruncated = Boolean(result.contentTruncated || contentPreview.truncated);
+        state.log.runs = Array.isArray(result.runs) ? result.runs : [];
+        state.log.format = String(result.format || "empty");
+        state.log.status = String(result.status || "missing");
+        state.log.warnings = Array.isArray(result.warnings) ? [...result.warnings] : [];
+        if (contentPreview.truncated && !state.log.warnings.some((warning) => warning?.code === "content_truncated")) {
+            state.log.warnings.push({
+                code: "content_truncated",
+                message: translatedOr("runtime.logRenderTruncated", "Large legacy log preview was truncated for responsiveness."),
+            });
+        }
+        const maxEventSequence = state.log.events.reduce(
+            (maximum, event) => Math.max(maximum, Number(event.sequence || 0)),
+            0,
+        );
+        state.log.nextCursor = Math.max(
+            Number(state.log.nextCursor || 0),
+            Number(result.nextCursor || 0),
+            maxEventSequence,
+        );
+        state.log.loading = false;
+        state.log.error = "";
+        state.log.runId = String(result.runId || requestedRunId || "");
+        state.selectedTaskId = taskId;
+        if ($("#runTask")) $("#runTask").value = taskId;
+        renderConversationLog({ forceFollow: options.forceFollow === true || !incremental });
+        return result;
+    } catch (error) {
+        if (requestId !== state.log.requestId) return null;
+        state.log.abortController = null;
+        if (error?.name === "AbortError") return null;
+        state.log.loading = false;
+        state.log.error = error.message || t("runtime.logFailed");
+        renderConversationLog();
+        if (options.silent === true) return null;
+        throw error;
+    }
 }
 
 function switchView(view) {
+    if (view !== "runtime") cancelLogRequest();
     state.activeView = view;
     $$(".nav").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
     $$(".view").forEach((node) => node.classList.toggle("active", node.id === view));
 }
 
+function applyLanguage(language = "") {
+    if (language) {
+        i18n.setLanguage(language);
+    } else {
+        i18n.apply();
+    }
+    $("#languageSelect").value = i18n.getLanguage();
+    if (!state.selectedTaskId) $("#editorPath").textContent = t("editor.noTask");
+    syncTaskSourceMode();
+    syncTaskType();
+    const profileId = $("#profileForm").elements.id.value;
+    const profile = (state.data?.profiles || []).find((item) => item.id === profileId) || null;
+    updateTokenPlaceholder(profile);
+    if (state.data) renderAll();
+    renderConversationLog();
+    tickClock();
+}
+
 function bindEvents() {
     $$(".nav").forEach((button) => {
-        button.addEventListener("click", () => switchView(button.dataset.view));
+        button.addEventListener("click", () => {
+            const view = button.dataset.view;
+            switchView(view);
+            if (view !== "runtime") return;
+            const taskId = $("#runTask").value || state.selectedTaskId;
+            if (taskId && (state.log.taskId !== taskId || state.log.status === "missing")) {
+                loadLog(taskId, { forceFollow: true }).catch((error) => toast(error.message));
+            }
+        });
     });
-    $("[data-refresh]").addEventListener("click", () => refresh().then(() => toast("已刷新")));
+    $("#languageSelect").addEventListener("change", (event) => applyLanguage(event.target.value));
+    $("[data-refresh]").addEventListener("click", () => refresh().then(() => toast(t("toast.refreshed"))));
 
     $("#newProfile").addEventListener("click", () => resetProfileForm());
     $("#toggleEnv").addEventListener("click", () => {
@@ -529,7 +1271,12 @@ function bindEvents() {
     $("#profileForm").addEventListener("submit", async (event) => {
         event.preventDefault();
         const form = event.currentTarget;
-        const body = Object.fromEntries(new FormData(form).entries());
+        const formData = new FormData(form);
+        const body = Object.fromEntries(formData.entries());
+        body.inputModalities = formData.getAll("inputModalities").filter(Boolean);
+        body.outputModalities = formData.getAll("outputModalities").filter(Boolean);
+        if (!body.inputModalities.includes("text")) return toast(t("toast.textInputRequired"));
+        if (body.outputModalities.length === 0) return toast(t("toast.outputModalityRequired"));
         body.enabled = form.elements.enabled.checked;
         body.nonInteractive = form.elements.nonInteractive.checked;
         body.timeoutSeconds = Number(body.timeoutSeconds || 1800);
@@ -537,7 +1284,7 @@ function bindEvents() {
         body.pingIntervalMinutes = Number(body.pingIntervalMinutes || 60);
         await api("/api/profiles", { method: "POST", body });
         await refresh();
-        toast("Profile 已保存");
+        toast(t("toast.profileSaved"));
     });
     $("#duplicateProfile").addEventListener("click", () => {
         const form = $("#profileForm");
@@ -546,14 +1293,15 @@ function bindEvents() {
     });
     $("#deleteProfile").addEventListener("click", async () => {
         const id = $("#profileForm").elements.id.value;
-        if (!id) return toast("请选择 Profile");
+        if (!id) return toast(t("toast.selectProfile"));
         await api(`/api/profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
         resetProfileForm();
         await refresh();
-        toast("Profile 已删除");
+        toast(t("toast.profileDeleted"));
     });
 
     $("#taskSourceMode").addEventListener("change", syncTaskSourceMode);
+    $("#taskType").addEventListener("change", syncTaskType);
     $("#taskForm input[name='sourceFile']").addEventListener("change", (event) => {
         applySelectedTaskFile(event.target.files?.[0]);
     });
@@ -568,7 +1316,7 @@ function bindEvents() {
         body.sourceMode = form.elements.sourceMode.value || "agent";
         if (body.sourceMode === "upload") {
             const file = form.elements.sourceFile.files?.[0];
-            if (!file) return toast("请选择任务目标文件");
+            if (!file) return toast(t("toast.selectTaskFile"));
             applySelectedTaskFile(file);
             if (!String(body.targetFileName || "").trim()) body.targetFileName = file.name;
             if (!String(body.title || "").trim()) body.title = file.name.replace(/\.[^.]+$/, "") || file.name;
@@ -580,43 +1328,80 @@ function bindEvents() {
         await loadFile(result.task.id);
         switchView("editor");
         if (result.generation?.failed) {
-            toast(`任务文件生成失败：exitCode ${result.generation.exitCode ?? "-"}`);
+            toast(t("toast.generationFailed", { code: result.generation.exitCode ?? "-" }));
         } else if (body.sourceMode === "existing") {
-            toast("任务文件已载入");
+            toast(t("toast.taskLoaded"));
         } else if (body.sourceMode === "upload") {
-            toast("任务文件已导入");
+            toast(t("toast.taskImported"));
         } else {
-            toast("任务文件已生成");
+            toast(t("toast.taskGenerated"));
         }
     });
 
     $("#taskList").addEventListener("click", async (event) => {
-        const id = event.target.dataset.openTask;
-        if (!id) return;
-        await loadFile(id);
-        switchView("editor");
+        const historyId = event.target.dataset.openHistory || event.target.dataset.openTask;
+        const editId = event.target.dataset.editTask;
+        if (historyId) {
+            state.selectedTaskId = historyId;
+            renderSelectors();
+            renderRunDetail();
+            switchView("runtime");
+            try {
+                await loadLog(historyId, { runId: "", forceFollow: true });
+            } catch (error) {
+                toast(error.message);
+            }
+            return;
+        }
+        if (editId) {
+            await loadFile(editId);
+            switchView("editor");
+        }
     });
     $("#editorTask").addEventListener("change", (event) => loadFile(event.target.value));
     $("#loadFile").addEventListener("click", () => loadFile($("#editorTask").value));
     $("#saveFile").addEventListener("click", async () => {
         const id = $("#editorTask").value;
-        if (!id) return toast("请选择任务");
+        if (!id) return toast(t("toast.selectTask"));
         await api(`/api/tasks/${encodeURIComponent(id)}/file`, {
             method: "PUT",
             body: { content: $("#fileEditor").value },
         });
         await refresh();
-        toast("任务文件已保存");
+        toast(t("toast.taskSaved"));
     });
 
     $("#runTask").addEventListener("change", async (event) => {
         state.selectedTaskId = event.target.value;
         const task = (state.data?.tasks || []).find((item) => item.id === state.selectedTaskId);
         const runProfileIds = taskProfileIds(task);
-        $("#runProfiles").innerHTML = profileOptions(runProfileIds.length ? runProfileIds : [state.selectedProfileId].filter(Boolean));
-        $("#decomposeProfile").innerHTML = profileOptions(task?.decomposeProfileId || state.selectedProfileId);
-        await loadLog(state.selectedTaskId);
+        $("#runProfiles").innerHTML = profileOptions(runProfileIds.length ? runProfileIds : [state.selectedProfileId].filter(Boolean), task?.taskType || "text");
+        $("#decomposeProfile").innerHTML = profileOptions(task?.decomposeProfileId || state.selectedProfileId, "text");
         renderRunDetail();
+        $("#appendTaskFeedback").textContent = "";
+        try {
+            await loadLog(state.selectedTaskId, { forceFollow: true });
+        } catch (error) {
+            toast(error.message);
+        }
+    });
+    $("#logRunSelect").addEventListener("change", async (event) => {
+        const taskId = $("#runTask").value || state.selectedTaskId;
+        if (!taskId) return;
+        setLogFollowing(true);
+        try {
+            await loadLog(taskId, { runId: event.target.value, forceFollow: true });
+        } catch (error) {
+            toast(error.message);
+        }
+    });
+    $("#logView").addEventListener("scroll", (event) => {
+        if (state.log.loading) return;
+        setLogFollowing(isLogNearBottom(event.currentTarget));
+    }, { passive: true });
+    $("#followLog").addEventListener("click", () => {
+        const shouldFollow = !state.log.following;
+        setLogFollowing(shouldFollow, shouldFollow);
     });
     $("#runProfiles").addEventListener("change", (event) => {
         state.selectedProfileId = selectedValues(event.target)[0] || state.selectedProfileId;
@@ -627,54 +1412,104 @@ function bindEvents() {
     $("#startTask").addEventListener("click", async () => {
         const taskId = $("#runTask").value;
         const profileIds = selectedValues($("#runProfiles"));
-        if (!taskId || profileIds.length === 0) return toast("请选择任务和 Profile");
+        if (!taskId || profileIds.length === 0) return toast(t("toast.selectTaskProfile"));
         await api(`/api/tasks/${encodeURIComponent(taskId)}/start`, {
             method: "POST",
             body: { profileIds },
         });
         await refresh();
-        await loadLog(taskId);
-        toast("任务已启动");
+        await loadLog(taskId, { runId: "", forceFollow: true });
+        toast(t("toast.taskStarted"));
     });
     $("#scheduleTask").addEventListener("click", async () => {
         const taskId = $("#runTask").value;
         const profileIds = selectedValues($("#runProfiles"));
         const startAt = parseScheduleInput($("#scheduleStartAt").value);
-        if (!taskId || profileIds.length === 0) return toast("请选择任务和 Profile");
-        if (!startAt) return toast("请选择预约启动时间");
-        if (startAt.getTime() <= Date.now()) return toast("请选择未来的预约时间");
+        if (!taskId || profileIds.length === 0) return toast(t("toast.selectTaskProfile"));
+        if (!startAt) return toast(t("toast.selectSchedule"));
+        if (startAt.getTime() <= Date.now()) return toast(t("toast.selectFutureSchedule"));
         await api(`/api/tasks/${encodeURIComponent(taskId)}/start`, {
             method: "POST",
             body: { profileIds, startAt: startAt.toISOString() },
         });
         await refresh();
-        await loadLog(taskId);
-        toast("任务已预约");
+        await loadLog(taskId, { runId: "", forceFollow: true });
+        toast(t("toast.taskScheduled"));
     });
     $("#stopTask").addEventListener("click", async () => {
         const taskId = $("#runTask").value;
-        if (!taskId) return toast("请选择任务");
+        if (!taskId) return toast(t("toast.selectTask"));
         await api(`/api/tasks/${encodeURIComponent(taskId)}/stop`, { method: "POST" });
         await refresh();
-        await loadLog(taskId);
-        toast("任务已停止");
+        await loadLog(taskId, { runId: "", forceFollow: true });
+        toast(t("toast.taskStopped"));
     });
     $("#decomposeTask").addEventListener("click", async () => {
         const taskId = $("#runTask").value;
         const profileId = $("#decomposeProfile").value || selectedValues($("#runProfiles"))[0];
-        if (!taskId || !profileId) return toast("请选择任务和 Profile");
+        if (!taskId || !profileId) return toast(t("toast.selectTaskProfile"));
         const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/generate`, {
             method: "POST",
             body: { profileId },
         });
         await refresh();
         await loadFile(taskId);
-        await loadLog(taskId);
-        toast(result.failed ? `生成目标文件失败：exitCode ${result.exitCode ?? "-"}` : "目标文件已生成");
+        await loadLog(taskId, { runId: "", forceFollow: true });
+        toast(result.failed
+            ? t("toast.generateFailed", { code: result.exitCode ?? "-" })
+            : t("toast.taskGenerated"));
     });
     $("#copyLog").addEventListener("click", async () => {
-        await navigator.clipboard.writeText($("#logView").textContent || "");
-        toast("日志已复制");
+        await navigator.clipboard.writeText(logPlainText());
+        toast(t("toast.logCopied"));
+    });
+    $("#appendTaskButton").addEventListener("click", async () => {
+        const taskId = $("#runTask").value || state.selectedTaskId;
+        const feedback = $("#appendTaskFeedback");
+        const button = $("#appendTaskButton");
+        const completionStandard = $("#appendCompletionStandard").value.trim();
+        const items = $("#appendTaskItems").value
+            .split(/\r?\n/)
+            .map((line) => line.trim().replace(/^(?:[-*+]\s*(?:\[[ xX]\]\s*)?|\d+[.)]\s*)/, ""))
+            .filter(Boolean)
+            .map((text) => completionStandard ? { text, completionStandard } : { text });
+        if (!taskId) return toast(t("toast.selectTask"));
+        if (items.length === 0) {
+            feedback.textContent = t("runtime.appendEmpty");
+            return toast(t("runtime.appendEmpty"));
+        }
+        button.disabled = true;
+        feedback.className = "field-note append-feedback-pending";
+        feedback.textContent = t("runtime.appending");
+        try {
+            const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/items`, {
+                method: "POST",
+                body: { items },
+            });
+            state.selectedTaskId = taskId;
+            await refresh();
+            await loadFile(taskId);
+            await loadLog(taskId, { runId: "", forceFollow: true });
+            $("#appendTaskItems").value = "";
+            $("#appendCompletionStandard").value = "";
+            feedback.className = "field-note append-feedback-success";
+            feedback.textContent = translatedOr("runtime.appended", `${result.items?.length || items.length} items appended`, {
+                count: result.items?.length || items.length,
+            });
+            toast(feedback.textContent);
+        } catch (error) {
+            feedback.className = "field-note append-feedback-error";
+            feedback.textContent = error.message;
+            toast(error.message);
+        } finally {
+            renderRuntimeContext(getSelectedTask());
+        }
+    });
+    $("#appendTaskItems").addEventListener("keydown", (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+            event.preventDefault();
+            $("#appendTaskButton").click();
+        }
     });
 
     $("#pingEnabled").addEventListener("change", async (event) => {
@@ -683,7 +1518,7 @@ function bindEvents() {
             body: { enabled: event.target.checked },
         });
         await refresh();
-        toast(event.target.checked ? "Ping ???" : "Ping ???");
+        toast(event.target.checked ? t("toast.pingEnabled") : t("toast.pingDisabled"));
     });
 
     $("#runPing").addEventListener("click", async () => {
@@ -692,7 +1527,10 @@ function bindEvents() {
         try {
             const result = await api("/api/pings/run", { method: "POST" });
             await refresh();
-            toast(`Ping 完成：${result.records.filter((record) => record.success).length}/${result.records.length} 成功`);
+            toast(t("toast.pingComplete", {
+                success: result.records.filter((record) => record.success).length,
+                total: result.records.length,
+            }));
         } finally {
             button.disabled = false;
         }
@@ -704,19 +1542,19 @@ function bindEvents() {
         await api("/api/directories", { method: "POST", body });
         event.currentTarget.reset();
         await refresh();
-        toast("目录已添加");
+        toast(t("toast.directoryAdded"));
     });
     $("#directoryList").addEventListener("click", async (event) => {
         const encoded = event.target.dataset.deleteDir;
         if (!encoded) return;
         await api(`/api/directories/${encoded}`, { method: "DELETE" });
         await refresh();
-        toast("目录已移除");
+        toast(t("toast.directoryRemoved"));
     });
 }
 
 function tickClock() {
-    $("#serverClock").textContent = new Intl.DateTimeFormat("zh-CN", {
+    $("#serverClock").textContent = new Intl.DateTimeFormat(i18n.getLocale(), {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
@@ -725,23 +1563,31 @@ function tickClock() {
 }
 
 async function boot() {
+    applyLanguage();
     bindEvents();
-    syncTaskSourceMode();
-    tickClock();
     setInterval(tickClock, 1000);
     await refresh();
     const firstProfile = state.data?.profiles?.[0];
     resetProfileForm(firstProfile || null);
+    syncTaskType();
     const firstTask = state.data?.tasks?.[0];
     if (firstTask) {
         await loadFile(firstTask.id);
-        await loadLog(firstTask.id);
     }
     setInterval(async () => {
         try {
             await refresh();
             const currentTask = $("#runTask").value || state.selectedTaskId;
-            if (currentTask && state.activeView === "runtime") await loadLog(currentTask);
+            const task = (state.data?.tasks || []).find((item) => item.id === currentTask);
+            const shouldPollLog = task && (
+                task.isRunning
+                || task.loopActive
+                || task.activeProcess
+                || ["running", "scheduled", "retry_wait"].includes(String(task.status || ""))
+            );
+            if (currentTask && state.activeView === "runtime" && shouldPollLog) {
+                await loadLog(currentTask, { incremental: true, silent: true });
+            }
         } catch (error) {
             toast(error.message);
         }

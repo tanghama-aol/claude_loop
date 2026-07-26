@@ -5,14 +5,21 @@ const {
     ALL_DONE_MARKER,
     CODEX_AUTO_CONFIRM_FLAG,
     DEFAULT_RUN_PROMPT,
+    appendTaskItemsToMarkdown,
     configEnvForProfile,
+    createTaskLogEvent,
     createDefaultProfiles,
     fillTemplate,
     generateTaskMarkdown,
     maskEnvText,
     nextProfileId,
+    nextTaskItemNumber,
+    normalizeTaskItem,
+    normalizeModalities,
     parseArgs,
     parseEnvText,
+    parseTaskLogEvents,
+    providerForAgentType,
     safeTaskFileName,
 } = require("../lib/core");
 
@@ -40,6 +47,57 @@ test("fillTemplate preserves dollar signs in replacement values", () => {
         prompt: "literal $$ value",
     });
     assert.equal(result, "literal $$ value");
+});
+
+test("task log events preserve raw multiline output and parse in sequence order", () => {
+    const later = createTaskLogEvent({
+        sequence: 2,
+        taskId: "task-1",
+        runId: "run-1",
+        timestamp: "2026-07-25T00:00:02.000Z",
+        type: "STDOUT",
+        phase: "run",
+        text: "first line\nsecond line\n",
+        stream: "stdout",
+        profile: { id: "profile-1", name: "codex-fast", agentType: "codex" },
+    });
+    const earlier = createTaskLogEvent({
+        sequence: 1,
+        taskId: "task-1",
+        runId: "run-1",
+        timestamp: "2026-07-25T00:00:01.000Z",
+        type: "Process Started",
+        text: "started",
+    });
+    const parsed = parseTaskLogEvents([
+        JSON.stringify(later),
+        "not-json",
+        JSON.stringify(earlier),
+        "",
+    ].join("\n"));
+
+    assert.deepEqual(parsed.map((event) => event.sequence), [1, 2]);
+    assert.equal(parsed[0].type, "process_started");
+    assert.equal(parsed[1].text, "first line\nsecond line\n");
+    assert.equal(parsed[1].profile.name, "codex-fast");
+});
+
+test("fillTemplate supports multimodal provider and artifact placeholders", () => {
+    const result = fillTemplate("{provider}|{taskType}|{outputFile}|{referenceFiles}", {
+        provider: "replicate",
+        taskType: "video",
+        outputFile: "/tmp/result.mp4",
+        referenceFiles: ["a.png", "b.png"],
+    });
+    assert.equal(result, "replicate|video|/tmp/result.mp4|a.png\nb.png");
+});
+
+test("provider and modality helpers preserve compatible defaults", () => {
+    assert.equal(providerForAgentType("claude"), "anthropic");
+    assert.equal(providerForAgentType("codex"), "openai");
+    assert.equal(providerForAgentType("gemini"), "google");
+    assert.deepEqual(normalizeModalities(["text", "image", "image", "unknown"]), ["text", "image"]);
+    assert.deepEqual(normalizeModalities([], ["text"]), ["text"]);
 });
 
 test("default run prompt uses the command-safe all-done marker", () => {
@@ -89,8 +147,47 @@ test("generateTaskMarkdown creates editable checklist", () => {
     assert.match(content, /完成标准/);
 });
 
+test("generateTaskMarkdown documents media artifact requirements", () => {
+    const content = generateTaskMarkdown({
+        title: "海报生成",
+        requirement: "生成复古海报",
+        taskType: "image",
+        artifactDirectory: "/tmp/artifacts",
+        outputFile: "/tmp/artifacts/result.webp",
+        outputFormat: "webp",
+        aspectRatio: "3:4",
+        resolution: "1536x2048",
+        referenceFiles: ["assets/reference.png"],
+    });
+    assert.match(content, /多模态产物设置/);
+    assert.match(content, /任务类型：image/);
+    assert.match(content, /result\.webp/);
+    assert.match(content, /assets\/reference\.png/);
+});
+
+test("appendTaskItemsToMarkdown appends numbered checklist blocks without rewriting old content", () => {
+    const original = "# 历史任务\n\n## 任务列表\n\n- [x] 1. 已完成\n";
+    const result = appendTaskItemsToMarkdown(original, [
+        "新增第一项",
+        { text: "新增第二项", completionCriteria: "通过自动化测试" },
+    ]);
+
+    assert.equal(result.items.map((item) => item.number).join(","), "2,3");
+    assert.equal(result.content.slice(0, original.length), original);
+    assert.match(result.content, /- \[ \] 2\. 新增第一项/);
+    assert.match(result.content, /- \[ \] 3\. 新增第二项/);
+    assert.match(result.content, /完成标准：通过自动化测试/);
+    assert.equal(nextTaskItemNumber(result.content), 4);
+    assert.deepEqual(normalizeTaskItem("  多行\n任务  "), {
+        text: "多行 任务",
+        completionStandard: "实现并验证该任务项，必要时更新相关文件。",
+    });
+});
+
 test("default codex profile bypasses confirmations", () => {
     const codexProfile = createDefaultProfiles("/tmp/project").find((profile) => profile.id === "profile_codex_default");
     assert.ok(codexProfile);
     assert.match(codexProfile.args, new RegExp(CODEX_AUTO_CONFIRM_FLAG));
+    assert.equal(codexProfile.provider, "openai");
+    assert.deepEqual(codexProfile.outputModalities, ["text"]);
 });

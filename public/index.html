@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>多 Agent 任务台</title>
+    <title data-i18n="app.title">多 Agent 任务台</title>
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -11,22 +11,29 @@
         <header class="topbar">
             <div>
                 <p class="eyebrow">Agent Loop Console</p>
-                <h1>多 Agent 任务台</h1>
+                <h1 data-i18n="app.title">多 Agent 任务台</h1>
             </div>
             <div class="topbar-actions">
+                <label class="language-picker">
+                    <span data-i18n="language.label">语言</span>
+                    <select id="languageSelect" data-i18n-aria-label="language.select" aria-label="选择界面语言">
+                        <option value="zh-CN">中文</option>
+                        <option value="en">English</option>
+                    </select>
+                </label>
                 <span id="serverClock" class="clock">--:--:--</span>
-                <button class="ghost" type="button" data-refresh>刷新</button>
+                <button class="ghost" type="button" data-refresh data-i18n="common.refresh">刷新</button>
             </div>
         </header>
 
         <aside class="rail">
-            <button class="nav active" type="button" data-view="dashboard">总览</button>
-            <button class="nav" type="button" data-view="profiles">Profiles</button>
-            <button class="nav" type="button" data-view="tasks">任务</button>
-            <button class="nav" type="button" data-view="editor">编辑</button>
-            <button class="nav" type="button" data-view="runtime">运行</button>
-            <button class="nav" type="button" data-view="pings">Ping</button>
-            <button class="nav" type="button" data-view="settings">目录</button>
+            <button class="nav active" type="button" data-view="dashboard" data-i18n="nav.dashboard">总览</button>
+            <button class="nav" type="button" data-view="profiles" data-i18n="nav.profiles">Profiles</button>
+            <button class="nav" type="button" data-view="tasks" data-i18n="nav.tasks">任务</button>
+            <button class="nav" type="button" data-view="editor" data-i18n="nav.editor">编辑</button>
+            <button class="nav" type="button" data-view="runtime" data-i18n="nav.runtime">运行</button>
+            <button class="nav" type="button" data-view="pings" data-i18n="nav.pings">Ping</button>
+            <button class="nav" type="button" data-view="settings" data-i18n="nav.directories">目录</button>
         </aside>
 
         <main class="workspace">
@@ -35,15 +42,15 @@
                 <div class="split">
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>任务状态</h2>
-                            <span class="hint">实时轮询</span>
+                            <h2 data-i18n="dashboard.taskStatus">任务状态</h2>
+                            <span class="hint" data-i18n="dashboard.livePolling">实时轮询</span>
                         </div>
                         <div id="taskBoard" class="task-board"></div>
                     </section>
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>事件流</h2>
-                            <span class="hint">最近 200 条</span>
+                            <h2 data-i18n="dashboard.eventFeed">事件流</h2>
+                            <span class="hint" data-i18n="dashboard.recentEvents">最近 200 条</span>
                         </div>
                         <div id="eventFeed" class="event-feed"></div>
                     </section>
@@ -54,87 +61,124 @@
                 <div class="split wide-left">
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>Agent Profiles</h2>
-                            <button class="ghost" type="button" id="newProfile">新建</button>
+                            <h2 data-i18n="profile.heading">Agent Profiles</h2>
+                            <button class="ghost" type="button" id="newProfile" data-i18n="common.new">新建</button>
                         </div>
                         <div id="profileList" class="profile-list"></div>
                     </section>
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>Profile 配置</h2>
-                            <span class="hint">环境变量默认隐藏</span>
+                            <h2 data-i18n="profile.config">Profile 配置</h2>
+                            <span class="hint" data-i18n="profile.envHidden">环境变量默认隐藏</span>
                         </div>
                         <form id="profileForm" class="form-grid">
                             <input type="hidden" name="id">
                             <label>
-                                名称
+                                <span data-i18n="profile.name">名称</span>
                                 <input name="name" required placeholder="claude-default">
                             </label>
                             <label>
-                                类型
+                                <span data-i18n="profile.provider">模型提供者</span>
+                                <input name="provider" list="providerOptions" placeholder="anthropic / openai / replicate">
+                                <datalist id="providerOptions">
+                                    <option value="anthropic"></option>
+                                    <option value="openai"></option>
+                                    <option value="google"></option>
+                                    <option value="replicate"></option>
+                                    <option value="fal"></option>
+                                    <option value="runway"></option>
+                                    <option value="stability"></option>
+                                    <option value="custom"></option>
+                                </datalist>
+                            </label>
+                            <label>
+                                <span data-i18n="profile.type">调用器类型</span>
                                 <select name="agentType">
                                     <option value="claude">Claude</option>
                                     <option value="codex">Codex</option>
                                     <option value="gemini">Gemini</option>
+                                    <option value="custom" data-i18n="profile.runnerCustom">自定义命令</option>
                                 </select>
                             </label>
                             <label>
-                                运行命令
+                                <span data-i18n="profile.command">运行命令</span>
                                 <input name="command" required placeholder="claude">
                             </label>
                             <label>
-                                超时秒数
+                                <span data-i18n="profile.timeout">超时秒数</span>
                                 <input name="timeoutSeconds" type="number" min="1" step="1" value="1800">
                             </label>
                             <label>
-                                模型名称
+                                <span data-i18n="profile.model">模型名称</span>
                                 <input name="modelName" placeholder="gpt-4.1 / claude-sonnet-4">
                             </label>
                             <label>
-                                测试间隔（分钟）
+                                <span data-i18n="profile.pingInterval">测试间隔（分钟）</span>
                                 <input name="pingIntervalMinutes" type="number" min="1" step="1" value="60">
                             </label>
+                            <fieldset class="capability-settings full">
+                                <legend data-i18n="profile.capabilities">多模态能力</legend>
+                                <div class="capability-columns">
+                                    <div>
+                                        <span class="capability-label" data-i18n="profile.inputModalities">输入模态</span>
+                                        <label class="checkline"><input name="inputModalities" type="checkbox" value="text" checked><span data-i18n="modality.text">文本</span></label>
+                                        <label class="checkline"><input name="inputModalities" type="checkbox" value="image"><span data-i18n="modality.image">图片</span></label>
+                                        <label class="checkline"><input name="inputModalities" type="checkbox" value="video"><span data-i18n="modality.video">视频</span></label>
+                                    </div>
+                                    <div>
+                                        <span class="capability-label" data-i18n="profile.outputModalities">输出模态</span>
+                                        <label class="checkline"><input name="outputModalities" type="checkbox" value="text" checked><span data-i18n="modality.text">文本</span></label>
+                                        <label class="checkline"><input name="outputModalities" type="checkbox" value="image"><span data-i18n="modality.image">图片</span></label>
+                                        <label class="checkline"><input name="outputModalities" type="checkbox" value="video"><span data-i18n="modality.video">视频</span></label>
+                                    </div>
+                                </div>
+                                <p class="field-note" data-i18n="profile.capabilityHint">任务只会选择声明支持对应输出模态的 Profile。</p>
+                            </fieldset>
                             <label class="full">
-                                参数
+                                <span data-i18n="profile.args">参数</span>
                                 <input name="args" placeholder="--dangerously-skip-permissions -p {prompt}">
                             </label>
                             <label class="full">
-                                Base URL
+                                <span data-i18n="profile.baseUrl">Base URL</span>
                                 <input name="baseUrl" placeholder="https://api.example.com/v1">
                             </label>
                             <label class="full">
-                                Token
-                                <input name="apiToken" type="password" placeholder="留空会保留已保存 Token">
+                                <span data-i18n="profile.token">Token</span>
+                                <input name="apiToken" type="password" data-i18n-placeholder="profile.tokenKeepPlaceholder" placeholder="留空会保留已保存 Token">
                             </label>
                             <label class="full">
-                                配置目录
+                                <span data-i18n="profile.configDirectory">配置目录</span>
                                 <input name="configDirectory" placeholder="/home/user/.claude">
                             </label>
                             <label class="full sensitive-row">
-                                环境变量
+                                <span data-i18n="profile.environment">环境变量</span>
                                 <textarea name="envText" rows="5" class="secret" placeholder="API_KEY=..."></textarea>
-                                <button class="mini" type="button" id="toggleEnv">显示/隐藏</button>
+                                <button class="mini" type="button" id="toggleEnv" data-i18n="common.showHide">显示/隐藏</button>
                             </label>
                             <label class="full">
-                                Prompt 模板
+                                <span data-i18n="profile.promptTemplate">Prompt 模板</span>
                                 <textarea name="promptTemplate" rows="8"></textarea>
+                            </label>
+                            <label class="full">
+                                <span data-i18n="profile.mediaPromptTemplate">图片/视频 Prompt 模板</span>
+                                <textarea name="mediaPromptTemplate" rows="8" data-i18n-placeholder="profile.mediaPromptPlaceholder" placeholder="留空使用内置多模态产物模板，可使用 {artifactDirectory}、{outputFile} 等变量。"></textarea>
                             </label>
                             <label class="checkline">
                                 <input name="enabled" type="checkbox" checked>
-                                启用
+                                <span data-i18n="profile.enabled">启用</span>
                             </label>
                             <label class="checkline">
                                 <input name="nonInteractive" type="checkbox" checked>
-                                非交互模式
+                                <span data-i18n="profile.nonInteractive">非交互模式</span>
                             </label>
                             <label class="checkline">
                                 <input name="pingEnabled" type="checkbox" checked>
-                                启用定时测试
+                                <span data-i18n="profile.pingEnabled">启用定时测试</span>
                             </label>
                             <div class="form-actions full">
-                                <button type="submit">保存 Profile</button>
-                                <button class="ghost" type="button" id="duplicateProfile">复制</button>
-                                <button class="danger" type="button" id="deleteProfile">删除</button>
+                                <button type="submit" data-i18n="profile.save">保存 Profile</button>
+                                <button class="ghost" type="button" id="duplicateProfile" data-i18n="common.duplicate">复制</button>
+                                <button class="danger" type="button" id="deleteProfile" data-i18n="common.delete">删除</button>
                             </div>
                         </form>
                     </section>
@@ -145,57 +189,106 @@
                 <div class="split wide-right">
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>创建任务</h2>
-                            <span class="hint">Markdown 目标文件</span>
+                            <h2 data-i18n="task.create">创建任务</h2>
+                            <span class="hint" data-i18n="task.markdownTarget">Markdown 目标文件</span>
                         </div>
                         <form id="taskForm" class="form-grid single">
                             <label>
-                                标题
-                                <input name="title" required placeholder="P3-真实笔顺评分">
+                                <span data-i18n="task.title">标题</span>
+                                <input name="title" required data-i18n-placeholder="task.titlePlaceholder" placeholder="P3-真实笔顺评分">
                             </label>
                             <label>
-                                目标文件名
-                                <input name="targetFileName" placeholder="P3-真实笔顺评分.md">
+                                <span data-i18n="task.type">任务类型</span>
+                                <select name="taskType" id="taskType">
+                                    <option value="text" data-i18n="modality.text">文本</option>
+                                    <option value="image" data-i18n="modality.image">图片</option>
+                                    <option value="video" data-i18n="modality.video">视频</option>
+                                </select>
                             </label>
                             <label>
-                                工作目录
+                                <span data-i18n="task.targetFile">目标文件名</span>
+                                <input name="targetFileName" data-i18n-placeholder="task.targetFilePlaceholder" placeholder="P3-真实笔顺评分.md">
+                            </label>
+                            <label>
+                                <span data-i18n="task.directory">工作目录</span>
                                 <select name="directory"></select>
                             </label>
                             <label>
-                                任务来源
+                                <span data-i18n="task.source">任务来源</span>
                                 <select name="sourceMode" id="taskSourceMode">
-                                    <option value="agent">Agent 生成</option>
-                                    <option value="existing">使用工作目录文件</option>
-                                    <option value="upload">从电脑选择文件</option>
+                                    <option value="agent" data-i18n="task.source.agent">Agent 生成</option>
+                                    <option value="existing" data-i18n="task.source.existing">使用工作目录文件</option>
+                                    <option value="upload" data-i18n="task.source.upload">从电脑选择文件</option>
                                 </select>
                             </label>
                             <div id="taskSourceHelp" class="source-mode-help full" aria-live="polite"></div>
                             <label class="task-generation-field">
-                                生成 Profile
+                                <span data-i18n="task.generateProfile">生成 Profile</span>
                                 <select name="decomposeProfileId"></select>
                             </label>
                             <label>
-                                执行 Profiles
+                                <span data-i18n="task.runProfiles">执行 Profiles</span>
                                 <select name="runProfileIds" multiple size="4"></select>
                             </label>
+                            <fieldset id="mediaTaskSettings" class="media-settings full" hidden>
+                                <legend data-i18n="task.mediaSettings">媒体产物设置</legend>
+                                <div class="media-settings-grid">
+                                    <label>
+                                        <span data-i18n="task.artifactDirectory">产物目录</span>
+                                        <input name="artifactDirectoryName" data-i18n-placeholder="task.artifactDirectoryPlaceholder" placeholder="留空自动使用 .agent-output/任务ID">
+                                    </label>
+                                    <label>
+                                        <span data-i18n="task.outputFile">建议文件名</span>
+                                        <input name="outputFileName" placeholder="result.png">
+                                    </label>
+                                    <label>
+                                        <span data-i18n="task.outputFormat">输出格式</span>
+                                        <select name="outputFormat" id="outputFormat"></select>
+                                    </label>
+                                    <label>
+                                        <span data-i18n="task.aspectRatio">画面比例</span>
+                                        <select name="aspectRatio">
+                                            <option value="">Auto</option>
+                                            <option value="1:1">1:1</option>
+                                            <option value="16:9">16:9</option>
+                                            <option value="9:16">9:16</option>
+                                            <option value="4:3">4:3</option>
+                                            <option value="3:4">3:4</option>
+                                        </select>
+                                    </label>
+                                    <label>
+                                        <span data-i18n="task.resolution">分辨率</span>
+                                        <input name="resolution" placeholder="1024x1024 / 1920x1080">
+                                    </label>
+                                    <label class="video-only">
+                                        <span data-i18n="task.duration">视频时长（秒）</span>
+                                        <input name="durationSeconds" type="number" min="1" step="1" value="5">
+                                    </label>
+                                    <label class="full">
+                                        <span data-i18n="task.referenceFiles">参考文件（每行一个相对路径）</span>
+                                        <textarea name="referenceFiles" rows="3" placeholder="assets/reference.png"></textarea>
+                                    </label>
+                                </div>
+                                <p class="field-note" data-i18n="task.mediaHint">运行器会收到统一的 AGENT_OUTPUT_DIR、AGENT_OUTPUT_FILE 和媒体参数环境变量。</p>
+                            </fieldset>
                             <label class="full task-upload-field" hidden>
-                                选择文件
+                                <span data-i18n="task.selectFile">选择文件</span>
                                 <input name="sourceFile" type="file" accept=".md,.markdown,text/markdown,text/plain">
                             </label>
                             <label class="full">
-                                任务需求
-                                <textarea name="requirement" rows="13" required placeholder="输入原始需求，生成 Profile 会创建可编辑的任务目标文件。"></textarea>
+                                <span data-i18n="task.requirement">任务需求</span>
+                                <textarea name="requirement" rows="13" required data-i18n-placeholder="task.requirementPlaceholder" placeholder="输入原始需求，生成 Profile 会创建可编辑的任务目标文件。"></textarea>
                             </label>
                             <label class="checkline full task-overwrite-field">
                                 <input name="overwrite" type="checkbox">
-                                覆盖同名文件
+                                <span data-i18n="task.overwrite">覆盖同名文件</span>
                             </label>
-                            <button type="submit" id="taskSubmitButton">调用 Agent 生成</button>
+                            <button type="submit" id="taskSubmitButton" data-i18n="task.submit.generate">调用 Agent 生成</button>
                         </form>
                     </section>
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>任务列表</h2>
+                            <h2 data-i18n="task.list">任务列表</h2>
                             <span id="taskCount" class="hint">0 个任务</span>
                         </div>
                         <div id="taskList" class="task-list"></div>
@@ -207,13 +300,13 @@
                 <section class="panel editor-panel">
                     <div class="panel-head">
                         <div>
-                            <h2>目标文件编辑</h2>
+                            <h2 data-i18n="editor.heading">目标文件编辑</h2>
                             <p id="editorPath" class="pathline">未选择任务</p>
                         </div>
                         <div class="inline-actions">
                             <select id="editorTask"></select>
-                            <button type="button" id="loadFile">载入</button>
-                            <button type="button" id="saveFile">保存</button>
+                            <button type="button" id="loadFile" data-i18n="common.load">载入</button>
+                            <button type="button" id="saveFile" data-i18n="common.save">保存</button>
                         </div>
                     </div>
                     <textarea id="fileEditor" class="file-editor" spellcheck="false"></textarea>
@@ -221,44 +314,84 @@
             </section>
 
             <section id="runtime" class="view">
-                <div class="split wide-left">
-                    <section class="panel">
-                        <div class="panel-head">
-                            <h2>运行控制</h2>
-                            <span class="hint">任务互相隔离</span>
+                <div class="runtime-shell">
+                    <section class="panel runtime-control-panel">
+                        <div class="panel-head runtime-panel-head">
+                            <div>
+                                <h2 data-i18n="runtime.heading">运行控制</h2>
+                                <p id="runtimeTaskSubtitle" class="pathline" data-i18n="runtime.noTask">选择任务以查看运行工作流</p>
+                            </div>
+                            <span id="runtimeStatusBadge" class="badge loop_not_started">-</span>
                         </div>
                         <div class="control-stack">
                             <label>
-                                任务
+                                <span data-i18n="runtime.task">任务</span>
                                 <select id="runTask"></select>
                             </label>
                             <label>
-                                执行 Profiles
+                                <span data-i18n="runtime.runProfiles">执行 Profiles</span>
                                 <select id="runProfiles" multiple size="5"></select>
                             </label>
                             <label>
-                                生成 Profile
+                                <span data-i18n="runtime.generateProfile">生成 Profile</span>
                                 <select id="decomposeProfile"></select>
                             </label>
                             <label>
-                                预约启动时间
+                                <span data-i18n="runtime.scheduleTime">预约启动时间</span>
                                 <input id="scheduleStartAt" type="datetime-local">
                             </label>
                             <div class="button-row">
-                                <button type="button" id="startTask">启动</button>
-                                <button class="ghost" type="button" id="scheduleTask">预约启动</button>
-                                <button class="ghost" type="button" id="decomposeTask">生成目标文件</button>
-                                <button class="danger" type="button" id="stopTask">停止</button>
+                                <button type="button" id="startTask" data-i18n="runtime.start">启动</button>
+                                <button class="ghost" type="button" id="scheduleTask" data-i18n="runtime.schedule">预约启动</button>
+                                <button class="ghost" type="button" id="decomposeTask" data-i18n="runtime.generate">生成目标文件</button>
+                                <button class="danger" type="button" id="stopTask" data-i18n="runtime.stop">停止</button>
                             </div>
                             <div id="runDetail" class="run-detail"></div>
+
+                            <section class="append-panel" aria-labelledby="appendTaskHeading">
+                                <div class="append-panel-head">
+                                    <div>
+                                        <h3 id="appendTaskHeading" data-i18n="runtime.appendHeading">向历史任务追加</h3>
+                                        <p data-i18n="runtime.appendHint">每行一个新任务项；旧日志和已完成项会保留。</p>
+                                    </div>
+                                    <span id="appendEligibility" class="append-eligibility"></span>
+                                </div>
+                                <label>
+                                    <span data-i18n="runtime.appendItems">新任务项</span>
+                                    <textarea id="appendTaskItems" rows="4" data-i18n-placeholder="runtime.appendItemsPlaceholder" placeholder="例如：补充边界条件测试"></textarea>
+                                </label>
+                                <label>
+                                    <span data-i18n="runtime.appendStandard">完成标准（可选）</span>
+                                    <input id="appendCompletionStandard" data-i18n-placeholder="runtime.appendStandardPlaceholder" placeholder="实现并验证该任务项">
+                                </label>
+                                <div class="append-actions">
+                                    <button type="button" id="appendTaskButton" data-i18n="runtime.appendButton">追加到任务文件</button>
+                                    <span id="appendTaskFeedback" class="field-note" aria-live="polite"></span>
+                                </div>
+                            </section>
                         </div>
                     </section>
-                    <section class="panel log-panel">
-                        <div class="panel-head">
-                            <h2>运行日志</h2>
-                            <button class="ghost" type="button" id="copyLog">复制</button>
+
+                    <section class="panel conversation-panel">
+                        <div class="panel-head conversation-head">
+                            <div>
+                                <h2 data-i18n="runtime.log">运行日志</h2>
+                                <p id="logSummary" class="pathline" data-i18n="runtime.logLoading">正在等待日志…</p>
+                            </div>
+                            <div class="log-toolbar">
+                                <label class="run-picker">
+                                    <span data-i18n="runtime.historyRun">历史运行</span>
+                                    <select id="logRunSelect" data-i18n-aria-label="runtime.historyRun" aria-label="历史运行"></select>
+                                </label>
+                                <button class="ghost" type="button" id="copyLog" data-i18n="common.copy">复制</button>
+                            </div>
                         </div>
-                        <pre id="logView" class="log-view"></pre>
+                        <div id="logNotice" class="log-notice" hidden role="status"></div>
+                        <div id="logView" class="conversation-log log-view" role="log" aria-live="polite" aria-busy="false"></div>
+                        <div class="log-footer">
+                            <span id="logCursor" class="hint"></span>
+                            <button class="follow-button" type="button" id="followLog" data-i18n="runtime.followLatest">跟随最新</button>
+                        </div>
                     </section>
                 </div>
             </section>
@@ -267,13 +400,13 @@
                 <section class="panel">
                     <div class="panel-head">
                         <div>
-                            <h2>LLM Ping</h2>
-                            <p class="pathline">When enabled, ping Claude Code and Codex profiles with one random simple question.</p>
+                            <h2 data-i18n="ping.heading">LLM Ping</h2>
+                            <p class="pathline" data-i18n="ping.description">启用后，系统会用一个随机简单问题测试 Claude Code 和 Codex Profile。</p>
                         </div>
                         <div class="inline-actions">
-                            <label class="checkline ping-toggle"><input id="pingEnabled" type="checkbox" checked>Enable Ping</label>
+                            <label class="checkline ping-toggle"><input id="pingEnabled" type="checkbox" checked><span data-i18n="ping.enable">启用 Ping</span></label>
                             <span id="pingSummary" class="hint">0 records</span>
-                            <button type="button" id="runPing">Ping Now</button>
+                            <button type="button" id="runPing" data-i18n="ping.now">立即 Ping</button>
                         </div>
                     </div>
                     <div id="pingDays" class="ping-days"></div>
@@ -284,24 +417,24 @@
                 <div class="split">
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>工作目录</h2>
-                            <span class="hint">任务只能选择已配置目录</span>
+                            <h2 data-i18n="settings.directories">工作目录</h2>
+                            <span class="hint" data-i18n="settings.directoryHint">任务只能选择已配置目录</span>
                         </div>
                         <form id="directoryForm" class="directory-form">
                             <input name="directory" required placeholder="/home/user/project">
-                            <button type="submit">添加目录</button>
+                            <button type="submit" data-i18n="settings.addDirectory">添加目录</button>
                         </form>
                         <div id="directoryList" class="directory-list"></div>
                     </section>
                     <section class="panel">
                         <div class="panel-head">
-                            <h2>安全边界</h2>
+                            <h2 data-i18n="settings.security">安全边界</h2>
                         </div>
                         <ul class="rules">
-                            <li>命令以非 shell 模式启动，参数来自 Profile 配置。</li>
-                            <li>任务文件只能写入任务选择的工作目录。</li>
-                            <li>每个任务拥有独立日志、状态和进程控制。</li>
-                            <li>高风险参数需要显式写入 Profile。</li>
+                            <li data-i18n="settings.rule.command">命令以非 shell 模式启动，参数来自 Profile 配置。</li>
+                            <li data-i18n="settings.rule.file">任务文件只能写入任务选择的工作目录。</li>
+                            <li data-i18n="settings.rule.isolation">每个任务拥有独立日志、状态和进程控制。</li>
+                            <li data-i18n="settings.rule.risk">高风险参数需要显式写入 Profile。</li>
                         </ul>
                     </section>
                 </div>
@@ -310,6 +443,7 @@
     </div>
 
     <div id="toast" class="toast" hidden></div>
+    <script src="/i18n.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>
