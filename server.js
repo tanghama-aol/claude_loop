@@ -37,6 +37,7 @@ const {
 
 const STATUS = {
     notStarted: "not_started",
+    queued: "queued",
     scheduled: "scheduled",
     running: "running",
     retryWait: "retry_wait",
@@ -44,6 +45,12 @@ const STATUS = {
     allDone: "all_done",
     stopped: "stopped",
     failed: "failed",
+};
+
+const SCHEDULE_MODE = {
+    immediate: "immediate",
+    fixedTime: "fixed_time",
+    profileAvailable: "profile_available",
 };
 
 const DEFAULT_HOST = "0.0.0.0";
@@ -93,6 +100,7 @@ const RUNTIME_STATE = {
     agentRunning: "agent_running",
     idleWaiting: "idle_waiting",
     loopNotStarted: "loop_not_started",
+    queueWaiting: "queue_waiting",
 };
 
 const TASK_TYPES = new Set(["text", "image", "video"]);
@@ -212,6 +220,254 @@ const PING_QUESTIONS = [
 ];
 const PING_INTERVAL_MS = 60 * 60 * 1000;
 const PING_SCHEDULER_TICK_MS = 60 * 1000;
+const PING_DETAIL_MAX_CHARS = 64 * 1024;
+const AVAILABILITY_CHECK_INTERVAL_MINUTES = 30;
+const AVAILABILITY_CHECK_INTERVAL_MS = AVAILABILITY_CHECK_INTERVAL_MINUTES * 60 * 1000;
+
+function tokenCount(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(String(value).replaceAll(",", ""));
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null;
+}
+
+function firstTokenCount(source, keys) {
+    for (const key of keys) {
+        const value = tokenCount(source?.[key]);
+        if (value !== null) return value;
+    }
+    return null;
+}
+
+function usageCounts(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const source = value.usage && typeof value.usage === "object" ? value.usage : value;
+    let inputTokens = firstTokenCount(source, [
+        "input_tokens",
+        "inputTokens",
+        "prompt_tokens",
+        "promptTokens",
+        "input_token_count",
+        "inputTokenCount",
+    ]);
+    const cacheCreationTokens = firstTokenCount(source, [
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+    ]);
+    const cacheReadTokens = firstTokenCount(source, [
+        "cache_read_input_tokens",
+        "cacheReadInputTokens",
+    ]);
+    if (cacheCreationTokens !== null || cacheReadTokens !== null) {
+        inputTokens = (inputTokens || 0) + (cacheCreationTokens || 0) + (cacheReadTokens || 0);
+    }
+    const outputTokens = firstTokenCount(source, [
+        "output_tokens",
+        "outputTokens",
+        "completion_tokens",
+        "completionTokens",
+        "output_token_count",
+        "outputTokenCount",
+    ]);
+    if (inputTokens === null && outputTokens === null) return null;
+    return { inputTokens, outputTokens };
+}
+
+function parseJsonOutputRecords(value = "") {
+    const text = String(value || "").trim();
+    if (!text) return [];
+    try {
+        return [JSON.parse(text)];
+    } catch {
+        const records = [];
+        for (const line of text.split(/\r?\n/)) {
+            const candidate = line.trim();
+            if (!candidate) continue;
+            try {
+                records.push(JSON.parse(candidate));
+            } catch {
+                // Structured CLIs may write a non-JSON notice next to JSONL events.
+            }
+        }
+        return records;
+    }
+}
+
+function walkJson(value, visit) {
+    if (!value || typeof value !== "object") return;
+    visit(value);
+    if (Array.isArray(value)) {
+        for (const item of value) walkJson(item, visit);
+        return;
+    }
+    for (const child of Object.values(value)) walkJson(child, visit);
+}
+
+function contentText(value) {
+    if (typeof value === "string") return value;
+    if (!Array.isArray(value)) return "";
+    return value
+        .map((item) => typeof item === "string" ? item : String(item?.text || item?.content || ""))
+        .filter(Boolean)
+        .join("");
+}
+
+function extractPingOutputDetails(value = "") {
+    const rawText = String(value || "").trim();
+    const records = parseJsonOutputRecords(rawText);
+    if (records.length === 0) {
+        const totalMatch = rawText.match(/tokens?\s+used\s*[\r\n:]+\s*([\d,]+)/i);
+        return {
+            structured: false,
+            inputTokens: null,
+            outputTokens: null,
+            totalTokens: totalMatch ? tokenCount(totalMatch[1]) : null,
+            outputText: rawText,
+            errorText: "",
+            isError: false,
+        };
+    }
+
+    let inputTokens = null;
+    let outputTokens = null;
+    let totalTokens = null;
+    let finalText = "";
+    let errorText = "";
+    let isError = false;
+    let protocolEventSeen = false;
+    const deltaText = [];
+    for (const record of records) {
+        if (record && typeof record === "object" && !Array.isArray(record) && typeof record.type === "string") {
+            protocolEventSeen = true;
+        }
+        walkJson(record, (node) => {
+            const counts = usageCounts(node);
+            if (counts) {
+                if (counts.inputTokens !== null) inputTokens = counts.inputTokens;
+                if (counts.outputTokens !== null) outputTokens = counts.outputTokens;
+            }
+            const nodeTotal = firstTokenCount(node, ["total_tokens", "totalTokens"]);
+            if (nodeTotal !== null) totalTokens = nodeTotal;
+
+            if (node.type === "stream_event"
+                && node.event?.type === "content_block_delta"
+                && node.event?.delta?.type === "text_delta"
+                && node.event.delta.text) {
+                deltaText.push(String(node.event.delta.text));
+            }
+            if (node.type === "item.completed" && node.item?.type === "agent_message") {
+                const text = contentText(node.item.text || node.item.content);
+                if (text) finalText = text;
+            }
+            if (node.type === "assistant" && node.message?.role === "assistant") {
+                const text = contentText(node.message.content);
+                if (text) finalText = text;
+            }
+            if (node.type === "result" && typeof node.result === "string" && node.result.trim()) {
+                finalText = node.result;
+                if (node.is_error === true || String(node.subtype || "").includes("error")) {
+                    errorText = node.result;
+                    isError = true;
+                }
+            }
+            if (Array.isArray(node.choices)) {
+                const text = contentText(node.choices.at(-1)?.message?.content || node.choices.at(-1)?.text);
+                if (text) finalText = text;
+            }
+            if (["error", "turn.failed"].includes(String(node.type || "").toLowerCase())) {
+                const text = contentText(node.message || node.error?.message || node.error);
+                if (text) errorText = text;
+                isError = true;
+            }
+        });
+        if (!finalText && record && typeof record === "object" && !Array.isArray(record)) {
+            const text = contentText(record.result || record.response || record.output || record.text);
+            if (text) finalText = text;
+        }
+    }
+
+    return {
+        structured: true,
+        inputTokens,
+        outputTokens,
+        totalTokens: totalTokens ?? (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null),
+        outputText: finalText || deltaText.join("") || (!protocolEventSeen ? rawText : ""),
+        errorText,
+        isError,
+    };
+}
+
+function jsonRecordHasAssistantText(record) {
+    let found = false;
+    walkJson(record, (node) => {
+        if (found) return;
+        if (node.type === "stream_event"
+            && node.event?.type === "content_block_delta"
+            && node.event?.delta?.type === "text_delta"
+            && String(node.event.delta.text || "").length > 0) {
+            found = true;
+            return;
+        }
+        if (node.type === "item.completed" && node.item?.type === "agent_message"
+            && contentText(node.item.text || node.item.content)) {
+            found = true;
+            return;
+        }
+        if (node.type === "assistant" && node.message?.role === "assistant" && contentText(node.message.content)) {
+            found = true;
+            return;
+        }
+        if (node.type === "result" && String(node.result || "").length > 0) found = true;
+    });
+    return found;
+}
+
+function firstPingResponseLatency(chunks = [], structured = false) {
+    if (!structured) {
+        return chunks.find((chunk) => /\S/.test(chunk.text || ""))?.elapsedMs ?? null;
+    }
+    let buffered = "";
+    let latestElapsedMs = null;
+    for (const chunk of chunks) {
+        buffered += String(chunk.text || "");
+        latestElapsedMs = chunk.elapsedMs;
+        const lines = buffered.split(/\r?\n/);
+        buffered = lines.pop() || "";
+        for (const line of lines) {
+            try {
+                if (jsonRecordHasAssistantText(JSON.parse(line))) return chunk.elapsedMs;
+            } catch {
+                // Ignore CLI notices; only assistant JSON events count as first response text.
+            }
+        }
+    }
+    if (buffered.trim()) {
+        try {
+            if (jsonRecordHasAssistantText(JSON.parse(buffered))) return latestElapsedMs;
+        } catch {
+            // An incomplete final line does not provide a trustworthy response timestamp.
+        }
+    }
+    return null;
+}
+
+function normalizeScheduleMode(value = "", { hasStartAt = false, scheduled = false } = {}) {
+    const mode = String(value || "").trim().toLowerCase().replaceAll("-", "_");
+    if (["availability", "available", "model_available", "profile_available"].includes(mode)) {
+        return SCHEDULE_MODE.profileAvailable;
+    }
+    if (["time", "fixed", "fixed_time", "scheduled_time"].includes(mode)) {
+        return SCHEDULE_MODE.fixedTime;
+    }
+    if (["immediate", "now"].includes(mode)) return SCHEDULE_MODE.immediate;
+    if (hasStartAt || scheduled) return SCHEDULE_MODE.fixedTime;
+    return SCHEDULE_MODE.immediate;
+}
+
+function normalizedDateString(value) {
+    if (!value) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
 
 function createApp(options = {}) {
     const rootDir = path.resolve(options.rootDir || process.cwd());
@@ -223,13 +479,22 @@ function createApp(options = {}) {
     const logEventCounters = new Map();
     let pingTimer = null;
     let pingInProgress = false;
+    let runnersClosing = false;
 
     fs.mkdirSync(logDir, { recursive: true });
 
     function initialState() {
+        const defaultProject = {
+            id: "project_default",
+            name: path.basename(rootDir) || "默认项目",
+            directory: rootDir,
+            createdAt: nowISO(),
+            updatedAt: nowISO(),
+        };
         return {
-            version: 2,
+            version: 3,
             directories: [rootDir],
+            projects: [defaultProject],
             profiles: createDefaultProfiles(rootDir),
             tasks: [],
             events: [],
@@ -282,7 +547,32 @@ function createApp(options = {}) {
         return normalized;
     }
 
+    function legacyProjectId(directory) {
+        return `project_directory_${crypto.createHash("sha1")
+            .update(path.resolve(directory || rootDir))
+            .digest("hex")
+            .slice(0, 12)}`;
+    }
+
+    function normalizeProject(project, index = 0) {
+        const rawDirectory = String(project?.directory || "").trim();
+        const directory = rawDirectory ? path.resolve(rawDirectory) : "";
+        const fallbackName = directory ? path.basename(directory) || directory : `项目 ${index + 1}`;
+        const fallbackId = directory
+            ? legacyProjectId(directory)
+            : `project_unbound_${crypto.createHash("sha1").update(`${fallbackName}:${index}`).digest("hex").slice(0, 12)}`;
+        return {
+            ...project,
+            id: String(project?.id || (index === 0 ? "project_default" : fallbackId)).trim(),
+            name: String(project?.name || fallbackName).trim() || fallbackName,
+            directory,
+            createdAt: project?.createdAt ? String(project.createdAt) : nowISO(),
+            updatedAt: project?.updatedAt ? String(project.updatedAt) : nowISO(),
+        };
+    }
+
     function normalizeTask(task) {
+        const directory = path.resolve(task?.directory || rootDir);
         const runProfileIds = normalizeProfileIdList(
             task?.runProfileIds?.length ? task.runProfileIds : [task?.runProfileId, task?.decomposeProfileId],
         );
@@ -299,14 +589,14 @@ function createApp(options = {}) {
         if (taskType !== "text") {
             try {
                 const resolved = resolveArtifactDirectory(
-                    task?.directory || rootDir,
-                    artifactDirectoryName || (artifactDirectory ? path.relative(task?.directory || rootDir, artifactDirectory) : ""),
+                    directory,
+                    artifactDirectoryName || (artifactDirectory ? path.relative(directory, artifactDirectory) : ""),
                     task?.id || "task",
                 );
                 artifactDirectoryName = resolved.name;
                 artifactDirectory = resolved.path;
             } catch {
-                const resolved = resolveArtifactDirectory(task?.directory || rootDir, "", task?.id || "task");
+                const resolved = resolveArtifactDirectory(directory, "", task?.id || "task");
                 artifactDirectoryName = resolved.name;
                 artifactDirectory = resolved.path;
             }
@@ -333,8 +623,42 @@ function createApp(options = {}) {
         const itemSequence = Number.isFinite(rawItemSequence) && rawItemSequence >= 0
             ? Math.trunc(rawItemSequence)
             : appendedItems.reduce((maximum, item) => Math.max(maximum, Number(item.number) || 0), 0);
+        const scheduled = String(task?.status || "") === STATUS.scheduled;
+        const scheduleMode = normalizeScheduleMode(task?.scheduleMode, {
+            hasStartAt: Boolean(task?.scheduledStartAt || (scheduled && task?.nextRunAt)),
+            scheduled,
+        });
+        const scheduledStartAt = scheduleMode === SCHEDULE_MODE.fixedTime
+            ? normalizedDateString(task?.scheduledStartAt || (scheduled ? task?.nextRunAt : null))
+            : null;
+        const availabilityLastCheckedAt = normalizedDateString(task?.availabilityLastCheckedAt);
+        const availabilityNextCheckAt = scheduleMode === SCHEDULE_MODE.profileAvailable && scheduled
+            ? normalizedDateString(task?.availabilityNextCheckAt || (scheduled ? task?.nextRunAt : null))
+            : null;
+        const archived = task?.archived === true || Boolean(task?.archivedAt);
+        const archiveRoot = path.resolve(directory, "archive");
+        const rawArchiveDirectory = String(task?.archiveDirectory || "").trim();
+        const resolvedArchiveDirectory = rawArchiveDirectory ? path.resolve(rawArchiveDirectory) : "";
+        const archiveRelative = resolvedArchiveDirectory ? path.relative(archiveRoot, resolvedArchiveDirectory) : "";
+        const archiveDirectory = archived
+            && resolvedArchiveDirectory
+            && archiveRelative !== ".."
+            && !archiveRelative.startsWith(`..${path.sep}`)
+            && !path.isAbsolute(archiveRelative)
+            ? resolvedArchiveDirectory
+            : "";
+        const queuedStart = task?.queuedStart && typeof task.queuedStart === "object"
+            ? {
+                profileIds: normalizeProfileIdList(task.queuedStart.profileIds),
+                scheduleMode: normalizeScheduleMode(task.queuedStart.scheduleMode, {
+                    hasStartAt: Boolean(task.queuedStart.startAt),
+                }),
+                startAt: normalizedDateString(task.queuedStart.startAt),
+            }
+            : null;
         return {
             ...task,
+            directory,
             logFile: normalizedLogFile,
             logEventsFile: normalizedLogEventsFile,
             logRuns,
@@ -353,19 +677,75 @@ function createApp(options = {}) {
             appendHistory: appendedItems,
             itemSequence,
             lastAppendedAt: task?.lastAppendedAt ? String(task.lastAppendedAt) : null,
+            scheduleMode,
+            scheduledStartAt,
+            availabilityCheckIntervalMinutes: scheduleMode === SCHEDULE_MODE.profileAvailable
+                ? AVAILABILITY_CHECK_INTERVAL_MINUTES
+                : null,
+            availabilityLastCheckedAt,
+            availabilityNextCheckAt,
+            projectId: String(task?.projectId || "").trim(),
+            archived,
+            archivedAt: archived && task?.archivedAt ? String(task.archivedAt) : null,
+            archiveDirectory,
+            archivedOriginalFilePath: archived && task?.archivedOriginalFilePath
+                ? path.resolve(String(task.archivedOriginalFilePath))
+                : null,
+            logDirectory: archiveDirectory ? path.join(archiveDirectory, "logs") : "",
+            queuedAt: String(task?.status || "") === STATUS.queued && task?.queuedAt
+                ? String(task.queuedAt)
+                : null,
+            queueRunId: String(task?.status || "") === STATUS.queued && task?.queueRunId
+                ? String(task.queueRunId)
+                : null,
+            queuedDirectory: String(task?.status || "") === STATUS.queued
+                ? path.resolve(task?.queuedDirectory || directory)
+                : null,
+            queuedStart: String(task?.status || "") === STATUS.queued ? queuedStart : null,
         };
     }
 
     function normalizeState(state) {
         const normalized = state && typeof state === "object" ? state : initialState();
-        normalized.version = 2;
+        normalized.version = 3;
         normalized.directories = Array.isArray(normalized.directories) && normalized.directories.length > 0
             ? normalized.directories.map((item) => path.resolve(item))
             : [rootDir];
+        normalized.projects = Array.isArray(normalized.projects) && normalized.projects.length > 0
+            ? normalized.projects.map(normalizeProject)
+            : [];
         normalized.profiles = Array.isArray(normalized.profiles)
             ? normalized.profiles.map(normalizeProfile)
             : createDefaultProfiles(rootDir);
         normalized.tasks = Array.isArray(normalized.tasks) ? normalized.tasks.map(normalizeTask) : [];
+        if (normalized.projects.length === 0) {
+            normalized.projects.push(normalizeProject({
+                id: "project_default",
+                name: path.basename(rootDir) || "默认项目",
+                directory: rootDir,
+            }));
+        }
+        const projectIds = new Set(normalized.projects.map((project) => project.id));
+        for (const task of normalized.tasks) {
+            if (task.projectId && projectIds.has(task.projectId)) continue;
+            let project = normalized.projects.find((item) => item.directory && item.directory === task.directory);
+            if (!project) {
+                const id = legacyProjectId(task.directory);
+                project = normalized.projects.find((item) => item.id === id);
+                if (!project) {
+                    project = normalizeProject({
+                        id,
+                        name: path.basename(task.directory) || task.directory,
+                        directory: task.directory,
+                        createdAt: task.createdAt || nowISO(),
+                        updatedAt: task.updatedAt || nowISO(),
+                    }, normalized.projects.length);
+                    normalized.projects.push(project);
+                    projectIds.add(project.id);
+                }
+            }
+            task.projectId = project.id;
+        }
         normalized.events = Array.isArray(normalized.events) ? normalized.events : [];
         normalized.pingRecords = Array.isArray(normalized.pingRecords) ? normalized.pingRecords : [];
         normalized.pingSettings = {
@@ -481,6 +861,56 @@ function createApp(options = {}) {
         return state.tasks.find((task) => task.id === id);
     }
 
+    function findProject(state, id) {
+        return state.projects.find((project) => project.id === id);
+    }
+
+    /**
+     * Agent processes operate in a concrete working directory.  Keep queue
+     * ownership tied to that directory instead of the presentation project:
+     * an unbound project can still choose a directory for each task, and two
+     * projects pointing at the same directory must not mutate it concurrently.
+     */
+    function queueDirectoryForTask(task) {
+        return path.resolve(task?.directory || rootDir);
+    }
+
+    function queuedTasksForDirectory(state, directory) {
+        const queueDirectory = path.resolve(directory || rootDir);
+        return state.tasks
+            .filter((task) => !task.archived
+                && task.status === STATUS.queued
+                && queueDirectoryForTask(task) === queueDirectory)
+            .sort((left, right) => String(left.queuedAt || left.createdAt || "")
+                .localeCompare(String(right.queuedAt || right.createdAt || ""))
+                || String(left.id).localeCompare(String(right.id)));
+    }
+
+    function directoryActiveTask(state, directory, excludedTaskId = "") {
+        const queueDirectory = path.resolve(directory || rootDir);
+        return state.tasks.find((task) => {
+            if (task.id === excludedTaskId || task.archived || queueDirectoryForTask(task) !== queueDirectory) return false;
+            if (runners.has(task.id)) return true;
+            return [STATUS.running, STATUS.scheduled, STATUS.retryWait].includes(String(task.status || ""));
+        }) || null;
+    }
+
+    function queuedTasksForProject(state, projectId) {
+        return state.tasks
+            .filter((task) => task.projectId === projectId && !task.archived && task.status === STATUS.queued)
+            .sort((left, right) => String(left.queuedAt || left.createdAt || "")
+                .localeCompare(String(right.queuedAt || right.createdAt || ""))
+                || String(left.id).localeCompare(String(right.id)));
+    }
+
+    function projectActiveTask(state, projectId, excludedTaskId = "") {
+        return state.tasks.find((task) => {
+            if (task.id === excludedTaskId || task.projectId !== projectId || task.archived) return false;
+            if (runners.has(task.id)) return true;
+            return [STATUS.running, STATUS.scheduled, STATUS.retryWait].includes(String(task.status || ""));
+        }) || null;
+    }
+
     function findProfile(state, id) {
         return state.profiles.find((profile) => profile.id === id && profile.enabled !== false);
     }
@@ -497,6 +927,15 @@ function createApp(options = {}) {
             if (profile && (!taskType || profileSupportsOutput(profile, taskType))) usableIds.push(id);
         }
         return usableIds;
+    }
+
+    function orderedUsableProfiles(state, task) {
+        const ids = selectUsableProfileIds(state, task.runProfileIds, task.taskType);
+        const currentIndex = ids.indexOf(String(task.runProfileId || ""));
+        const orderedIds = currentIndex > 0
+            ? [...ids.slice(currentIndex), ...ids.slice(0, currentIndex)]
+            : ids;
+        return orderedIds.map((id) => findProfile(state, id)).filter(Boolean);
     }
 
     function resolveRunProfile(state, task) {
@@ -519,6 +958,19 @@ function createApp(options = {}) {
     }
 
     function runtimeInfoForTask(task) {
+        if (task.status === STATUS.queued) {
+            return {
+                runtimeState: RUNTIME_STATE.queueWaiting,
+                loopActive: false,
+                isRunning: false,
+                isAgentRunning: false,
+                isIdleWaiting: true,
+                activeProcess: null,
+                loopStartedAt: null,
+                idleSince: task.queuedAt || null,
+                runtimeNextRunAt: null,
+            };
+        }
         const runner = runners.get(task.id);
         if (!runner || runner.stopped) {
             return {
@@ -633,27 +1085,64 @@ function createApp(options = {}) {
 
     function publicState() {
         const state = loadState();
+        const directoryQueuePositions = new Map();
+        const queueDirectories = new Set(
+            state.tasks
+                .filter((task) => task.status === STATUS.queued && !task.archived)
+                .map((task) => queueDirectoryForTask(task)),
+        );
+        for (const directory of queueDirectories) {
+            queuedTasksForDirectory(state, directory).forEach((task, index) => {
+                directoryQueuePositions.set(task.id, index + 1);
+            });
+        }
+        const publicProjects = state.projects.map((project) => ({
+            ...project,
+            currentTaskCount: state.tasks.filter((task) => task.projectId === project.id && !task.archived).length,
+            archivedTaskCount: state.tasks.filter((task) => task.projectId === project.id && task.archived).length,
+            activeTaskId: projectActiveTask(state, project.id)?.id || null,
+            queuedTaskCount: queuedTasksForProject(state, project.id).length,
+        }));
+        const publicTasks = state.tasks.map((task) => {
+            const project = state.projects.find((item) => item.id === task.projectId);
+            const queueActiveTask = task.status === STATUS.queued
+                ? directoryActiveTask(state, task.directory, task.id)
+                : null;
+            const artifacts = scanTaskArtifacts(task).map(({ filePath, signature, ...artifact }) => artifact);
+            const logRuns = (task.logRuns || []).map((run) => ({
+                ...run,
+                logSize: safeStat(taskRunLogPath(task, run, false))?.size || 0,
+                eventLogSize: safeStat(taskRunLogPath(task, run, true))?.size || 0,
+            }));
+            return {
+                ...task,
+                projectName: project?.name || "",
+                projectDirectory: project?.directory || "",
+                archivePath: task.archiveDirectory || null,
+                queueStatus: task.status === STATUS.queued ? "queued" : null,
+                queueDirectory: task.status === STATUS.queued ? queueDirectoryForTask(task) : null,
+                queueActiveTaskId: queueActiveTask?.id || null,
+                logRuns,
+                logRunCount: logRuns.length,
+                ...runtimeInfoForTask(task),
+                queuePosition: directoryQueuePositions.get(task.id) || null,
+                artifacts,
+                artifactCount: artifacts.length,
+                logSize: task.logFile ? safeStat(taskLogPath(task))?.size || 0 : 0,
+                fileMtime: task.filePath ? safeStat(task.filePath)?.mtime?.toISOString() || null : null,
+            };
+        });
+        const projectTaskTree = publicProjects.map((project) => ({
+            ...project,
+            current: publicTasks.filter((task) => task.projectId === project.id && !task.archived),
+            archive: publicTasks.filter((task) => task.projectId === project.id && task.archived),
+        }));
         return {
             ...state,
+            projects: publicProjects,
             profiles: state.profiles.map(profileForClient),
-            tasks: state.tasks.map((task) => {
-                const artifacts = scanTaskArtifacts(task).map(({ filePath, signature, ...artifact }) => artifact);
-                const logRuns = (task.logRuns || []).map((run) => ({
-                    ...run,
-                    logSize: safeStat(taskRunLogPath(task, run, false))?.size || 0,
-                    eventLogSize: safeStat(taskRunLogPath(task, run, true))?.size || 0,
-                }));
-                return {
-                    ...task,
-                    logRuns,
-                    logRunCount: logRuns.length,
-                    ...runtimeInfoForTask(task),
-                    artifacts,
-                    artifactCount: artifacts.length,
-                    logSize: task.logFile ? safeStat(taskLogPath(task))?.size || 0 : 0,
-                    fileMtime: task.filePath ? safeStat(task.filePath)?.mtime?.toISOString() || null : null,
-                };
-            }),
+            tasks: publicTasks,
+            projectTaskTree,
             pingDays: pingDays(state.pingRecords),
             pingSettings: state.pingSettings,
             pingQuestionCount: PING_QUESTIONS.length,
@@ -698,6 +1187,68 @@ function createApp(options = {}) {
             const error = new Error("目标文件必须位于任务工作目录内");
             error.statusCode = 400;
             throw error;
+        }
+        return filePath;
+    }
+
+    function verifiedTaskFilePath(task) {
+        const archived = task?.archived === true;
+        if (archived && !String(task?.archiveDirectory || "").trim()) {
+            const error = new Error("归档任务文件目录无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        let root = path.resolve(task?.directory || rootDir);
+        if (archived) root = verifiedArchiveDirectory(task, { allowMissing: true });
+        const filePath = task?.filePath
+            ? path.resolve(String(task.filePath))
+            : archived
+                ? path.resolve(root, safeTaskFileName(task?.targetFileName || `${task?.title || "task"}.md`))
+                : resolveTaskFile(root, task?.targetFileName || `${task?.title || "task"}.md`);
+        const relative = path.relative(root, filePath);
+        if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+            const error = new Error("任务文件路径无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        try {
+            const realRoot = fs.realpathSync(root);
+            const stat = fs.lstatSync(filePath);
+            if (stat.isSymbolicLink()) {
+                const error = new Error("任务文件不能是符号链接");
+                error.statusCode = 400;
+                throw error;
+            }
+            const realFile = fs.realpathSync(filePath);
+            const realRelative = path.relative(realRoot, realFile);
+            if (!realRelative || realRelative === ".." || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
+                const error = new Error("任务文件路径越界");
+                error.statusCode = 400;
+                throw error;
+            }
+        } catch (error) {
+            if (error.statusCode) throw error;
+            if (error.code !== "ENOENT") {
+                const wrapped = new Error("任务文件路径无法验证");
+                wrapped.statusCode = 400;
+                throw wrapped;
+            }
+            if (!fs.existsSync(root)) return filePath;
+            try {
+                const realRoot = fs.realpathSync(root);
+                const realParent = fs.realpathSync(path.dirname(filePath));
+                const parentRelative = path.relative(realRoot, realParent);
+                if (parentRelative === ".." || parentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(parentRelative)) {
+                    const wrapped = new Error("任务文件父目录越界");
+                    wrapped.statusCode = 400;
+                    throw wrapped;
+                }
+            } catch (parentError) {
+                if (parentError.statusCode) throw parentError;
+                const wrapped = new Error("任务文件父目录无法验证");
+                wrapped.statusCode = 400;
+                throw wrapped;
+            }
         }
         return filePath;
     }
@@ -818,7 +1369,12 @@ function createApp(options = {}) {
     }
 
     function appendTaskItems(state, task, inputItems) {
-        const activeStatuses = new Set([STATUS.running, STATUS.scheduled, STATUS.retryWait]);
+        if (task.archived) {
+            const error = new Error("归档任务不能追加任务项");
+            error.statusCode = 409;
+            throw error;
+        }
+        const activeStatuses = new Set([STATUS.queued, STATUS.running, STATUS.scheduled, STATUS.retryWait]);
         if (runners.has(task.id) || activeStatuses.has(String(task.status || ""))) {
             const error = new Error("任务正在运行或等待重试，暂不能追加任务项");
             error.statusCode = 409;
@@ -833,8 +1389,8 @@ function createApp(options = {}) {
         }
         // Validate the aggregate log destinations before mutating the task file so a
         // damaged or tampered state record cannot leave a half-applied append.
-        assertSafeLogFilePath(taskLogPath(task));
-        assertSafeLogFilePath(taskLogPath(task, true));
+        assertSafeLogFilePath(taskLogPath(task), taskLogRoot(task));
+        assertSafeLogFilePath(taskLogPath(task, true), taskLogRoot(task));
         const originalContent = fs.readFileSync(filePath, "utf8");
         const requestedSequence = Number(task.itemSequence);
         const startNumber = Math.max(
@@ -899,6 +1455,212 @@ function createApp(options = {}) {
             previousStatus,
             status: task.status,
         };
+    }
+
+    function safeArchiveDirectoryName(task) {
+        const title = safeTaskFileName(task?.title || task?.targetFileName || "task")
+            .replace(/\.md$/i, "")
+            .replace(/\s+/g, "-")
+            .slice(0, 80) || "task";
+        return `${title}-${safeLogToken(task?.id, "task")}`;
+    }
+
+    function resolveArchiveRoot(directory) {
+        const taskDirectory = path.resolve(directory || rootDir);
+        const archiveRoot = path.resolve(taskDirectory, "archive");
+        const relative = path.relative(taskDirectory, archiveRoot);
+        if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+            const error = new Error("归档目录无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        if (!fs.existsSync(archiveRoot)) return archiveRoot;
+        const stat = fs.lstatSync(archiveRoot);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            const error = new Error("archive 必须是任务工作目录内的普通目录");
+            error.statusCode = 400;
+            throw error;
+        }
+        const realDirectory = fs.realpathSync(taskDirectory);
+        const realArchiveRoot = fs.realpathSync(archiveRoot);
+        const realRelative = path.relative(realDirectory, realArchiveRoot);
+        if (!realRelative || realRelative === ".." || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
+            const error = new Error("archive 目录不能越过任务工作目录");
+            error.statusCode = 400;
+            throw error;
+        }
+        return archiveRoot;
+    }
+
+    function verifiedArchiveDirectory(task, options = {}) {
+        const rawArchiveDirectory = String(task?.archiveDirectory || "").trim();
+        if (!rawArchiveDirectory) {
+            const error = new Error("归档任务目录无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        const archiveRoot = resolveArchiveRoot(task?.directory || rootDir);
+        const archiveDirectory = path.resolve(rawArchiveDirectory);
+        const archiveRelative = path.relative(archiveRoot, archiveDirectory);
+        if (!archiveRelative || archiveRelative === ".." || archiveRelative.startsWith(`..${path.sep}`) || path.isAbsolute(archiveRelative)) {
+            const error = new Error("归档任务目录无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        if (!fs.existsSync(archiveDirectory) && options.allowMissing === true) return archiveDirectory;
+        try {
+            const archiveStat = fs.lstatSync(archiveDirectory);
+            if (archiveStat.isSymbolicLink() || !archiveStat.isDirectory()) {
+                const error = new Error("归档任务目录必须是普通目录");
+                error.statusCode = 400;
+                throw error;
+            }
+            const realArchiveRoot = fs.realpathSync(archiveRoot);
+            const realArchiveDirectory = fs.realpathSync(archiveDirectory);
+            const realArchiveRelative = path.relative(realArchiveRoot, realArchiveDirectory);
+            if (!realArchiveRelative
+                || realArchiveRelative === ".."
+                || realArchiveRelative.startsWith(`..${path.sep}`)
+                || path.isAbsolute(realArchiveRelative)) {
+                const error = new Error("归档任务目录越界");
+                error.statusCode = 400;
+                throw error;
+            }
+        } catch (error) {
+            if (error.statusCode) throw error;
+            const wrapped = new Error("归档任务目录无法验证");
+            wrapped.statusCode = 400;
+            throw wrapped;
+        }
+        return archiveDirectory;
+    }
+
+    function moveFileSync(source, destination) {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        try {
+            fs.renameSync(source, destination);
+        } catch (error) {
+            if (error?.code !== "EXDEV") throw error;
+            fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+            fs.unlinkSync(source);
+        }
+    }
+
+    function archiveTask(state, task) {
+        if (task.archived) {
+            const error = new Error("任务已经归档");
+            error.statusCode = 409;
+            throw error;
+        }
+        if (runners.has(task.id) || [STATUS.queued, STATUS.running, STATUS.scheduled, STATUS.retryWait].includes(task.status)) {
+            const error = new Error("运行中、预约中或排队中的任务不能归档");
+            error.statusCode = 409;
+            throw error;
+        }
+
+        const archiveRoot = resolveArchiveRoot(task.directory);
+        const archiveDirectory = path.resolve(archiveRoot, safeArchiveDirectoryName(task));
+        const archiveRelative = path.relative(archiveRoot, archiveDirectory);
+        if (!archiveRelative || archiveRelative === ".." || archiveRelative.startsWith(`..${path.sep}`) || path.isAbsolute(archiveRelative)) {
+            const error = new Error("归档目录无效");
+            error.statusCode = 400;
+            throw error;
+        }
+        if (fs.existsSync(archiveDirectory)) {
+            const error = new Error("任务归档目录已存在");
+            error.statusCode = 409;
+            throw error;
+        }
+
+        const originalFilePath = verifiedTaskFilePath(task);
+        const archivedAt = nowISO();
+        appendTaskLogEvent(task, "task_archived", `归档任务：${task.title}`, {
+            phase: "setup",
+            runStatus: task.status,
+            metadata: { archiveDirectory },
+        });
+        const originalLogRoot = taskLogRoot(task);
+        const fileMoves = [];
+        if (safeStat(originalFilePath)?.isFile()) {
+            fileMoves.push({
+                source: originalFilePath,
+                destination: path.join(archiveDirectory, path.basename(originalFilePath)),
+                kind: "task",
+            });
+        }
+        const logPaths = new Set([taskLogPath(task), taskLogPath(task, true)]);
+        for (const run of task.logRuns || []) {
+            logPaths.add(taskRunLogPath(task, run));
+            logPaths.add(taskRunLogPath(task, run, true));
+        }
+        for (const source of logPaths) {
+            if (!logFilePathIsSafe(source, originalLogRoot) || !safeStat(source)?.isFile()) continue;
+            fileMoves.push({
+                source,
+                destination: path.join(archiveDirectory, "logs", path.basename(source)),
+                kind: "log",
+            });
+        }
+
+        const moved = [];
+        try {
+            fs.mkdirSync(path.join(archiveDirectory, "logs"), { recursive: true });
+            for (const entry of fileMoves) {
+                moveFileSync(entry.source, entry.destination);
+                moved.push(entry);
+            }
+            const archivedFile = fileMoves.find((entry) => entry.kind === "task")?.destination
+                || path.join(archiveDirectory, safeTaskFileName(task.targetFileName || `${task.title}.md`));
+            if (!safeStat(archivedFile)?.isFile()) {
+                fs.writeFileSync(archivedFile, String(task.requirement || ""), "utf8");
+            }
+            fs.writeFileSync(path.join(archiveDirectory, "task.json"), JSON.stringify({
+                id: task.id,
+                projectId: task.projectId,
+                title: task.title,
+                requirement: task.requirement,
+                status: task.status,
+                targetFileName: task.targetFileName,
+                workingDirectory: task.directory,
+                originalFilePath,
+                archivedFilePath: archivedFile,
+                logFiles: fileMoves
+                    .filter((entry) => entry.kind === "log")
+                    .map((entry) => path.relative(archiveDirectory, entry.destination).split(path.sep).join("/")),
+                archivedAt,
+            }, null, 2), "utf8");
+
+            task.archived = true;
+            task.archivedAt = archivedAt;
+            task.archiveDirectory = archiveDirectory;
+            task.archivedOriginalFilePath = originalFilePath;
+            task.filePath = archivedFile;
+            task.logDirectory = path.join(archiveDirectory, "logs");
+            task.queuedAt = null;
+            task.queueRunId = null;
+            task.queuedDirectory = null;
+            task.queuedStart = null;
+            task.updatedAt = archivedAt;
+            addEvent(state, "archive", task.id, `归档任务：${task.title}`);
+            saveState(state);
+            return task;
+        } catch (error) {
+            for (const entry of moved.reverse()) {
+                try {
+                    if (fs.existsSync(entry.destination) && !fs.existsSync(entry.source)) {
+                        moveFileSync(entry.destination, entry.source);
+                    }
+                } catch {
+                    // Preserve the original error; rollback is best-effort.
+                }
+            }
+            try {
+                fs.rmSync(archiveDirectory, { recursive: true, force: true });
+            } catch {
+                // Preserve the original error.
+            }
+            throw error;
+        }
     }
 
     function resolveArtifactDirectory(directory, artifactDirectoryName, taskId) {
@@ -999,10 +1761,19 @@ function createApp(options = {}) {
         return `${fallback}-${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 12)}`;
     }
 
-    function logPathWithinDirectory(fileName, fallback) {
+    function taskLogRoot(task = {}) {
+        const archiveDirectory = String(task?.archiveDirectory || "").trim();
+        if (task?.archived === true && archiveDirectory) {
+            return path.resolve(verifiedArchiveDirectory(task, { allowMissing: true }), "logs");
+        }
+        return logDir;
+    }
+
+    function logPathWithinDirectory(fileName, fallback, directory = logDir) {
+        const root = path.resolve(directory);
         const safeName = safeLogFileName(fileName, fallback);
-        const resolved = path.resolve(logDir, safeName);
-        const relative = path.relative(logDir, resolved);
+        const resolved = path.resolve(root, safeName);
+        const relative = path.relative(root, resolved);
         if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             const error = new Error("日志路径无效");
             error.statusCode = 400;
@@ -1011,14 +1782,15 @@ function createApp(options = {}) {
         return resolved;
     }
 
-    function logFilePathIsSafe(filePath) {
+    function logFilePathIsSafe(filePath, directory = logDir) {
+        const root = path.resolve(directory);
         const resolved = path.resolve(filePath);
-        const relative = path.relative(path.resolve(logDir), resolved);
+        const relative = path.relative(root, resolved);
         if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
         try {
             const stat = fs.lstatSync(resolved);
             if (stat.isSymbolicLink()) return false;
-            const realRoot = fs.realpathSync(logDir);
+            const realRoot = fs.realpathSync(root);
             const realFile = fs.realpathSync(resolved);
             const realRelative = path.relative(realRoot, realFile);
             return realRelative !== ".."
@@ -1029,8 +1801,8 @@ function createApp(options = {}) {
         }
     }
 
-    function assertSafeLogFilePath(filePath) {
-        if (logFilePathIsSafe(filePath)) return filePath;
+    function assertSafeLogFilePath(filePath, directory = logDir) {
+        if (logFilePathIsSafe(filePath, directory)) return filePath;
         const error = new Error("日志文件路径无效");
         error.statusCode = 400;
         throw error;
@@ -1054,6 +1826,7 @@ function createApp(options = {}) {
         return logPathWithinDirectory(
             eventLog ? taskLogEventsFileName(task) : taskLogFileName(task),
             fallback,
+            taskLogRoot(task),
         );
     }
 
@@ -1066,7 +1839,7 @@ function createApp(options = {}) {
     function taskRunLogPath(task, run, eventLog = false) {
         const fallback = taskRunLogFileName(task, run?.runId, eventLog);
         const fileName = eventLog ? run?.eventLogFile : run?.logFile;
-        return logPathWithinDirectory(fileName, fallback);
+        return logPathWithinDirectory(fileName, fallback, taskLogRoot(task));
     }
 
     function normalizeTaskLogRun(run, task = {}) {
@@ -1120,9 +1893,10 @@ function createApp(options = {}) {
             if (options.startedAt && !run.startedAt) run.startedAt = String(options.startedAt);
             if (options.scheduledAt && !run.scheduledAt) run.scheduledAt = String(options.scheduledAt);
         }
-        fs.mkdirSync(logDir, { recursive: true });
+        const root = taskLogRoot(task);
+        fs.mkdirSync(root, { recursive: true });
         for (const filePath of [taskRunLogPath(task, run), taskRunLogPath(task, run, true)]) {
-            assertSafeLogFilePath(filePath);
+            assertSafeLogFilePath(filePath, root);
             const descriptor = fs.openSync(filePath, "a");
             fs.closeSync(descriptor);
         }
@@ -1133,7 +1907,7 @@ function createApp(options = {}) {
         const run = ensureTaskRunLog(task, runId, updates);
         if (!run) return null;
         Object.assign(run, updates);
-        const storedEvents = inspectTaskLogFile(taskRunLogPath(task, run, true)).events;
+        const storedEvents = inspectTaskLogFile(taskRunLogPath(task, run, true), taskLogRoot(task)).events;
         if (storedEvents.length > 0) {
             run.eventCount = storedEvents.length;
             run.firstSequence = Number(storedEvents[0].sequence || 0);
@@ -1171,7 +1945,7 @@ function createApp(options = {}) {
             const eventPath = taskLogPath(task, true);
             let existingEvents = [];
             try {
-                existingEvents = logFilePathIsSafe(eventPath) && fs.existsSync(eventPath)
+                existingEvents = logFilePathIsSafe(eventPath, taskLogRoot(task)) && fs.existsSync(eventPath)
                     ? parseTaskLogEvents(fs.readFileSync(eventPath, "utf8"))
                     : [];
             } catch {
@@ -1188,14 +1962,14 @@ function createApp(options = {}) {
         return sequence;
     }
 
-    function appendLegacyLogFile(filePath, message, timestamp) {
+    function appendLegacyLogFile(filePath, message, timestamp, directory = logDir) {
         const text = String(message ?? "").replace(/\s+$/g, "");
         if (!text) return;
-        fs.appendFileSync(assertSafeLogFilePath(filePath), `[${timestamp}] ${text}\n`, "utf8");
+        fs.appendFileSync(assertSafeLogFilePath(filePath, directory), `[${timestamp}] ${text}\n`, "utf8");
     }
 
     function appendLegacyTaskLog(task, message, timestamp, filePath = null) {
-        appendLegacyLogFile(filePath || taskLogPath(task), message, timestamp);
+        appendLegacyLogFile(filePath || taskLogPath(task), message, timestamp, taskLogRoot(task));
     }
 
     function shouldPersistRunLog(options, runId) {
@@ -1230,11 +2004,12 @@ function createApp(options = {}) {
                 status: options.runStatus || "running",
             })
             : null;
-        const aggregateEventPath = assertSafeLogFilePath(taskLogPath(task, true));
-        fs.mkdirSync(logDir, { recursive: true });
+        const root = taskLogRoot(task);
+        const aggregateEventPath = assertSafeLogFilePath(taskLogPath(task, true), root);
+        fs.mkdirSync(root, { recursive: true });
         fs.appendFileSync(aggregateEventPath, `${JSON.stringify(event)}\n`, "utf8");
         if (run) {
-            fs.appendFileSync(assertSafeLogFilePath(taskRunLogPath(task, run, true)), `${JSON.stringify(event)}\n`, "utf8");
+            fs.appendFileSync(assertSafeLogFilePath(taskRunLogPath(task, run, true), root), `${JSON.stringify(event)}\n`, "utf8");
             run.eventCount = Math.max(0, Number(run.eventCount || 0)) + 1;
             run.firstSequence = run.firstSequence === null || run.firstSequence === undefined
                 ? sequence
@@ -1245,18 +2020,18 @@ function createApp(options = {}) {
         if (options.legacyText !== false) {
             const legacyText = options.legacyText === undefined ? text : options.legacyText;
             appendLegacyTaskLog(task, legacyText, timestamp);
-            if (run) appendLegacyLogFile(assertSafeLogFilePath(taskRunLogPath(task, run)), legacyText, timestamp);
+            if (run) appendLegacyLogFile(taskRunLogPath(task, run), legacyText, timestamp, root);
         }
         return event;
     }
 
     function readTaskLogEvents(task, afterSequence = 0) {
-        return inspectTaskLogFile(taskLogPath(task, true)).events
+        return inspectTaskLogFile(taskLogPath(task, true), taskLogRoot(task)).events
             .filter((event) => Number(event.sequence || 0) > afterSequence);
     }
 
-    function inspectTaskLogFile(filePath) {
-        if (!logFilePathIsSafe(filePath)) {
+    function inspectTaskLogFile(filePath, directory = logDir) {
+        if (!logFilePathIsSafe(filePath, directory)) {
             return {
                 exists: true,
                 content: "",
@@ -1305,14 +2080,14 @@ function createApp(options = {}) {
         };
     }
 
-    function readLegacyLogFile(filePath, options = {}) {
+    function readLegacyLogFile(filePath, options = {}, directory = logDir) {
         const emptyMetadata = {
             totalBytes: 0,
             returnedBytes: 0,
             omittedBytes: 0,
             truncated: false,
         };
-        if (!logFilePathIsSafe(filePath)) {
+        if (!logFilePathIsSafe(filePath, directory)) {
             return {
                 exists: true,
                 content: "",
@@ -1472,8 +2247,9 @@ function createApp(options = {}) {
             ? Math.trunc(Number(options.afterSequence))
             : 0;
         const legacyMaxBytes = options.fullContent === true ? null : DEFAULT_LEGACY_LOG_PREVIEW_BYTES;
-        const aggregateStructured = inspectTaskLogFile(taskLogPath(task, true));
-        const aggregateLegacy = readLegacyLogFile(taskLogPath(task), { maxBytes: legacyMaxBytes });
+        const root = taskLogRoot(task);
+        const aggregateStructured = inspectTaskLogFile(taskLogPath(task, true), root);
+        const aggregateLegacy = readLegacyLogFile(taskLogPath(task), { maxBytes: legacyMaxBytes }, root);
         const allRuns = taskLogRuns(task, aggregateStructured.events);
         const requestedRunId = String(options.runId || "").trim();
         const selectedRun = requestedRunId ? allRuns.find((run) => run.runId === requestedRunId) : null;
@@ -1484,8 +2260,8 @@ function createApp(options = {}) {
         if (selectedRun) {
             const runEventPath = taskRunLogPath(task, selectedRun, true);
             const runLegacyPath = taskRunLogPath(task, selectedRun, false);
-            const runStructured = inspectTaskLogFile(runEventPath);
-            const runLegacy = readLegacyLogFile(runLegacyPath, { maxBytes: legacyMaxBytes });
+            const runStructured = inspectTaskLogFile(runEventPath, root);
+            const runLegacy = readLegacyLogFile(runLegacyPath, { maxBytes: legacyMaxBytes }, root);
             if (runStructured.exists || runStructured.readError) {
                 structured = runStructured;
                 events = runStructured.events;
@@ -1791,6 +2567,11 @@ function createApp(options = {}) {
         return baseName === "codex" || baseName === "codex.exe" || baseName === "codex.cmd" || baseName === "codex.ps1";
     }
 
+    function isClaudeCommand(profile) {
+        const baseName = path.basename(stripCommandQuotes(profile.command || "")).toLowerCase();
+        return baseName === "claude" || baseName === "claude.exe" || baseName === "claude.cmd" || baseName === "claude.ps1";
+    }
+
     function addNonInteractiveArgs(profile, args) {
         if (profile.nonInteractive === false) return args;
         const agentType = String(profile.agentType || "").trim().toLowerCase();
@@ -1816,6 +2597,39 @@ function createApp(options = {}) {
             command: stripCommandQuotes(profile.command),
             args: renderedArgs,
             summary: [stripCommandQuotes(profile.command), ...renderedArgs].map(quoteCommandArg).join(" ").trim(),
+        };
+    }
+
+    function buildPingSpawn(profile, prompt, task = {}) {
+        const spawnSpec = buildSpawn(profile, prompt, task);
+        const args = [...spawnSpec.args];
+        let structuredOutput = false;
+
+        if (isCodexCommand(profile)) {
+            const execIndex = args.indexOf("exec");
+            if (execIndex >= 0) {
+                if (!args.includes("--json")) args.splice(execIndex + 1, 0, "--json");
+                structuredOutput = true;
+            }
+        } else if (isClaudeCommand(profile)) {
+            const outputFormatArg = args.find((arg, index) => arg.startsWith("--output-format=")
+                || (arg === "--output-format" && args[index + 1]));
+            if (!outputFormatArg) {
+                args.unshift("--output-format", "stream-json", "--include-partial-messages", "--verbose");
+                structuredOutput = true;
+            } else {
+                const format = outputFormatArg.includes("=")
+                    ? outputFormatArg.split("=").slice(1).join("=")
+                    : args[args.indexOf(outputFormatArg) + 1];
+                structuredOutput = ["json", "stream-json"].includes(String(format || "").toLowerCase());
+            }
+        }
+
+        return {
+            ...spawnSpec,
+            args,
+            summary: [spawnSpec.command, ...args].map(quoteCommandArg).join(" ").trim(),
+            structuredOutput,
         };
     }
 
@@ -1846,9 +2660,12 @@ function createApp(options = {}) {
                     signal: null,
                     timedOut: false,
                     output: `\n${message}`,
+                    stdout: "",
+                    stderr: message,
                     commandSummary: actualSpawnSpec.summary,
                     durationMs: Date.now() - startedAt,
                     firstOutputAt: null,
+                    firstOutputLatencyMs: null,
                     lastOutputAt: nowISO(),
                     outputChunks: 1,
                     stderrBytes: 0,
@@ -1891,10 +2708,13 @@ function createApp(options = {}) {
             );
 
             let output = "";
+            let stdout = "";
+            let stderr = "";
             let stdoutBytes = 0;
             let stderrBytes = 0;
             let outputChunks = 0;
             let firstOutputAt = null;
+            let firstOutputLatencyMs = null;
             let lastOutputAt = null;
             let settled = false;
             const settle = (result) => {
@@ -1931,9 +2751,12 @@ function createApp(options = {}) {
                 resolve({
                     ...result,
                     output,
+                    stdout,
+                    stderr,
                     commandSummary: actualSpawnSpec.summary,
                     durationMs,
                     firstOutputAt,
+                    firstOutputLatencyMs,
                     lastOutputAt,
                     outputChunks,
                     stderrBytes,
@@ -1955,11 +2778,13 @@ function createApp(options = {}) {
             child.stdout.on("data", (chunk) => {
                 const text = chunk.toString();
                 output += text;
+                stdout += text;
                 stdoutBytes += chunk.length;
                 outputChunks += 1;
                 lastOutputAt = nowISO();
                 if (!firstOutputAt) {
                     firstOutputAt = lastOutputAt;
+                    firstOutputLatencyMs = Date.now() - startedAt;
                     emitLifecycle("first_output", `Agent 首次输出：stdout ${chunk.length} bytes`, {
                         stream: "stdout",
                         bytes: chunk.length,
@@ -1975,11 +2800,13 @@ function createApp(options = {}) {
             child.stderr.on("data", (chunk) => {
                 const text = chunk.toString();
                 output += text;
+                stderr += text;
                 stderrBytes += chunk.length;
                 outputChunks += 1;
                 lastOutputAt = nowISO();
                 if (!firstOutputAt) {
                     firstOutputAt = lastOutputAt;
+                    firstOutputLatencyMs = Date.now() - startedAt;
                     emitLifecycle("first_output", `Agent 首次输出：stderr ${chunk.length} bytes`, {
                         stream: "stderr",
                         bytes: chunk.length,
@@ -2024,7 +2851,7 @@ function createApp(options = {}) {
         return now.getTime() - lastTime >= intervalMs;
     }
 
-    async function pingProfile(profile) {
+    async function pingProfile(profile, { source = "scheduled", taskId = null } = {}) {
         const timestamp = new Date();
         const { date, minute } = localMinuteParts(timestamp);
         const task = {
@@ -2049,12 +2876,38 @@ function createApp(options = {}) {
         });
         try {
             const prompt = selectPingPrompt();
+            const spawnSpec = buildPingSpawn(profile, prompt, task);
+            const pingStartedAt = Date.now();
+            const stdoutChunks = [];
             const result = await runProfileCommand({
                 profile,
                 task,
                 prompt,
+                spawnSpec,
+                onOutput(text, stream) {
+                    if (stream === "stdout") {
+                        stdoutChunks.push({
+                            text,
+                            elapsedMs: Date.now() - pingStartedAt,
+                        });
+                    }
+                },
             });
             const output = String(result.output || "");
+            const outputDetails = extractPingOutputDetails(result.stdout || output);
+            const responseText = String(outputDetails.outputText || "").trim();
+            const success = result.exitCode === 0 && outputDetails.isError !== true && responseText.length > 0;
+            const outputReason = output.trim().slice(-1000);
+            const structuredFailureReason = String(outputDetails.errorText || (!success ? responseText : "")).trim().slice(-1000);
+            const failureReason = success
+                ? ""
+                : result.timedOut
+                    ? `超时：超过 ${profile.timeoutSeconds || 1800} 秒`
+                    : structuredFailureReason || outputReason || (result.signal ? `进程被信号 ${result.signal} 终止` : `进程退出码 ${result.exitCode ?? "-"}`);
+            const firstOutputLatencyMs = firstPingResponseLatency(stdoutChunks, spawnSpec.structuredOutput)
+                ?? result.firstOutputLatencyMs
+                ?? null;
+            const outputTruncated = responseText.length > PING_DETAIL_MAX_CHARS;
             return {
                 id: makeId("ping_record"),
                 createdAt: timestamp.toISOString(),
@@ -2068,21 +2921,48 @@ function createApp(options = {}) {
                 model: profile.modelName || `${profile.name} (${profile.agentType})`,
                 baseUrl: profile.baseUrl || "",
                 pingIntervalMinutes: Math.max(1, Number(profile.pingIntervalMinutes || 60)),
-                success: result.exitCode === 0 && output.trim().length > 0,
+                success,
                 exitCode: result.exitCode,
                 signal: result.signal || null,
                 durationMs: result.durationMs,
+                firstOutputLatencyMs,
+                firstOutputAt: result.firstOutputAt || null,
+                lastOutputAt: result.lastOutputAt || null,
+                inputTokens: outputDetails.inputTokens,
+                outputTokens: outputDetails.outputTokens,
+                totalTokens: outputDetails.totalTokens,
+                inputText: prompt,
+                outputText: responseText.slice(0, PING_DETAIL_MAX_CHARS),
+                outputTruncated,
+                failureReason,
                 outputTail: output.slice(-1000),
                 command: result.commandSummary,
+                source,
+                taskId,
             };
         } finally {
             runners.delete(task.id);
         }
     }
 
+    async function pingProfilesInOrder(profiles, { source, taskId, cancelled = () => false } = {}) {
+        const records = [];
+        let availableRecord = null;
+        for (const profile of profiles) {
+            if (cancelled()) break;
+            const record = await pingProfile(profile, { source, taskId });
+            records.push(record);
+            if (record.success) {
+                availableRecord = record;
+                break;
+            }
+        }
+        return { records, availableRecord };
+    }
+
     async function runPingRound(runOptions = {}) {
         if (pingInProgress) {
-            const error = new Error("Ping 姝ｅ湪杩愯");
+            const error = new Error("Ping 正在运行");
             error.statusCode = 409;
             throw error;
         }
@@ -2108,9 +2988,35 @@ function createApp(options = {}) {
             if (records.length === 0) return records;
             state = loadState();
             state.pingRecords = [...records, ...(state.pingRecords || [])].slice(0, 5000);
-            addEvent(state, "ping", null, `Ping Profiles锛?{records.filter((record) => record.success).length}/${records.length} 鎴愬姛`);
+            addEvent(state, "ping", null, `Ping Profiles：${records.filter((record) => record.success).length}/${records.length} 成功`);
             saveState(state);
             return records;
+        } finally {
+            pingInProgress = false;
+        }
+    }
+
+    async function runSingleProfilePing(profile) {
+        if (pingInProgress) {
+            const error = new Error("Ping 正在运行");
+            error.statusCode = 409;
+            throw error;
+        }
+        pingInProgress = true;
+        try {
+            // A direct profile test is explicit user intent, so it remains
+            // available even when scheduled/global Ping is disabled.
+            const record = await pingProfile(profile, { source: "manual" });
+            const state = loadState();
+            state.pingRecords = [record, ...(state.pingRecords || [])].slice(0, 5000);
+            addEvent(
+                state,
+                "ping",
+                profile.id,
+                `Ping Profile：${profile.name} ${record.success ? "成功" : "失败"}`,
+            );
+            saveState(state);
+            return record;
         } finally {
             pingInProgress = false;
         }
@@ -2122,7 +3028,7 @@ function createApp(options = {}) {
         pingTimer = setInterval(() => {
             runPingRound({ dueOnly: true }).catch((error) => {
                 const state = loadState();
-                addEvent(state, "ping", null, `Ping 澶辫触锛?{error.message}`);
+                addEvent(state, "ping", null, `Ping 失败：${error.message}`);
                 saveState(state);
             });
         }, intervalMs);
@@ -2339,6 +3245,585 @@ function createApp(options = {}) {
         runner.timer.unref();
     }
 
+    function availabilityCheckIntervalMs() {
+        const configured = Number(options.availabilityCheckIntervalMs);
+        return Number.isFinite(configured) && configured > 0
+            ? Math.max(1, configured)
+            : AVAILABILITY_CHECK_INTERVAL_MS;
+    }
+
+    function profileSelectionRetryMs() {
+        const configured = Number(options.profileSelectionRetryMs);
+        return Number.isFinite(configured) && configured > 0 ? Math.max(1, configured) : 60 * 1000;
+    }
+
+    async function selectAvailableProfileForRun(taskId) {
+        const runner = runners.get(taskId);
+        if (!runner || runner.stopped || runner.profileSelecting) return null;
+        runner.profileSelecting = true;
+
+        try {
+            let state = loadState();
+            let task = findTask(state, taskId);
+            if (!task || [STATUS.allDone, STATUS.failed, STATUS.stopped].includes(task.status)) return null;
+
+            const profiles = orderedUsableProfiles(state, task);
+            if (profiles.length <= 1) {
+                runner.profileSelectionRequired = false;
+                return { state, task };
+            }
+
+            const runId = runner.runId || task.lastRunId || makeId("run");
+            runner.runId = runId;
+            appendTaskLogEvent(task, "availability_check", "按配置顺序检测执行 Profile 是否可用", {
+                runId,
+                runStatus: task.status,
+                metadata: {
+                    source: "task_selection",
+                    profileIds: profiles.map((profile) => profile.id),
+                },
+            });
+            saveState(state);
+
+            const { records, availableRecord } = await pingProfilesInOrder(profiles, {
+                source: "task_selection",
+                taskId,
+                cancelled: () => {
+                    const activeRunner = runners.get(taskId);
+                    return !activeRunner || activeRunner !== runner || activeRunner.stopped;
+                },
+            });
+
+            state = loadState();
+            task = findTask(state, taskId);
+            if (records.length > 0) {
+                state.pingRecords = [...records].reverse().concat(state.pingRecords || []).slice(0, 5000);
+            }
+            const activeRunner = runners.get(taskId);
+            if (!task || !activeRunner || activeRunner !== runner || activeRunner.stopped
+                || [STATUS.allDone, STATUS.failed, STATUS.stopped].includes(task.status)) {
+                if (records.length > 0) saveState(state);
+                return null;
+            }
+
+            task.availabilityLastCheckedAt = nowISO();
+            task.updatedAt = nowISO();
+            const availableProfile = availableRecord
+                ? findProfile(state, availableRecord.profileId)
+                : null;
+            if (availableProfile && profileSupportsOutput(availableProfile, task.taskType)) {
+                task.runProfileId = availableProfile.id;
+                activeRunner.profileSelectionRequired = false;
+                addEvent(state, "profile_selected", task.id, `按顺序选择可用 Profile：${availableProfile.name}`);
+                appendTaskLogEvent(task, "profile_available", `已选择首个可用 Profile：${availableProfile.name}`, {
+                    runId,
+                    profile: availableProfile,
+                    runStatus: STATUS.running,
+                    metadata: {
+                        source: "task_selection",
+                        profileId: availableProfile.id,
+                        pingRecordId: availableRecord.id,
+                        durationMs: availableRecord.durationMs,
+                        attemptedProfileIds: records.map((record) => record.profileId),
+                    },
+                });
+                saveState(state);
+                return { state, task };
+            }
+
+            const delayMs = profileSelectionRetryMs();
+            const nextRunAt = new Date(Date.now() + delayMs).toISOString();
+            const failureSummary = records.length > 0
+                ? records.map((record) => `${record.profileName}: ${record.failureReason || "不可用"}`).join("；")
+                : "没有可检测的执行 Profile";
+            task.status = STATUS.retryWait;
+            task.retryCount = (task.retryCount || 0) + 1;
+            task.nextRunAt = nextRunAt;
+            activeRunner.nextRunAt = nextRunAt;
+            activeRunner.idleSince = nowISO();
+            addEvent(state, "retry", task.id, `执行 Profile 均不可用，稍后按顺序重试：${task.title}`);
+            appendTaskLogEvent(task, "availability_wait", `执行 Profile 均不可用：${failureSummary}`, {
+                runId,
+                runStatus: STATUS.retryWait,
+                metadata: {
+                    source: "task_selection",
+                    reason: "profiles_unavailable",
+                    delayMs,
+                    nextCheckAt: nextRunAt,
+                    pingRecordIds: records.map((record) => record.id),
+                },
+            });
+            updateTaskRunLog(task, runId, { status: STATUS.retryWait, endedAt: null });
+            saveState(state);
+            scheduleNext(taskId, delayMs);
+            return null;
+        } finally {
+            const activeRunner = runners.get(taskId);
+            if (activeRunner === runner) activeRunner.profileSelecting = false;
+        }
+    }
+
+    function scheduleAvailabilityCheck(taskId, checkAt = new Date()) {
+        const runner = runners.get(taskId);
+        if (!runner || runner.stopped) return;
+        if (runner.timer) clearTimeout(runner.timer);
+        const scheduledAt = checkAt instanceof Date ? checkAt : new Date(checkAt);
+        const validCheckAt = Number.isNaN(scheduledAt.getTime()) ? new Date() : scheduledAt;
+        const delayMs = Math.max(0, validCheckAt.getTime() - Date.now());
+        runner.scheduleMode = SCHEDULE_MODE.profileAvailable;
+        runner.idleSince = nowISO();
+        runner.nextRunAt = validCheckAt.toISOString();
+        runner.timer = setTimeout(() => {
+            runner.timer = null;
+            checkTaskProfileAvailability(taskId).catch((error) => {
+                const activeRunner = runners.get(taskId);
+                if (!activeRunner || activeRunner.stopped) return;
+                const state = loadState();
+                const task = findTask(state, taskId);
+                if (!task || task.status !== STATUS.scheduled
+                    || task.scheduleMode !== SCHEDULE_MODE.profileAvailable) return;
+                const nextCheckAt = new Date(Date.now() + availabilityCheckIntervalMs()).toISOString();
+                task.nextRunAt = nextCheckAt;
+                task.availabilityNextCheckAt = nextCheckAt;
+                task.updatedAt = nowISO();
+                addEvent(state, "availability_wait", task.id, `模型可用性检测失败，30 分钟后重试：${error.message}`);
+                appendTaskLogEvent(task, "availability_wait", `模型可用性检测失败：${error.message}`, {
+                    runId: activeRunner.runId,
+                    runStatus: STATUS.scheduled,
+                    metadata: {
+                        reason: "check_error",
+                        error: error.message,
+                        delayMs: availabilityCheckIntervalMs(),
+                        nextCheckAt,
+                    },
+                });
+                updateTaskRunLog(task, activeRunner.runId, { status: STATUS.scheduled, endedAt: null });
+                saveState(state);
+                scheduleAvailabilityCheck(taskId, new Date(nextCheckAt));
+            });
+        }, delayMs);
+        runner.timer.unref();
+    }
+
+    async function checkTaskProfileAvailability(taskId) {
+        const runner = runners.get(taskId);
+        if (!runner || runner.stopped || runner.availabilityChecking) return;
+        runner.availabilityChecking = true;
+        runner.nextRunAt = null;
+        runner.idleSince = nowISO();
+
+        try {
+            let state = loadState();
+            let task = findTask(state, taskId);
+            if (!task || task.status !== STATUS.scheduled
+                || task.scheduleMode !== SCHEDULE_MODE.profileAvailable) {
+                if (task) releaseTaskRunner(task);
+                else runners.delete(taskId);
+                return;
+            }
+
+            const runId = runner.runId || task.lastRunId || makeId("run");
+            runner.runId = runId;
+            const checkedAt = nowISO();
+            const currentCheckAt = task.availabilityNextCheckAt || task.nextRunAt || checkedAt;
+            task.availabilityLastCheckedAt = checkedAt;
+            task.availabilityNextCheckAt = currentCheckAt;
+            task.nextRunAt = currentCheckAt;
+            task.updatedAt = checkedAt;
+            addEvent(state, "availability_check", task.id, `检测任务 Profile 是否可用：${task.title}`);
+            appendTaskLogEvent(task, "availability_check", "开始检测执行 Profile 是否可用", {
+                runId,
+                runStatus: STATUS.scheduled,
+                metadata: {
+                    runProfileIds: task.runProfileIds,
+                    intervalMinutes: AVAILABILITY_CHECK_INTERVAL_MINUTES,
+                },
+            });
+            saveState(state);
+
+            const profiles = orderedUsableProfiles(state, task);
+            const { records, availableRecord } = await pingProfilesInOrder(profiles, {
+                source: "task_availability",
+                taskId,
+                cancelled: () => {
+                    const activeRunner = runners.get(taskId);
+                    return !activeRunner || activeRunner !== runner || activeRunner.stopped;
+                },
+            });
+
+            state = loadState();
+            task = findTask(state, taskId);
+            if (records.length > 0) {
+                state.pingRecords = [...records].reverse().concat(state.pingRecords || []).slice(0, 5000);
+            }
+            const activeRunner = runners.get(taskId);
+            if (!task || !activeRunner || activeRunner !== runner || activeRunner.stopped
+                || task.status !== STATUS.scheduled
+                || task.scheduleMode !== SCHEDULE_MODE.profileAvailable) {
+                if (records.length > 0) saveState(state);
+                return;
+            }
+
+            task.availabilityLastCheckedAt = nowISO();
+            task.updatedAt = nowISO();
+            if (availableRecord) {
+                const profile = state.profiles.find((item) => item.id === availableRecord.profileId) || null;
+                task.runProfileId = availableRecord.profileId;
+                task.status = STATUS.running;
+                task.nextRunAt = null;
+                task.availabilityNextCheckAt = null;
+                activeRunner.nextRunAt = null;
+                activeRunner.idleSince = null;
+                activeRunner.profileSelectionRequired = false;
+                addEvent(state, "started", task.id, `Profile 可用，启动任务：${task.title}`);
+                appendTaskLogEvent(task, "profile_available", `Profile 可用，开始执行：${availableRecord.profileName}`, {
+                    runId,
+                    profile,
+                    runStatus: STATUS.running,
+                    metadata: {
+                        profileId: availableRecord.profileId,
+                        pingRecordId: availableRecord.id,
+                        durationMs: availableRecord.durationMs,
+                    },
+                });
+                updateTaskRunLog(task, runId, { status: STATUS.running, endedAt: null });
+                saveState(state);
+                setImmediate(() => runTaskLoop(taskId));
+                return;
+            }
+
+            const nextCheckAt = new Date(Date.now() + availabilityCheckIntervalMs()).toISOString();
+            const failureSummary = records.length > 0
+                ? records.map((record) => `${record.profileName}: ${record.failureReason || "不可用"}`).join("；")
+                : "没有可探测的执行 Profile";
+            task.status = STATUS.scheduled;
+            task.nextRunAt = nextCheckAt;
+            task.availabilityNextCheckAt = nextCheckAt;
+            activeRunner.nextRunAt = nextCheckAt;
+            activeRunner.idleSince = nowISO();
+            addEvent(state, "availability_wait", task.id, `Profile 暂不可用，30 分钟后重试：${task.title}`);
+            appendTaskLogEvent(task, "availability_wait", `Profile 暂不可用：${failureSummary}`, {
+                runId,
+                runStatus: STATUS.scheduled,
+                metadata: {
+                    reason: "profile_unavailable",
+                    delayMs: availabilityCheckIntervalMs(),
+                    intervalMinutes: AVAILABILITY_CHECK_INTERVAL_MINUTES,
+                    nextCheckAt,
+                    pingRecordIds: records.map((record) => record.id),
+                },
+            });
+            updateTaskRunLog(task, runId, { status: STATUS.scheduled, endedAt: null });
+            saveState(state);
+            scheduleAvailabilityCheck(taskId, new Date(nextCheckAt));
+        } finally {
+            runner.availabilityChecking = false;
+        }
+    }
+
+    function restoreScheduledTasks() {
+        const state = loadState();
+        let changed = false;
+        for (const task of state.tasks) {
+            if (task.status !== STATUS.scheduled || runners.has(task.id)) continue;
+            const runId = task.lastRunId || makeId("run");
+            const existingRun = (task.logRuns || []).find((run) => run.runId === runId);
+            const startedAt = existingRun?.startedAt || task.updatedAt || nowISO();
+            const scheduleMode = normalizeScheduleMode(task.scheduleMode, {
+                hasStartAt: Boolean(task.scheduledStartAt || task.nextRunAt),
+                scheduled: true,
+            });
+            const nextRunAt = scheduleMode === SCHEDULE_MODE.profileAvailable
+                ? task.availabilityNextCheckAt || task.nextRunAt || nowISO()
+                : task.scheduledStartAt || task.nextRunAt || nowISO();
+            task.lastRunId = runId;
+            task.scheduleMode = scheduleMode;
+            task.nextRunAt = normalizedDateString(nextRunAt) || nowISO();
+            if (scheduleMode === SCHEDULE_MODE.fixedTime) task.scheduledStartAt = task.nextRunAt;
+            if (scheduleMode === SCHEDULE_MODE.profileAvailable) {
+                task.availabilityCheckIntervalMinutes = AVAILABILITY_CHECK_INTERVAL_MINUTES;
+                task.availabilityNextCheckAt = task.nextRunAt;
+            }
+            ensureTaskRunLog(task, runId, {
+                startedAt,
+                scheduledAt: task.scheduledStartAt || startedAt,
+                status: STATUS.scheduled,
+            });
+            runners.set(task.id, {
+                stopped: false,
+                child: null,
+                timer: null,
+                startedAt,
+                idleSince: nowISO(),
+                nextRunAt: task.nextRunAt,
+                activeProcess: null,
+                currentRunStartedAt: null,
+                lastAgentExitAt: null,
+                lastAgentExitCode: null,
+                lastAgentSignal: null,
+                runId,
+                scheduleMode,
+                availabilityChecking: false,
+                profileSelectionRequired: selectUsableProfileIds(state, task.runProfileIds, task.taskType).length > 1,
+                profileSelecting: false,
+            });
+            if (scheduleMode === SCHEDULE_MODE.profileAvailable) {
+                scheduleAvailabilityCheck(task.id, new Date(task.nextRunAt));
+            } else {
+                scheduleInitialRun(task.id, new Date(task.nextRunAt));
+            }
+            changed = true;
+        }
+        if (changed) saveState(state);
+    }
+
+    function beginTaskRun(state, task, options = {}) {
+        const usableIds = normalizeProfileIdList(options.usableIds);
+        let scheduleMode = normalizeScheduleMode(options.scheduleMode, {
+            hasStartAt: Boolean(options.startAt),
+        });
+        let startAt = options.startAt instanceof Date
+            ? options.startAt
+            : options.startAt ? new Date(options.startAt) : null;
+        if (scheduleMode === SCHEDULE_MODE.fixedTime
+            && (!startAt || Number.isNaN(startAt.getTime()) || startAt.getTime() <= Date.now())) {
+            scheduleMode = SCHEDULE_MODE.immediate;
+            startAt = null;
+        }
+        const shouldSchedule = scheduleMode !== SCHEDULE_MODE.immediate;
+        const scheduledStartAt = scheduleMode === SCHEDULE_MODE.fixedTime ? startAt.toISOString() : null;
+        const startedAt = nowISO();
+        const availabilityNextCheckAt = scheduleMode === SCHEDULE_MODE.profileAvailable ? startedAt : null;
+        const nextRunAt = scheduledStartAt || availabilityNextCheckAt;
+        const runId = makeId("run");
+        task.runProfileIds = usableIds;
+        task.runProfileId = usableIds[0];
+        task.lastRunId = runId;
+        task.status = shouldSchedule ? STATUS.scheduled : STATUS.running;
+        task.retryCount = task.retryCount || 0;
+        task.nextRunAt = nextRunAt;
+        task.scheduleMode = scheduleMode;
+        task.scheduledStartAt = scheduledStartAt;
+        task.availabilityCheckIntervalMinutes = scheduleMode === SCHEDULE_MODE.profileAvailable
+            ? AVAILABILITY_CHECK_INTERVAL_MINUTES
+            : null;
+        task.availabilityLastCheckedAt = null;
+        task.availabilityNextCheckAt = availabilityNextCheckAt;
+        task.queuedAt = null;
+        task.queueRunId = null;
+        task.queuedDirectory = null;
+        task.queuedStart = null;
+        task.updatedAt = startedAt;
+        ensureTaskRunLog(task, runId, {
+            startedAt,
+            scheduledAt: shouldSchedule ? scheduledStartAt || startedAt : null,
+            status: task.status,
+        });
+        const scheduleMessage = scheduleMode === SCHEDULE_MODE.profileAvailable
+            ? `预约 Profile 可用时启动任务：${task.title}`
+            : `预约定时启动任务：${task.title}`;
+        const startMessage = options.fromQueue
+            ? `从目录队列启动任务：${task.title}`
+            : `启动任务：${task.title}`;
+        addEvent(
+            state,
+            shouldSchedule ? "scheduled" : "started",
+            task.id,
+            shouldSchedule ? scheduleMessage : startMessage,
+        );
+        saveState(state);
+        runners.set(task.id, {
+            stopped: false,
+            child: null,
+            timer: null,
+            startedAt,
+            idleSince: startedAt,
+            nextRunAt,
+            activeProcess: null,
+            currentRunStartedAt: null,
+            lastAgentExitAt: null,
+            lastAgentExitCode: null,
+            lastAgentSignal: null,
+            runId,
+            scheduleMode,
+            availabilityChecking: false,
+            profileSelectionRequired: usableIds.length > 1,
+            profileSelecting: false,
+        });
+        const initialProfile = findProfile(state, usableIds[0]);
+        appendTaskLogEvent(
+            task,
+            shouldSchedule ? "task_scheduled" : "task_started",
+            shouldSchedule ? scheduleMessage : startMessage,
+            {
+                runId,
+                profile: initialProfile,
+                startedAt,
+                scheduledAt: shouldSchedule ? scheduledStartAt || startedAt : null,
+                runStatus: task.status,
+                metadata: {
+                    fromQueue: options.fromQueue === true,
+                    queueDirectory: options.fromQueue === true ? queueDirectoryForTask(task) : null,
+                    scheduleMode,
+                    scheduledStartAt,
+                    availabilityNextCheckAt,
+                    availabilityCheckIntervalMinutes: task.availabilityCheckIntervalMinutes,
+                    runProfileIds: usableIds,
+                },
+            },
+        );
+        saveState(state);
+        if (scheduleMode === SCHEDULE_MODE.fixedTime) {
+            scheduleInitialRun(task.id, startAt);
+        } else if (scheduleMode === SCHEDULE_MODE.profileAvailable) {
+            scheduleAvailabilityCheck(task.id, new Date(availabilityNextCheckAt));
+        } else {
+            setImmediate(() => runTaskLoop(task.id));
+        }
+        return {
+            ok: true,
+            queued: false,
+            runId,
+            runProfileIds: usableIds,
+            scheduleMode,
+            scheduledStartAt,
+            availabilityNextCheckAt,
+        };
+    }
+
+    function enqueueTaskRun(state, task, options = {}) {
+        const queuedAt = nowISO();
+        const scheduleMode = normalizeScheduleMode(options.scheduleMode, {
+            hasStartAt: Boolean(options.startAt),
+        });
+        const startAt = scheduleMode === SCHEDULE_MODE.fixedTime
+            ? normalizedDateString(options.startAt)
+            : null;
+        task.runProfileIds = normalizeProfileIdList(options.usableIds);
+        task.runProfileId = task.runProfileIds[0] || task.runProfileId;
+        task.status = STATUS.queued;
+        task.queuedAt = queuedAt;
+        task.queueRunId = makeId("queue");
+        task.queuedStart = {
+            profileIds: task.runProfileIds,
+            scheduleMode,
+            startAt,
+        };
+        task.queuedDirectory = queueDirectoryForTask(task);
+        task.nextRunAt = null;
+        task.scheduleMode = scheduleMode;
+        task.scheduledStartAt = startAt;
+        task.availabilityNextCheckAt = null;
+        task.updatedAt = queuedAt;
+        const activeTask = directoryActiveTask(state, task.directory, task.id);
+        addEvent(state, "queued", task.id, `任务进入目录队列：${task.title}`);
+        appendTaskLogEvent(task, "task_queued", `任务进入目录队列，等待 ${activeTask?.title || "前序任务"}`, {
+            phase: "setup",
+            runStatus: STATUS.queued,
+            metadata: {
+                projectId: task.projectId,
+                directory: task.queuedDirectory,
+                activeTaskId: activeTask?.id || null,
+                scheduleMode,
+                scheduledStartAt: startAt,
+                runProfileIds: task.runProfileIds,
+            },
+        });
+        saveState(state);
+        const queuePosition = queuedTasksForDirectory(state, task.directory)
+            .findIndex((item) => item.id === task.id) + 1;
+        return {
+            ok: true,
+            queued: true,
+            runId: task.queueRunId,
+            status: STATUS.queued,
+            queuePosition,
+            projectId: task.projectId,
+            queueDirectory: task.queuedDirectory,
+            activeTaskId: activeTask?.id || null,
+            runProfileIds: task.runProfileIds,
+            scheduleMode,
+            scheduledStartAt: startAt,
+            availabilityNextCheckAt: null,
+        };
+    }
+
+    function startNextQueuedTask(directory) {
+        const state = loadState();
+        const queueDirectory = path.resolve(directory || rootDir);
+        if (directoryActiveTask(state, queueDirectory)) return null;
+        const task = queuedTasksForDirectory(state, queueDirectory)[0];
+        if (!task) return null;
+        const queuedStart = task.queuedStart || {};
+        const usableIds = selectUsableProfileIds(state, queuedStart.profileIds || task.runProfileIds, task.taskType);
+        if (usableIds.length === 0) {
+            task.status = STATUS.failed;
+            task.queuedAt = null;
+            task.queueRunId = null;
+            task.queuedDirectory = null;
+            task.queuedStart = null;
+            task.lastOutput = "排队任务没有可用的执行 Profile";
+            task.updatedAt = nowISO();
+            addEvent(state, "failed", task.id, task.lastOutput);
+            appendTaskLogEvent(task, "task_failed", task.lastOutput, {
+                runStatus: STATUS.failed,
+                metadata: {
+                    reason: "queued_profiles_unavailable",
+                    directory: queueDirectory,
+                },
+            });
+            saveState(state);
+            // Skip unusable queued entries in the same directory without
+            // leaving later tasks blocked behind a permanently failed item.
+            return startNextQueuedTask(queueDirectory);
+        }
+        return beginTaskRun(state, task, {
+            usableIds,
+            scheduleMode: queuedStart.scheduleMode,
+            startAt: queuedStart.startAt,
+            fromQueue: true,
+        });
+    }
+
+    const queueAdvancing = new Set();
+
+    function advanceDirectoryQueue(directory) {
+        const queueDirectory = path.resolve(directory || rootDir);
+        if (runnersClosing || queueAdvancing.has(queueDirectory)) return;
+        queueAdvancing.add(queueDirectory);
+        setImmediate(() => {
+            try {
+                if (!runnersClosing) startNextQueuedTask(queueDirectory);
+            } catch (error) {
+                const state = loadState();
+                addEvent(state, "queue_error", null, `目录队列启动失败：${error.message}`);
+                saveState(state);
+            } finally {
+                queueAdvancing.delete(queueDirectory);
+            }
+        });
+    }
+
+    function releaseTaskRunner(task, { advanceQueue = true } = {}) {
+        if (!task) return;
+        runners.delete(task.id);
+        if (advanceQueue) advanceDirectoryQueue(queueDirectoryForTask(task));
+    }
+
+    function restoreQueuedTasks() {
+        const state = loadState();
+        const queueDirectories = new Set(
+            state.tasks
+                .filter((task) => task.status === STATUS.queued && !task.archived)
+                .map((task) => queueDirectoryForTask(task)),
+        );
+        for (const directory of queueDirectories) {
+            if (!directoryActiveTask(state, directory) && queuedTasksForDirectory(state, directory).length > 0) {
+                advanceDirectoryQueue(directory);
+            }
+        }
+    }
+
     async function runTaskLoop(taskId) {
         const runner = runners.get(taskId);
         if (!runner || runner.stopped) return;
@@ -2355,6 +3840,12 @@ function createApp(options = {}) {
         }
         const runId = runner.runId || makeId("run");
         runner.runId = runId;
+        if (runner.profileSelectionRequired === true) {
+            const selected = await selectAvailableProfileForRun(taskId);
+            if (!selected) return;
+            state = selected.state;
+            task = selected.task;
+        }
         updateTaskRunLog(task, runId, { status: STATUS.running });
         const profile = resolveRunProfile(state, task);
         if (!profile) {
@@ -2369,7 +3860,7 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.failed, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
 
@@ -2401,7 +3892,7 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.failed, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
         task.lastPrompt = prompt;
@@ -2491,7 +3982,7 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.stopped, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
 
@@ -2499,6 +3990,7 @@ function createApp(options = {}) {
             task.status = STATUS.retryWait;
             task.retryCount = (task.retryCount || 0) + 1;
             const switched = rotateProfile(state, task);
+            if (switched) runner.profileSelectionRequired = true;
             task.nextRunAt = new Date(Date.now() + 300000).toISOString();
             const note = switched ? `检测到 429，切换 Profile：${switched.profileName}，5 分钟后重试` : "检测到 429，5 分钟后重试";
             addEvent(state, "retry", taskId, note);
@@ -2540,7 +4032,7 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.allDone, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
 
@@ -2556,7 +4048,7 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.allDone, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
 
@@ -2605,13 +4097,14 @@ function createApp(options = {}) {
             });
             updateTaskRunLog(task, runId, { status: STATUS.stopped, endedAt: nowISO() });
             saveState(state);
-            runners.delete(taskId);
+            releaseTaskRunner(task);
             return;
         }
 
         task.status = STATUS.retryWait;
         task.retryCount = (task.retryCount || 0) + 1;
         const switched = rotateProfile(state, task);
+        if (switched) runner.profileSelectionRequired = true;
         task.nextRunAt = new Date(Date.now() + 60000).toISOString();
         const missingArtifact = normalizeTaskType(task.taskType) !== "text" && generatedArtifacts.length === 0;
         const retryReason = missingArtifact ? "未检测到新媒体产物" : "其他输出";
@@ -2747,6 +4240,23 @@ function createApp(options = {}) {
             return;
         }
 
+        const profilePingMatch = pathname.match(/^\/api\/profiles\/([^/]+)\/ping$/);
+        if (method === "POST" && profilePingMatch) {
+            const state = loadState();
+            const id = decodePathSegment(profilePingMatch[1], "Profile ID");
+            const profile = state.profiles.find((item) => item.id === id);
+            if (!profile) {
+                sendJson(response, 404, { error: "Profile 不存在" });
+                return;
+            }
+            const record = await runSingleProfilePing(profile);
+            sendJson(response, 200, {
+                ok: true,
+                record,
+            });
+            return;
+        }
+
         if (method === "POST" && pathname === "/api/profiles") {
             const body = await readJson(request);
             const state = loadState();
@@ -2809,6 +4319,79 @@ function createApp(options = {}) {
             return;
         }
 
+        if (method === "POST" && pathname === "/api/projects") {
+            const body = await readJson(request);
+            const state = loadState();
+            const existing = body.id ? findProject(state, String(body.id)) : null;
+            if (body.id && !existing) {
+                sendJson(response, 404, { error: "项目不存在" });
+                return;
+            }
+            const name = String(body.name || existing?.name || "").trim();
+            if (!name) {
+                sendJson(response, 400, { error: "项目名称不能为空" });
+                return;
+            }
+            const rawDirectory = String(body.directory ?? existing?.directory ?? "").trim();
+            let directory = "";
+            if (rawDirectory) {
+                try {
+                    directory = resolveDirectory(state, rawDirectory);
+                } catch (error) {
+                    sendJson(response, error.statusCode || 400, { error: error.message });
+                    return;
+                }
+            }
+            if (existing && existing.directory !== directory
+                && state.tasks.some((task) => task.projectId === existing.id)) {
+                sendJson(response, 409, { error: "项目已有任务，不能更换绑定目录" });
+                return;
+            }
+            const duplicate = state.projects.find((project) => project.id !== existing?.id && project.name === name);
+            if (duplicate) {
+                sendJson(response, 409, { error: "项目名称已存在" });
+                return;
+            }
+            const project = normalizeProject({
+                ...existing,
+                id: existing?.id || makeId("project"),
+                name,
+                directory,
+                createdAt: existing?.createdAt || nowISO(),
+                updatedAt: nowISO(),
+            }, state.projects.length);
+            if (existing) Object.assign(existing, project);
+            else state.projects.push(project);
+            addEvent(state, "project", null, `${existing ? "更新" : "创建"}项目：${project.name}`);
+            saveState(state);
+            sendJson(response, 200, { ok: true, project });
+            return;
+        }
+
+        const deleteProjectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
+        if (method === "DELETE" && deleteProjectMatch) {
+            const state = loadState();
+            const id = decodePathSegment(deleteProjectMatch[1], "项目 ID");
+            const project = findProject(state, id);
+            if (!project) {
+                sendJson(response, 404, { error: "项目不存在" });
+                return;
+            }
+            if (state.tasks.some((task) => task.projectId === id)) {
+                sendJson(response, 409, { error: "项目仍包含任务，不能删除" });
+                return;
+            }
+            if (state.projects.length <= 1) {
+                sendJson(response, 409, { error: "至少保留一个项目" });
+                return;
+            }
+            state.projects = state.projects.filter((item) => item.id !== id);
+            addEvent(state, "project", null, `删除项目：${project.name}`);
+            saveState(state);
+            sendJson(response, 200, { ok: true });
+            return;
+        }
+
         if (method === "POST" && pathname === "/api/directories") {
             const body = await readJson(request);
             const directory = path.resolve(String(body.directory || ""));
@@ -2832,6 +4415,16 @@ function createApp(options = {}) {
                 sendJson(response, 400, { error: "默认目录不能删除" });
                 return;
             }
+            const boundProject = state.projects.find((project) => project.directory === directory);
+            if (boundProject) {
+                sendJson(response, 409, { error: `目录已绑定项目：${boundProject.name}` });
+                return;
+            }
+            const directoryTask = state.tasks.find((task) => path.resolve(task.directory || rootDir) === directory);
+            if (directoryTask) {
+                sendJson(response, 409, { error: `目录仍包含任务：${directoryTask.title}` });
+                return;
+            }
             state.directories = state.directories.filter((item) => path.resolve(item) !== directory);
             addEvent(state, "directory", null, `删除工作目录：${directory}`);
             saveState(state);
@@ -2842,7 +4435,35 @@ function createApp(options = {}) {
         if (method === "POST" && pathname === "/api/tasks") {
             const body = await readJson(request);
             const state = loadState();
-            const directory = resolveDirectory(state, body.directory || rootDir);
+            const requestedDirectory = String(body.directory || rootDir);
+            const requestedProjectId = String(body.projectId || body.project || "").trim();
+            let project = requestedProjectId ? findProject(state, requestedProjectId) : null;
+            if (requestedProjectId && !project) {
+                sendJson(response, 400, { error: "请选择有效项目" });
+                return;
+            }
+            if (!project) {
+                const resolvedRequestedDirectory = resolveDirectory(state, requestedDirectory);
+                project = state.projects.find((item) => item.directory === resolvedRequestedDirectory);
+                if (!project) {
+                    const baseProjectName = path.basename(resolvedRequestedDirectory) || resolvedRequestedDirectory;
+                    const projectName = state.projects.some((item) => item.name === baseProjectName)
+                        ? `${baseProjectName} · ${resolvedRequestedDirectory}`
+                        : baseProjectName;
+                    project = normalizeProject({
+                        id: legacyProjectId(resolvedRequestedDirectory),
+                        name: projectName,
+                        directory: resolvedRequestedDirectory,
+                        createdAt: nowISO(),
+                        updatedAt: nowISO(),
+                    }, state.projects.length);
+                    state.projects.push(project);
+                    addEvent(state, "project", null, `为工作目录创建项目：${project.name}`);
+                }
+            }
+            const directory = project?.directory
+                ? resolveDirectory(state, project.directory)
+                : resolveDirectory(state, requestedDirectory);
             const title = String(body.title || "任务目标").trim();
             const requirement = String(body.requirement || "").trim();
             const taskType = normalizeTaskType(body.taskType);
@@ -2940,6 +4561,7 @@ function createApp(options = {}) {
                 resolution,
                 durationSeconds,
                 referenceFiles,
+                projectId: project.id,
                 decomposeProfileId: generationProfile?.id || body.decomposeProfileId || "",
                 runProfileId: runProfileIds[0] || "",
                 runProfileIds,
@@ -2950,6 +4572,11 @@ function createApp(options = {}) {
                 lastCommand: "",
                 lastPrompt: "",
                 nextRunAt: null,
+                scheduleMode: SCHEDULE_MODE.immediate,
+                scheduledStartAt: null,
+                availabilityCheckIntervalMinutes: null,
+                availabilityLastCheckedAt: null,
+                availabilityNextCheckAt: null,
                 logFile,
                 logEventsFile: taskLogEventsFileName({ id: taskId, logFile }),
                 logRuns: [],
@@ -3018,6 +4645,24 @@ function createApp(options = {}) {
             return;
         }
 
+        const taskArchiveMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/archive$/);
+        if (method === "POST" && taskArchiveMatch) {
+            const state = loadState();
+            const task = findTask(state, decodePathSegment(taskArchiveMatch[1], "任务 ID"));
+            if (!task) {
+                sendJson(response, 404, { error: "任务不存在" });
+                return;
+            }
+            const archivedTask = archiveTask(state, task);
+            sendJson(response, 200, {
+                ok: true,
+                task: archivedTask,
+                archiveDirectory: archivedTask.archiveDirectory,
+                filePath: archivedTask.filePath,
+            });
+            return;
+        }
+
         const taskArtifactMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
         if (method === "GET" && taskArtifactMatch) {
             const state = loadState();
@@ -3056,22 +4701,28 @@ function createApp(options = {}) {
                 return;
             }
             if (method === "GET") {
+                const verifiedFilePath = verifiedTaskFilePath(task);
                 sendJson(response, 200, {
-                    content: fs.existsSync(task.filePath) ? fs.readFileSync(task.filePath, "utf8") : "",
-                    filePath: task.filePath,
+                    content: fs.existsSync(verifiedFilePath) ? fs.readFileSync(verifiedFilePath, "utf8") : "",
+                    filePath: verifiedFilePath,
                 });
                 return;
             }
             if (method === "PUT") {
+                if (task.archived) {
+                    sendJson(response, 409, { error: "归档任务为只读，不能编辑" });
+                    return;
+                }
+                const verifiedFilePath = verifiedTaskFilePath(task);
                 const body = await readJson(request);
-                fs.writeFileSync(task.filePath, String(body.content || ""), "utf8");
+                fs.writeFileSync(verifiedFilePath, String(body.content || ""), "utf8");
                 task.updatedAt = nowISO();
-                task.fileMtime = safeStat(task.filePath)?.mtime?.toISOString() || null;
+                task.fileMtime = safeStat(verifiedFilePath)?.mtime?.toISOString() || null;
                 addEvent(state, "task", task.id, `保存任务文件：${task.targetFileName}`);
                 saveState(state);
-                appendTaskLogEvent(task, "task_file_saved", `保存任务文件：${task.filePath}`, {
+                appendTaskLogEvent(task, "task_file_saved", `保存任务文件：${verifiedFilePath}`, {
                     phase: "setup",
-                    metadata: { filePath: task.filePath },
+                    metadata: { filePath: verifiedFilePath },
                 });
                 sendJson(response, 200, { ok: true });
                 return;
@@ -3113,6 +4764,14 @@ function createApp(options = {}) {
                 sendJson(response, 404, { error: "任务不存在" });
                 return;
             }
+            if (task.archived) {
+                sendJson(response, 409, { error: "归档任务不能启动" });
+                return;
+            }
+            if (task.status === STATUS.queued) {
+                sendJson(response, 409, { error: "任务已经在目录队列中" });
+                return;
+            }
             if (runners.has(task.id)) {
                 sendJson(response, 409, { error: "任务已经在运行" });
                 return;
@@ -3128,72 +4787,29 @@ function createApp(options = {}) {
                 return;
             }
             const rawStartAt = String(body.startAt || "").trim();
+            const hasExplicitScheduleMode = String(body.scheduleMode || "").trim().length > 0;
+            let scheduleMode = normalizeScheduleMode(body.scheduleMode, { hasStartAt: Boolean(rawStartAt) });
             const startAt = rawStartAt ? new Date(rawStartAt) : null;
             if (rawStartAt && Number.isNaN(startAt.getTime())) {
                 sendJson(response, 400, { error: "预约启动时间无效" });
                 return;
             }
-            const shouldSchedule = startAt && startAt.getTime() > Date.now();
-            const scheduledStartAt = shouldSchedule ? startAt.toISOString() : null;
-            const startedAt = nowISO();
-            const runId = makeId("run");
-            task.runProfileIds = usableIds;
-            task.runProfileId = usableIds[0];
-            task.lastRunId = runId;
-            task.status = shouldSchedule ? STATUS.scheduled : STATUS.running;
-            task.retryCount = task.retryCount || 0;
-            task.nextRunAt = scheduledStartAt;
-            ensureTaskRunLog(task, runId, {
-                startedAt,
-                scheduledAt: scheduledStartAt,
-                status: task.status,
-            });
-            addEvent(
-                state,
-                shouldSchedule ? "scheduled" : "started",
-                task.id,
-                shouldSchedule ? `预约启动任务：${task.title}` : `启动任务：${task.title}`,
-            );
-            saveState(state);
-            runners.set(task.id, {
-                stopped: false,
-                child: null,
-                timer: null,
-                startedAt,
-                idleSince: startedAt,
-                nextRunAt: scheduledStartAt,
-                activeProcess: null,
-                currentRunStartedAt: null,
-                lastAgentExitAt: null,
-                lastAgentExitCode: null,
-                lastAgentSignal: null,
-                runId,
-            });
-            const initialProfile = findProfile(state, usableIds[0]);
-            appendTaskLogEvent(
-                task,
-                shouldSchedule ? "task_scheduled" : "task_started",
-                shouldSchedule ? `预约启动任务：${task.title}` : `启动任务：${task.title}`,
-                {
-                    runId,
-                    profile: initialProfile,
-                    startedAt,
-                    scheduledAt: scheduledStartAt,
-                    runStatus: task.status,
-                    metadata: {
-                        scheduledStartAt,
-                        runProfileIds: usableIds,
-                    },
-                },
-            );
-            saveState(state);
-            if (shouldSchedule) {
-                scheduleInitialRun(task.id, startAt);
-                sendJson(response, 200, { ok: true, runId, runProfileIds: usableIds, scheduledStartAt });
+            if (scheduleMode === SCHEDULE_MODE.fixedTime && !startAt) {
+                sendJson(response, 400, { error: "请选择预约启动时间" });
                 return;
             }
-            setImmediate(() => runTaskLoop(task.id));
-            sendJson(response, 200, { ok: true, runId, runProfileIds: usableIds, scheduledStartAt: null });
+            if (scheduleMode === SCHEDULE_MODE.fixedTime && startAt.getTime() <= Date.now()) {
+                if (hasExplicitScheduleMode) {
+                    sendJson(response, 400, { error: "请选择未来的预约时间" });
+                    return;
+                }
+                scheduleMode = SCHEDULE_MODE.immediate;
+            }
+            const activeTask = directoryActiveTask(state, task.directory, task.id);
+            const result = activeTask
+                ? enqueueTaskRun(state, task, { usableIds, scheduleMode, startAt })
+                : beginTaskRun(state, task, { usableIds, scheduleMode, startAt });
+            sendJson(response, 200, result);
             return;
         }
 
@@ -3207,14 +4823,24 @@ function createApp(options = {}) {
             }
             const runner = runners.get(task.id);
             const runId = runner?.runId || `${task.id}:lifecycle`;
+            let queueAdvanceAttached = false;
             if (runner) {
                 runner.stopped = true;
                 if (runner.timer) clearTimeout(runner.timer);
-                if (runner.child) runner.child.kill("SIGTERM");
+                if (runner.child && isChildActive(runner.child)) {
+                    queueAdvanceAttached = true;
+                    runner.child.once("close", () => advanceDirectoryQueue(queueDirectoryForTask(task)));
+                    runner.child.kill("SIGTERM");
+                }
                 runners.delete(task.id);
             }
             task.status = STATUS.stopped;
             task.nextRunAt = null;
+            task.availabilityNextCheckAt = null;
+            task.queuedAt = null;
+            task.queueRunId = null;
+            task.queuedDirectory = null;
+            task.queuedStart = null;
             addEvent(state, "stopped", task.id, `停止任务：${task.title}`);
             appendTaskLogEvent(task, "user_stopped", "用户停止任务", {
                 runId,
@@ -3225,6 +4851,7 @@ function createApp(options = {}) {
             });
             if (runner) updateTaskRunLog(task, runId, { status: STATUS.stopped, endedAt: nowISO() });
             saveState(state);
+            if (!queueAdvanceAttached) advanceDirectoryQueue(queueDirectoryForTask(task));
             sendJson(response, 200, { ok: true });
             return;
         }
@@ -3236,6 +4863,10 @@ function createApp(options = {}) {
             const task = findTask(state, decodeURIComponent(generateMatch[1]));
             if (!task) {
                 sendJson(response, 404, { error: "任务不存在" });
+                return;
+            }
+            if (task.archived) {
+                sendJson(response, 409, { error: "归档任务不能重新生成目标文件" });
                 return;
             }
             const generation = await runTaskFileGeneration(task.id, body.profileId || task.decomposeProfileId);
@@ -3309,6 +4940,7 @@ function createApp(options = {}) {
     };
 
     server.closeRunners = () => {
+        runnersClosing = true;
         if (pingTimer) {
             clearInterval(pingTimer);
             pingTimer = null;
@@ -3325,6 +4957,7 @@ function createApp(options = {}) {
                 if (!task || [STATUS.allDone, STATUS.failed, STATUS.stopped].includes(task.status)) continue;
                 task.status = STATUS.stopped;
                 task.nextRunAt = null;
+                task.availabilityNextCheckAt = null;
                 addEvent(state, "stopped", task.id, "服务关闭，任务已停止");
                 appendTaskLogEvent(task, "task_stopped", "服务关闭，任务已停止", {
                     runId: runner.runId,
@@ -3342,6 +4975,8 @@ function createApp(options = {}) {
     };
 
     startPingScheduler();
+    restoreScheduledTasks();
+    restoreQueuedTasks();
 
     return server;
 }
@@ -3363,9 +4998,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+    AVAILABILITY_CHECK_INTERVAL_MINUTES,
     DEFAULT_HOST,
     DEFAULT_PORT,
     RUNTIME_STATE,
+    SCHEDULE_MODE,
     STATUS,
     createApp,
     formatStartupMessage,

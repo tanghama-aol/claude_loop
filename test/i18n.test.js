@@ -18,6 +18,10 @@ test("normalizeLanguage supports Chinese and English locale variants", () => {
 test("translate interpolates values and falls back to the translation key", () => {
     assert.equal(translate("en", "task.count.other", { count: 3 }), "3 tasks");
     assert.equal(translate("zh-CN", "toast.pingComplete", { success: 2, total: 3 }), "Ping 完成：2/3 成功");
+    assert.equal(translate("zh-CN", "ping.column.firstOutput"), "首字时延");
+    assert.equal(translate("en", "ping.column.outputTokens"), "output tokens");
+    assert.equal(translate("zh-CN", "dashboard.openProject", { name: "示例项目" }), "进入项目：示例项目");
+    assert.equal(translate("en", "dashboard.openCard", { name: "Profiles" }), "Open Profiles");
     assert.equal(translate("en", "missing.key"), "missing.key");
 });
 

@@ -177,8 +177,10 @@
                             </label>
                             <div class="form-actions full">
                                 <button type="submit" data-i18n="profile.save">保存 Profile</button>
+                                <button class="ghost" type="button" id="pingProfile" data-i18n="profile.pingNow">测试连接</button>
                                 <button class="ghost" type="button" id="duplicateProfile" data-i18n="common.duplicate">复制</button>
                                 <button class="danger" type="button" id="deleteProfile" data-i18n="common.delete">删除</button>
+                                <span id="profilePingStatus" class="profile-ping-status" aria-live="polite"></span>
                             </div>
                         </form>
                     </section>
@@ -208,6 +210,10 @@
                             <label>
                                 <span data-i18n="task.targetFile">目标文件名</span>
                                 <input name="targetFileName" data-i18n-placeholder="task.targetFilePlaceholder" placeholder="P3-真实笔顺评分.md">
+                            </label>
+                            <label>
+                                <span data-i18n="task.project">所属项目</span>
+                                <select name="projectId" id="taskProject"></select>
                             </label>
                             <label>
                                 <span data-i18n="task.directory">工作目录</span>
@@ -288,10 +294,19 @@
                     </section>
                     <section class="panel">
                         <div class="panel-head">
-                            <h2 data-i18n="task.list">任务列表</h2>
+                            <h2 data-i18n="task.tree">项目任务树</h2>
                             <span id="taskCount" class="hint">0 个任务</span>
                         </div>
-                        <div id="taskList" class="task-list"></div>
+                        <form id="projectForm" class="project-form">
+                            <input type="hidden" name="id">
+                            <input name="name" required data-i18n-placeholder="project.namePlaceholder" placeholder="项目名称">
+                            <select name="directory" data-project-directory>
+                                <option value="" data-i18n="project.unbound">不绑定目录</option>
+                            </select>
+                            <button type="submit" id="projectSubmit" data-i18n="project.create">创建项目</button>
+                        </form>
+                        <div id="projectList" class="project-list"></div>
+                        <div id="taskList" class="task-list project-task-tree"></div>
                     </section>
                 </div>
             </section>
@@ -337,9 +352,17 @@
                                 <select id="decomposeProfile"></select>
                             </label>
                             <label>
+                                <span data-i18n="runtime.scheduleMode">预约方式</span>
+                                <select id="scheduleMode">
+                                    <option value="fixed_time" data-i18n="runtime.scheduleMode.fixedTime">固定时间</option>
+                                    <option value="profile_available" data-i18n="runtime.scheduleMode.profileAvailable">模型可用时</option>
+                                </select>
+                            </label>
+                            <label id="scheduleTimeField" class="schedule-time-field">
                                 <span data-i18n="runtime.scheduleTime">预约启动时间</span>
                                 <input id="scheduleStartAt" type="datetime-local">
                             </label>
+                            <p id="scheduleModeHint" class="field-note schedule-mode-hint"></p>
                             <div class="button-row">
                                 <button type="button" id="startTask" data-i18n="runtime.start">启动</button>
                                 <button class="ghost" type="button" id="scheduleTask" data-i18n="runtime.schedule">预约启动</button>
@@ -347,6 +370,22 @@
                                 <button class="danger" type="button" id="stopTask" data-i18n="runtime.stop">停止</button>
                             </div>
                             <div id="runDetail" class="run-detail"></div>
+
+                            <section id="runtimeFileSection" class="runtime-file-section" aria-labelledby="runtimeFileHeading">
+                                <div class="runtime-file-head">
+                                    <div>
+                                        <h3 id="runtimeFileHeading" data-i18n="editor.heading">目标文件编辑</h3>
+                                        <p id="runtimeEditorPath" class="pathline" data-i18n="editor.noTask">未选择任务</p>
+                                    </div>
+                                    <div class="inline-actions">
+                                        <button class="ghost" type="button" id="runtimeLoadFile" data-i18n="common.load">载入</button>
+                                        <button type="button" id="runtimeSaveFile" data-i18n="common.save">保存</button>
+                                        <button class="danger" type="button" id="archiveTask" data-i18n="task.archive">归档任务</button>
+                                    </div>
+                                </div>
+                                <textarea id="runtimeFileEditor" class="runtime-file-editor" spellcheck="false"></textarea>
+                                <p id="runtimeFileHint" class="field-note"></p>
+                            </section>
 
                             <section class="append-panel" aria-labelledby="appendTaskHeading">
                                 <div class="append-panel-head">

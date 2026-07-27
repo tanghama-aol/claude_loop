@@ -735,12 +735,14 @@ test("server can schedule a task to start once in the future", async (t) => {
     const startAt = new Date(Date.now() + 220).toISOString();
     await request(server, `/api/tasks/${created.task.id}/start`, {
         method: "POST",
-        body: { profileIds: [profile.profile.id], startAt },
+        body: { profileIds: [profile.profile.id], scheduleMode: "fixed_time", startAt },
     });
 
     const scheduledState = await request(server, "/api/state");
     const scheduledTask = scheduledState.tasks.find((item) => item.id === created.task.id);
     assert.equal(scheduledTask.status, "scheduled");
+    assert.equal(scheduledTask.scheduleMode, "fixed_time");
+    assert.equal(scheduledTask.scheduledStartAt, startAt);
     assert.equal(scheduledTask.runtimeState, RUNTIME_STATE.idleWaiting);
     assert.equal(scheduledTask.nextRunAt, startAt);
     assert.equal(scheduledTask.runtimeNextRunAt, startAt);
@@ -753,6 +755,98 @@ test("server can schedule a task to start once in the future", async (t) => {
     assert.equal(finishedTask.nextRunAt, null);
     assert.equal(finishedTask.runtimeState, RUNTIME_STATE.loopNotStarted);
     assert.equal(fs.readFileSync(markerPath, "utf8"), "started");
+});
+
+test("server starts a task when its Profile becomes available", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const availabilityGate = path.join(tempRoot, "model-available.flag");
+    const script = writeAgentScript(tempRoot, "agent-availability.sh", [
+        `if (String(process.env.AGENT_TASK_ID || "").startsWith("ping_") && !fs.existsSync(${JSON.stringify(availabilityGate)})) {`,
+        "    console.error(\"model unavailable\");",
+        "    process.exit(2);",
+        "}",
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        availabilityCheckIntervalMs: 60,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "availability-agent",
+            agentType: "codex",
+            command: script.command,
+            args: script.args,
+            timeoutSeconds: 1,
+            pingEnabled: false,
+            enabled: true,
+        },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "模型可用预约",
+            requirement: "模型可用后运行",
+            targetFileName: "availability-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+
+    const scheduled = await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: {
+            profileIds: [profile.profile.id],
+            scheduleMode: "profile_available",
+        },
+    });
+    assert.equal(scheduled.scheduleMode, "profile_available");
+    assert.equal(scheduled.runProfileIds[0], profile.profile.id);
+
+    const waitingTask = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        const task = state.tasks.find((item) => item.id === created.task.id);
+        const failedCheck = state.pingRecords.some((record) => record.taskId === created.task.id && record.success === false);
+        return task?.status === "scheduled" && failedCheck ? task : null;
+    });
+    assert.equal(waitingTask.scheduleMode, "profile_available");
+    assert.equal(waitingTask.availabilityCheckIntervalMinutes, 30);
+    assert.ok(waitingTask.availabilityNextCheckAt);
+    assert.equal(waitingTask.runtimeState, RUNTIME_STATE.idleWaiting);
+    assert.equal(fs.existsSync(availabilityGate), false);
+
+    fs.writeFileSync(availabilityGate, "ready", "utf8");
+    const finishedTask = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+    }, { timeoutMs: 2500 });
+    assert.equal(finishedTask.scheduleMode, "profile_available");
+    assert.equal(finishedTask.availabilityNextCheckAt, null);
+
+    const state = await request(server, "/api/state");
+    const records = state.pingRecords.filter((record) => record.taskId === created.task.id);
+    assert.ok(records.length >= 2);
+    assert.equal(records.some((record) => record.success), true);
+    assert.equal(records.some((record) => record.success === false), true);
+    assert.ok(records.every((record) => record.source === "task_availability"));
+    const log = await request(server, `/api/tasks/${created.task.id}/log`);
+    assert.ok(log.events.some((event) => event.type === "availability_check"));
+    assert.ok(log.events.some((event) => event.type === "availability_wait"));
+    assert.ok(log.events.some((event) => event.type === "profile_available"));
 });
 
 test("server cancels a scheduled task when it is stopped", async (t) => {
@@ -1413,6 +1507,101 @@ test("server logs real prompt and rotates to next profile after failure", async 
     assert.ok(log.events.some((event) => event.type === "retry_wait" && event.metadata.reason === "429"));
 });
 
+test("server selects the first available task Profile in configured order", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const executionOrder = path.join(tempRoot, "profile-order.log");
+    const unavailableRun = path.join(tempRoot, "unavailable-run.txt");
+    const availableRun = path.join(tempRoot, "available-run.txt");
+    const unavailableScript = writeAgentScript(tempRoot, "agent-unavailable-first.js", [
+        `fs.appendFileSync(${JSON.stringify(executionOrder)}, "first\\n", "utf8");`,
+        `if (!String(process.env.AGENT_TASK_ID || "").startsWith("ping_")) fs.writeFileSync(${JSON.stringify(unavailableRun)}, "ran", "utf8");`,
+        "console.error(\"first profile unavailable\");",
+        "process.exit(2);",
+    ].join("\n"));
+    const availableScript = writeAgentScript(tempRoot, "agent-available-second.js", [
+        "const isPing = String(process.env.AGENT_TASK_ID || \"\").startsWith(\"ping_\");",
+        `fs.appendFileSync(${JSON.stringify(executionOrder)}, isPing ? "second-ping\\n" : "second-run\\n", "utf8");`,
+        "if (isPing) {",
+        "    console.log(\"pong\");",
+        "    return;",
+        "}",
+        `fs.writeFileSync(${JSON.stringify(availableRun)}, "ran", "utf8");`,
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const unavailableProfile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "unavailable-first",
+            agentType: "codex",
+            command: unavailableScript.command,
+            args: unavailableScript.args,
+            timeoutSeconds: 1,
+            enabled: true,
+        },
+    });
+    const availableProfile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "available-second",
+            agentType: "claude",
+            command: availableScript.command,
+            args: availableScript.args,
+            timeoutSeconds: 1,
+            enabled: true,
+        },
+    });
+    const profileIds = [unavailableProfile.profile.id, availableProfile.profile.id];
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "顺序选择 Profile",
+            requirement: "使用首个可用模型",
+            targetFileName: "ordered-profile-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            decomposeProfileId: availableProfile.profile.id,
+            runProfileIds: profileIds,
+        },
+    });
+
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds },
+    });
+
+    const task = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+    });
+    assert.deepEqual(task.runProfileIds, profileIds);
+    assert.equal(task.runProfileId, availableProfile.profile.id);
+    assert.equal(fs.existsSync(unavailableRun), false);
+    assert.equal(fs.readFileSync(availableRun, "utf8"), "ran");
+    assert.equal(fs.readFileSync(executionOrder, "utf8"), "first\nsecond-ping\nsecond-run\n");
+
+    const state = await request(server, "/api/state");
+    const selectionRecords = state.pingRecords.filter((record) => record.taskId === created.task.id);
+    assert.equal(selectionRecords.length, 2);
+    assert.ok(selectionRecords.every((record) => record.source === "task_selection"));
+    const log = await request(server, `/api/tasks/${created.task.id}/log`);
+    assert.ok(log.events.some((event) => event.type === "availability_check" && event.metadata.source === "task_selection"));
+    assert.ok(log.events.some((event) => event.type === "profile_available" && event.profile.id === availableProfile.profile.id));
+});
+
 test("server applies profile config directory to agent environment", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
@@ -1575,6 +1764,7 @@ test("server pings enabled claude and codex profiles and groups records by day",
     assert.equal(state.pingDays[0].success, 1);
     assert.equal(state.pingDays[0].failed, 1);
     assert.equal(state.pingDays[0].records.length, 2);
+    assert.equal(state.events.find((event) => event.type === "ping")?.message, "Ping Profiles：1/2 成功");
 });
 
 test("server can disable and re-enable the global ping feature", async (t) => {
@@ -1646,6 +1836,83 @@ test("server can disable and re-enable the global ping feature", async (t) => {
     assert.equal(result.records[0].success, true);
 });
 
+test("server can test one Profile from the editor and persist the result", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const successScript = writeAgentScript(tempRoot, "agent-profile-editor-ping.sh", [
+        "console.log(`editor-pong:${process.argv.slice(2).join(\" \")}`);",
+    ].join("\n"));
+    const failureScript = writeAgentScript(tempRoot, "agent-profile-editor-ping-fail.sh", [
+        "console.error(\"editor connection failed\");",
+        "process.exit(3);",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const saved = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "editor-ping-profile",
+            agentType: "claude",
+            command: successScript.command,
+            args: successScript.args,
+            timeoutSeconds: 1,
+            pingEnabled: false,
+            enabled: true,
+        },
+    });
+    const profileId = saved.profile.id;
+    const success = await request(server, `/api/profiles/${encodeURIComponent(profileId)}/ping`, {
+        method: "POST",
+    });
+    assert.equal(success.ok, true);
+    assert.equal(success.record.profileId, profileId);
+    assert.equal(success.record.source, "manual");
+    assert.equal(success.record.success, true);
+    assert.equal(success.record.prompt, "What is 1+1?");
+    assert.equal(typeof success.record.durationMs, "number");
+
+    await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            id: profileId,
+            name: "editor-ping-profile",
+            agentType: "claude",
+            command: failureScript.command,
+            args: failureScript.args,
+            timeoutSeconds: 1,
+            pingEnabled: false,
+            enabled: true,
+        },
+    });
+    const failure = await request(server, `/api/profiles/${encodeURIComponent(profileId)}/ping`, {
+        method: "POST",
+    });
+    assert.equal(failure.record.success, false);
+    assert.match(failure.record.failureReason, /editor connection failed/);
+
+    const state = await request(server, "/api/state");
+    assert.equal(state.pingRecords.length, 2);
+    assert.equal(state.pingRecords[0].source, "manual");
+    assert.match(state.events[0].message, /Ping Profile：editor-ping-profile 失败/);
+
+    const missing = await server.inject({
+        method: "POST",
+        path: "/api/profiles/does-not-exist/ping",
+    });
+    assert.equal(missing.statusCode, 404);
+});
+
 test("server pings with one random prompt from the prepared 30 simple questions", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
@@ -1700,6 +1967,134 @@ test("server pings with one random prompt from the prepared 30 simple questions"
     assert.equal(result.records[0].prompt, "What is 1+1?");
     assert.notEqual(result.records[0].prompt, "hello");
     assert.match(result.records[0].outputTail, /What is 1\+1\?/);
+});
+
+test("server records first response latency, token usage, and expandable ping I/O details", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("the fake Codex executable in this test uses a POSIX shebang");
+        return;
+    }
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const fakeCodex = path.join(tempRoot, "codex");
+    const fakeClaude = path.join(tempRoot, "claude");
+    fs.writeFileSync(fakeCodex, [
+        "#!/usr/bin/env node",
+        "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
+        "(async () => {",
+        "    if (!process.argv.includes(\"--json\")) {",
+        "        console.error(\"missing --json\");",
+        "        process.exit(2);",
+        "    }",
+        "    console.log(JSON.stringify({ type: \"thread.started\", thread_id: \"ping-test\" }));",
+        "    await sleep(35);",
+        "    console.log(JSON.stringify({ type: \"item.completed\", item: { type: \"agent_message\", text: \"Structured pong\" } }));",
+        "    console.log(JSON.stringify({ type: \"turn.completed\", usage: { input_tokens: 31, cached_input_tokens: 5, output_tokens: 4 } }));",
+        "})().catch((error) => { console.error(error); process.exit(1); });",
+        "",
+    ].join("\n"), "utf8");
+    fs.chmodSync(fakeCodex, 0o755);
+    fs.writeFileSync(fakeClaude, [
+        "#!/usr/bin/env node",
+        "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
+        "(async () => {",
+        "    const formatIndex = process.argv.indexOf(\"--output-format\");",
+        "    if (process.argv[formatIndex + 1] !== \"stream-json\" || !process.argv.includes(\"--include-partial-messages\")) {",
+        "        console.error(\"missing Claude stream JSON flags\");",
+        "        process.exit(2);",
+        "    }",
+        "    console.log(JSON.stringify({ type: \"system\", subtype: \"init\" }));",
+        "    await sleep(30);",
+        "    console.log(JSON.stringify({ type: \"stream_event\", event: { type: \"content_block_delta\", delta: { type: \"text_delta\", text: \"Claude\" } } }));",
+        "    console.log(JSON.stringify({ type: \"result\", subtype: \"success\", result: \"Claude pong\", usage: { input_tokens: 3, cache_creation_input_tokens: 2, cache_read_input_tokens: 10, output_tokens: 5 } }));",
+        "})().catch((error) => { console.error(error); process.exit(1); });",
+        "",
+    ].join("\n"), "utf8");
+    fs.chmodSync(fakeClaude, 0o755);
+    fs.mkdirSync(tempData, { recursive: true });
+    fs.writeFileSync(path.join(tempData, "state.json"), JSON.stringify({
+        version: 1,
+        directories: [tempRoot],
+        profiles: [
+            {
+                id: "profile_codex_metrics",
+                name: "codex-metrics",
+                agentType: "codex",
+                command: fakeCodex,
+                args: "exec {prompt}",
+                envText: "",
+                promptTemplate: DEFAULT_RUN_PROMPT,
+                timeoutSeconds: 1,
+                enabled: true,
+                nonInteractive: true,
+                defaultDirectory: tempRoot,
+                configDirectory: "",
+                pingEnabled: true,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+            },
+            {
+                id: "profile_claude_metrics",
+                name: "claude-metrics",
+                agentType: "claude",
+                command: fakeClaude,
+                args: "-p {prompt}",
+                envText: "",
+                promptTemplate: DEFAULT_RUN_PROMPT,
+                timeoutSeconds: 1,
+                enabled: true,
+                nonInteractive: true,
+                defaultDirectory: tempRoot,
+                configDirectory: "",
+                pingEnabled: true,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+            },
+        ],
+        tasks: [],
+        events: [],
+        pingRecords: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    }), "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const result = await request(server, "/api/pings/run", { method: "POST" });
+    const codexRecord = result.records.find((record) => record.profileName === "codex-metrics");
+    const claudeRecord = result.records.find((record) => record.profileName === "claude-metrics");
+    assert.equal(codexRecord.success, true);
+    assert.equal(codexRecord.inputText, "What is 1+1?");
+    assert.equal(codexRecord.outputText, "Structured pong");
+    assert.equal(codexRecord.inputTokens, 31);
+    assert.equal(codexRecord.outputTokens, 4);
+    assert.equal(codexRecord.totalTokens, 35);
+    assert.ok(codexRecord.firstOutputLatencyMs >= 20, `expected model response latency, received ${codexRecord.firstOutputLatencyMs}ms`);
+    assert.ok(codexRecord.durationMs >= codexRecord.firstOutputLatencyMs);
+    assert.match(codexRecord.command, /exec --json/);
+
+    assert.equal(claudeRecord.success, true);
+    assert.equal(claudeRecord.outputText, "Claude pong");
+    assert.equal(claudeRecord.inputTokens, 15);
+    assert.equal(claudeRecord.outputTokens, 5);
+    assert.equal(claudeRecord.totalTokens, 20);
+    assert.ok(claudeRecord.firstOutputLatencyMs >= 20);
+    assert.match(claudeRecord.command, /--output-format stream-json --include-partial-messages/);
+
+    const state = await request(server, "/api/state");
+    assert.equal(state.pingRecords.length, 2);
+    assert.equal(state.pingDays[0].records.find((record) => record.profileName === "codex-metrics").inputTokens, 31);
+    assert.equal(state.pingDays[0].records.find((record) => record.profileName === "claude-metrics").outputText, "Claude pong");
 });
 
 test("server stores model test configuration and masks profile tokens", async (t) => {
@@ -2200,4 +2595,254 @@ test("server rejects incompatible media Profiles and artifact paths outside the 
     });
     assert.equal(escaped.statusCode, 400);
     assert.match(escaped.json().error, /产物目录必须位于任务工作目录内/);
+});
+
+test("server groups tasks by project, queues same-project runs, and archives target plus logs", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const executionLog = path.join(tempRoot, "project-queue-execution.log");
+    const agent = writeAgentScript(tempRoot, "agent-project-queue.js", [
+        `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
+        "await sleep(100);",
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const unbound = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "不绑定项目" },
+    });
+    assert.equal(unbound.project.directory, "");
+    const bound = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "队列项目", directory: tempRoot },
+    });
+    assert.equal(bound.project.directory, tempRoot);
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "queue-agent",
+            agentType: "custom",
+            command: agent.command,
+            args: agent.args,
+            timeoutSeconds: 2,
+            enabled: true,
+        },
+    });
+    const createTask = (title, targetFileName) => request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title,
+            requirement: title,
+            targetFileName,
+            projectId: bound.project.id,
+            directory: tempRoot,
+            sourceMode: "template",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    const first = await createTask("当前任务", "current.md");
+    const second = await createTask("排队任务", "queued.md");
+    assert.equal(first.task.projectId, bound.project.id);
+    assert.equal(second.task.directory, tempRoot);
+
+    const firstStart = await request(server, `/api/tasks/${first.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    assert.equal(firstStart.queued, false);
+    const secondStart = await request(server, `/api/tasks/${second.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    assert.equal(secondStart.queued, true);
+    assert.equal(secondStart.queuePosition, 1);
+
+    const completed = await waitFor(async () => {
+        const current = await request(server, "/api/state");
+        const firstTask = current.tasks.find((task) => task.id === first.task.id);
+        const secondTask = current.tasks.find((task) => task.id === second.task.id);
+        return firstTask?.status === "all_done" && secondTask?.status === "all_done"
+            ? { current, firstTask, secondTask }
+            : null;
+    }, { timeoutMs: 4000 });
+    assert.equal(completed.secondTask.queuePosition, null);
+    assert.equal(fs.readFileSync(executionLog, "utf8").split(/\r?\n/).filter(Boolean).length, 2);
+
+    const archive = await request(server, `/api/tasks/${first.task.id}/archive`, { method: "POST" });
+    assert.equal(archive.task.archived, true);
+    assert.match(archive.archiveDirectory, /archive/);
+    assert.equal(fs.existsSync(path.join(tempRoot, "current.md")), false);
+    assert.equal(fs.existsSync(archive.task.filePath), true);
+    assert.equal(fs.existsSync(path.join(archive.task.archiveDirectory, "logs")), true);
+
+    const archivedFile = await request(server, `/api/tasks/${first.task.id}/file`);
+    assert.match(archivedFile.content, /当前任务/);
+    const archivedLog = await request(server, `/api/tasks/${first.task.id}/log`);
+    assert.ok(archivedLog.events.some((event) => event.type === "task_archived"));
+    const readOnly = await server.inject({
+        method: "PUT",
+        path: `/api/tasks/${first.task.id}/file`,
+        body: { content: "不应修改" },
+    });
+    assert.equal(readOnly.statusCode, 409);
+    const finalState = await request(server, "/api/state");
+    assert.equal(finalState.tasks.find((task) => task.id === first.task.id).archived, true);
+    assert.ok(finalState.projects.find((project) => project.id === bound.project.id).archivedTaskCount >= 1);
+});
+
+test("server serializes tasks from different projects that share one working directory", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const executionLog = path.join(tempRoot, "directory-queue.log");
+    const agent = writeAgentScript(tempRoot, "agent-directory-queue.js", [
+        `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
+        "await sleep(100);",
+        "console.log(\"GGGG全部完成GGGG\");",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const firstProject = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "目录项目 A", directory: tempRoot },
+    });
+    const secondProject = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "目录项目 B", directory: tempRoot },
+    });
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "directory-queue-agent",
+            agentType: "custom",
+            command: agent.command,
+            args: agent.args,
+            timeoutSeconds: 2,
+            enabled: true,
+        },
+    });
+    const createTask = (projectId, title, targetFileName) => request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            projectId,
+            title,
+            requirement: title,
+            targetFileName,
+            directory: tempRoot,
+            sourceMode: "template",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    const first = await createTask(firstProject.project.id, "目录任务 A", "directory-a.md");
+    const second = await createTask(secondProject.project.id, "目录任务 B", "directory-b.md");
+
+    await request(server, `/api/tasks/${first.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    const queued = await request(server, `/api/tasks/${second.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    assert.equal(queued.queued, true);
+    assert.equal(queued.queueDirectory, tempRoot);
+    assert.equal(queued.activeTaskId, first.task.id);
+
+    const queuedState = await request(server, "/api/state");
+    const queuedTask = queuedState.tasks.find((task) => task.id === second.task.id);
+    assert.equal(queuedTask.queuePosition, 1);
+    assert.equal(queuedTask.queueDirectory, tempRoot);
+    assert.equal(queuedTask.queueActiveTaskId, first.task.id);
+
+    await waitFor(async () => {
+        const current = await request(server, "/api/state");
+        return current.tasks.find((task) => task.id === first.task.id)?.status === "all_done"
+            && current.tasks.find((task) => task.id === second.task.id)?.status === "all_done";
+    }, { timeoutMs: 4000 });
+    assert.deepEqual(
+        fs.readFileSync(executionLog, "utf8").split(/\r?\n/).filter(Boolean),
+        [first.task.id, second.task.id],
+    );
+});
+
+test("server preserves a requested directory when assigning legacy and unbound project tasks", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const legacyDirectory = path.join(tempRoot, "legacy-directory");
+    const unboundDirectory = path.join(tempRoot, "unbound-directory");
+    fs.mkdirSync(legacyDirectory);
+    fs.mkdirSync(unboundDirectory);
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    await request(server, "/api/directories", { method: "POST", body: { directory: legacyDirectory } });
+    await request(server, "/api/directories", { method: "POST", body: { directory: unboundDirectory } });
+    const legacyTask = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "旧客户端目录任务",
+            requirement: "保留传入目录",
+            targetFileName: "legacy-directory.md",
+            directory: legacyDirectory,
+            sourceMode: "template",
+        },
+    });
+    assert.equal(legacyTask.task.directory, legacyDirectory);
+
+    const unbound = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "未绑定目录任务组" },
+    });
+    const unboundTask = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            projectId: unbound.project.id,
+            title: "未绑定项目任务",
+            requirement: "使用任务自己的目录",
+            targetFileName: "unbound-directory.md",
+            directory: unboundDirectory,
+            sourceMode: "template",
+        },
+    });
+    assert.equal(unboundTask.task.projectId, unbound.project.id);
+    assert.equal(unboundTask.task.directory, unboundDirectory);
+
+    const state = await request(server, "/api/state");
+    assert.equal(state.projects.find((project) => project.id === legacyTask.task.projectId)?.directory, legacyDirectory);
+    const deleteInUse = await server.inject({
+        method: "DELETE",
+        path: `/api/directories/${encodeURIComponent(unboundDirectory)}`,
+    });
+    assert.equal(deleteInUse.statusCode, 409);
+    assert.match(deleteInUse.json().error, /目录仍包含任务/);
 });
