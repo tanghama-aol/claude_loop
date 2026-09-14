@@ -128,3 +128,154 @@ test("dashboard cards navigate to their related module, task, or project", () =>
     assert.match(appSource, /data-open-project/);
     assert.match(appSource, /dashboard-target-highlight/);
 });
+
+test("removing the selected task clears editors and logs before selecting a remaining task", async () => {
+    const start = appSource.indexOf("async function refresh(");
+    const end = appSource.indexOf("\nfunction updateTokenPlaceholder", start);
+    const nodes = new Map(["#fileEditor", "#runtimeFileEditor", "#appendTaskItems", "#appendCompletionStandard", "#editorPath", "#runtimeEditorPath", "#runProfiles"]
+        .map((selector) => [selector, { value: "old task content", textContent: "old task path", innerHTML: "old profiles" }]));
+    let nextTasks = [{ id: "kept" }];
+    const logLoads = [];
+    const context = {
+        state: { selectedTaskId: "removed", scheduleTaskId: "removed", fileRequestId: 0, refreshRequestId: 0, activeView: "runtime" },
+        api: async () => ({ tasks: nextTasks }),
+        $: (selector) => nodes.get(selector),
+        t: (key) => key,
+        loadLog: async (id) => logLoads.push(id),
+        renderAll: () => {
+            if (!context.state.selectedTaskId) context.state.selectedTaskId = nextTasks[0]?.id || "";
+        },
+        loadFile: async (id) => {
+            assert.equal(nodes.get("#fileEditor").value, "");
+            assert.equal(nodes.get("#runtimeFileEditor").value, "");
+            nodes.get("#fileEditor").value = `content for ${id}`;
+            nodes.get("#runtimeFileEditor").value = `content for ${id}`;
+        },
+    };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.refresh = refresh;`, context);
+    await context.refresh({ replacementTaskId: "kept" });
+    assert.equal(context.state.selectedTaskId, "kept");
+    assert.equal(nodes.get("#fileEditor").value, "content for kept");
+    assert.equal(nodes.get("#appendTaskItems").value, "");
+    assert.equal(nodes.get("#appendCompletionStandard").value, "");
+    assert.equal(context.state.fileRequestId, 1);
+    assert.deepEqual(logLoads, ["", "kept"]);
+
+    // A background poll may already have selected a fallback before the deduplication response arrives.
+    context.state.selectedTaskId = "fallback";
+    context.state.data = { tasks: [{ id: "fallback" }, { id: "kept" }] };
+    context.api = async () => null;
+    await context.refresh({ replacementTaskId: "kept" });
+    assert.equal(context.state.selectedTaskId, "kept");
+    assert.equal(nodes.get("#fileEditor").value, "content for kept");
+
+    nextTasks = [];
+    context.api = async () => ({ tasks: nextTasks });
+    await context.refresh();
+    assert.equal(context.state.selectedTaskId, "");
+    assert.equal(nodes.get("#fileEditor").value, "");
+    assert.equal(nodes.get("#runtimeFileEditor").value, "");
+    assert.equal(nodes.get("#editorPath").textContent, "editor.noTask");
+    assert.equal(logLoads.at(-1), "");
+});
+
+test("a stale file response cannot restore a deleted task or overwrite the next editor", async () => {
+    const start = appSource.indexOf("async function loadFile(");
+    const end = appSource.indexOf("\nasync function deleteTask", start);
+    let resolveFile;
+    const context = {
+        state: { selectedTaskId: "removed", fileRequestId: 0, data: { tasks: [{ id: "removed" }] } },
+        api: () => new Promise((resolve) => { resolveFile = resolve; }),
+        $: () => { throw new Error("stale response must not touch the editors"); },
+    };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.loadFile = loadFile;`, context);
+    const pending = context.loadFile("removed");
+    context.state.fileRequestId += 1;
+    context.state.selectedTaskId = "kept";
+    context.state.data.tasks = [{ id: "kept" }];
+    resolveFile({ content: "stale content", filePath: "removed.md" });
+    await pending;
+    assert.equal(context.state.selectedTaskId, "kept");
+});
+
+test("delete actions remain disabled for active tasks and processes, including a stopped process still exiting", () => {
+    const start = appSource.indexOf("function taskCanDelete(");
+    const end = appSource.indexOf("\nfunction renderRuntimeContext", start);
+    const context = { state: { deletingTaskIds: new Set() } };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.taskCanDelete = taskCanDelete;`, context);
+    for (const status of ["running", "queued", "scheduled", "retry_wait"]) {
+        assert.equal(context.taskCanDelete({ id: "busy", status }), false);
+    }
+    assert.equal(context.taskCanDelete({ id: "stopping", status: "stopped", canDelete: false }), false);
+    assert.equal(context.taskCanDelete({ id: "archived", archived: true, status: "completed", canDelete: true }), true);
+    assert.equal(context.taskCanDelete(null), false);
+});
+
+test("live log memory is bounded by both event count and output length", () => {
+    const start = appSource.indexOf("function boundLogEvents(");
+    const end = appSource.indexOf("\nfunction cancelLogRequest", start);
+    const context = { MAX_LOG_EVENTS: 400, MAX_LOG_RENDER_CHARS: 512 * 1024 };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.boundLogEvents = boundLogEvents;`, context);
+    const small = Array.from({ length: 1000 }, (_, sequence) => ({ sequence, text: "small" }));
+    assert.equal(context.boundLogEvents(small).length, 400);
+    assert.equal(context.boundLogEvents(small)[0].sequence, 600);
+    const large = Array.from({ length: 100 }, (_, sequence) => ({ sequence, text: "x".repeat(65536) }));
+    assert.equal(context.boundLogEvents(large).length, 8);
+    assert.equal(context.boundLogEvents(large).at(-1).sequence, 99);
+});
+
+test("unchanged log polls preserve timeline DOM and expanded details", () => {
+    const start = appSource.indexOf("function renderConversationLog(");
+    const end = appSource.indexOf("\nfunction renderConversationBody", start);
+    const nodes = new Map();
+    let bodyRenders = 0;
+    const context = {
+        state: { log: { taskId: "task", runId: "", renderVersion: 1, events: [{ sequence: 1 }], content: "", loading: false, following: false, format: "structured" } },
+        $: (selector) => {
+            if (!nodes.has(selector)) nodes.set(selector, { dataset: {}, scrollTop: 20, scrollHeight: 200, setAttribute() {} });
+            return nodes.get(selector);
+        },
+        i18n: { getLanguage: () => "zh-CN" },
+        t: (key) => key,
+        translatedOr: (_key, fallback) => fallback,
+        renderConversationBody: () => { bodyRenders += 1; },
+        renderLogRunOptions() {}, renderLogNotice() {}, setLogFollowing() {},
+    };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.renderConversationLog = renderConversationLog;`, context);
+    context.renderConversationLog();
+    context.state.log.loading = true;
+    context.renderConversationLog();
+    context.state.log.loading = false;
+    context.renderConversationLog();
+    assert.equal(bodyRenders, 1);
+    context.state.log.renderVersion += 1;
+    context.renderConversationLog();
+    assert.equal(bodyRenders, 2);
+});
+
+test("polling never overlaps requests and pauses while the page is hidden", async () => {
+    const start = appSource.indexOf("async function poll(");
+    const end = appSource.indexOf("\nasync function boot", start);
+    let refreshes = 0;
+    let resolveRefresh;
+    const context = {
+        state: { pollInFlight: false, data: { tasks: [] }, log: {}, pollFailures: 0 },
+        document: { hidden: true },
+        refresh: () => { refreshes += 1; return new Promise((resolve) => { resolveRefresh = resolve; }); },
+        $: () => ({ value: "" }),
+        clearTimeout() {},
+        setTimeout: () => { throw new Error("must not schedule background polling"); },
+        toast: (message) => { throw new Error(message); },
+    };
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.poll = poll;`, context);
+    await context.poll();
+    assert.equal(refreshes, 0);
+    context.document.hidden = false;
+    const pending = context.poll();
+    await context.poll();
+    assert.equal(refreshes, 1);
+    context.document.hidden = true;
+    resolveRefresh();
+    await pending;
+    assert.equal(context.state.pollInFlight, false);
+});

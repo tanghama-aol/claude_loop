@@ -293,10 +293,14 @@
                         </form>
                     </section>
                     <section class="panel">
-                        <div class="panel-head">
+                        <div class="panel-head task-list-head">
                             <h2 data-i18n="task.tree">项目任务树</h2>
-                            <span id="taskCount" class="hint">0 个任务</span>
+                            <div class="task-actions">
+                                <span id="taskCount" class="hint">0 个任务</span>
+                                <button class="ghost" type="button" id="deduplicateTasks" data-i18n="task.deduplicate">一键去重</button>
+                            </div>
                         </div>
+                        <p class="task-cleanup-hint" data-i18n="task.cleanupHint">按目标文件路径去重，保留已归档任务；删除仅移除记录，文件和日志保留。</p>
                         <form id="projectForm" class="project-form">
                             <input type="hidden" name="id">
                             <input name="name" required data-i18n-placeholder="project.namePlaceholder" placeholder="项目名称">
@@ -381,6 +385,7 @@
                                         <button class="ghost" type="button" id="runtimeLoadFile" data-i18n="common.load">载入</button>
                                         <button type="button" id="runtimeSaveFile" data-i18n="common.save">保存</button>
                                         <button class="danger" type="button" id="archiveTask" data-i18n="task.archive">归档任务</button>
+                                        <button class="danger" type="button" id="deleteTask" data-i18n="task.delete">删除任务</button>
                                     </div>
                                 </div>
                                 <textarea id="runtimeFileEditor" class="runtime-file-editor" spellcheck="false"></textarea>
@@ -429,6 +434,7 @@
                         <div id="logView" class="conversation-log log-view" role="log" aria-live="polite" aria-busy="false"></div>
                         <div class="log-footer">
                             <span id="logCursor" class="hint"></span>
+                            <button class="ghost" type="button" id="olderLog" disabled data-i18n="runtime.olderLogs">更早日志</button>
                             <button class="follow-button" type="button" id="followLog" data-i18n="runtime.followLatest">跟随最新</button>
                         </div>
                     </section>

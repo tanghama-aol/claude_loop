@@ -39,12 +39,25 @@ const LOG_METADATA_KEYS = [
     "cwd",
 ];
 const MAX_LEGACY_LOG_RENDER_CHARS = 256 * 1024;
+const LOG_PAGE_SIZE = 200;
+const MAX_LOG_EVENTS = 400;
+const MAX_LOG_RENDER_CHARS = 512 * 1024;
+const timeFormatters = new Map();
 
 const state = {
     data: null,
     selectedProfileId: "",
     selectedTaskId: "",
     scheduleTaskId: "",
+    fileRequestId: 0,
+    refreshRequestId: 0,
+    creatingTask: false,
+    deduplicatingTasks: false,
+    deletingTaskIds: new Set(),
+    responseEtags: new Map(),
+    pollTimer: null,
+    pollInFlight: false,
+    pollFailures: 0,
     dashboardHighlightTimer: null,
     activeView: "dashboard",
     log: {
@@ -66,6 +79,13 @@ const state = {
         following: true,
         requestId: 0,
         abortController: null,
+        renderVersion: 0,
+        totalEvents: 0,
+        firstCursor: 0,
+        hasMoreBefore: false,
+        hasMoreAfter: false,
+        historyMode: false,
+        sourceSignature: "",
     },
 };
 
@@ -84,13 +104,13 @@ function escapeHtml(value) {
 function formatTime(value) {
     if (!value) return "-";
     try {
-        return new Intl.DateTimeFormat(i18n.getLocale(), {
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-        }).format(new Date(value));
+        const locale = i18n.getLocale();
+        if (!timeFormatters.has(locale)) {
+            timeFormatters.set(locale, new Intl.DateTimeFormat(locale, {
+                month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+            }));
+        }
+        return timeFormatters.get(locale).format(new Date(value));
     } catch {
         return value;
     }
@@ -395,7 +415,35 @@ function renderConversationLog({ forceFollow = false } = {}) {
     const previousScrollTop = view.scrollTop;
     const shouldFollow = forceFollow || state.log.following;
     view.setAttribute("aria-busy", String(state.log.loading));
+    const renderKey = JSON.stringify([state.log.taskId, state.log.runId, state.log.renderVersion, state.log.error,
+        state.log.events.length === 0 && !state.log.content && state.log.loading, i18n.getLanguage()]);
 
+    if (view.dataset.renderKey !== renderKey) {
+        view.dataset.renderKey = renderKey;
+        renderConversationBody(view);
+    }
+
+    const eventCount = state.log.events.length;
+    const format = translatedOr(`logFormat.${state.log.format}`, state.log.format || "empty");
+    const runLabel = state.log.runId
+        ? runSummaryLabel((state.log.runs || []).find((run) => run.runId === state.log.runId) || { runId: state.log.runId })
+        : t("runtime.allRuns");
+    $("#logSummary").textContent = state.log.taskId
+        ? `${t("runtime.eventWindow", { count: eventCount, total: state.log.totalEvents || eventCount })} · ${runLabel} · ${format}`
+        : t("runtime.noTask");
+    $("#logCursor").textContent = state.log.taskId
+        ? `${translatedOr("runtime.cursor", "Cursor", { value: state.log.nextCursor || 0 })} · ${state.log.loading ? t("runtime.syncing") : t("runtime.synced")}`
+        : "";
+    $("#olderLog").disabled = state.log.loading || !state.log.hasMoreBefore || !state.log.firstCursor;
+    renderLogRunOptions();
+    renderLogNotice();
+    setLogFollowing(state.log.following);
+
+    if (shouldFollow) view.scrollTop = view.scrollHeight;
+    else view.scrollTop = previousScrollTop;
+}
+
+function renderConversationBody(view) {
     if (state.log.loading && state.log.events.length === 0 && !state.log.content) {
         view.innerHTML = `
             <div class="log-state log-state-loading">
@@ -441,26 +489,6 @@ function renderConversationLog({ forceFollow = false } = {}) {
         `;
     }
 
-    const eventCount = state.log.events.length;
-    const format = translatedOr(`logFormat.${state.log.format}`, state.log.format || "empty");
-    const runLabel = state.log.runId
-        ? runSummaryLabel((state.log.runs || []).find((run) => run.runId === state.log.runId) || { runId: state.log.runId })
-        : t("runtime.allRuns");
-    $("#logSummary").textContent = state.log.taskId
-        ? `${translatedOr("runtime.eventCount", `${eventCount} events`, { count: eventCount })} · ${runLabel} · ${format}`
-        : t("runtime.noTask");
-    $("#logCursor").textContent = state.log.taskId
-        ? `${translatedOr("runtime.cursor", "Cursor", { value: state.log.nextCursor || 0 })} · ${state.log.loading ? t("runtime.syncing") : t("runtime.synced")}`
-        : "";
-    renderLogRunOptions();
-    renderLogNotice();
-    setLogFollowing(state.log.following);
-
-    if (shouldFollow) {
-        view.scrollTop = view.scrollHeight;
-    } else {
-        view.scrollTop = previousScrollTop;
-    }
 }
 
 function logPlainText() {
@@ -551,13 +579,17 @@ function toast(message) {
 }
 
 async function api(path, options = {}) {
+    const { conditional = false, ...requestOptions } = options;
+    const etag = conditional ? state.responseEtags.get(path) : null;
     const response = await fetch(path, {
-        headers: { "content-type": "application/json" },
-        ...options,
-        body: options.body ? JSON.stringify(options.body) : undefined,
+        ...requestOptions,
+        headers: { "content-type": "application/json", ...requestOptions.headers, ...(etag ? { "if-none-match": etag } : {}) },
+        body: requestOptions.body ? JSON.stringify(requestOptions.body) : undefined,
     });
+    if (response.status === 304) return null;
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || t("api.requestFailed"));
+    if (conditional && response.headers.get("etag")) state.responseEtags.set(path, response.headers.get("etag"));
     return payload;
 }
 
@@ -786,6 +818,7 @@ function renderTasks() {
                         <span class="badge ${escapeHtml(task.archived ? "completed" : runtimeState)}">${escapeHtml(status)}</span>
                         <button class="ghost" type="button" data-open-history="${escapeHtml(task.id)}" data-open-task="${escapeHtml(task.id)}">${escapeHtml(t("common.logs"))}</button>
                         ${task.archived ? "" : `<button class="ghost" type="button" data-archive-task="${escapeHtml(task.id)}">${escapeHtml(t("task.archive"))}</button>`}
+                        <button class="danger" type="button" data-delete-task="${escapeHtml(task.id)}" aria-label="${escapeHtml(t("task.deleteLabel", { name: task.title }))}" ${taskCanDelete(task) ? "" : `disabled title="${escapeHtml(t("task.deleteBusy"))}"`}>${escapeHtml(t("common.delete"))}</button>
                     </div>
                 </article>`;
         };
@@ -810,6 +843,7 @@ function renderTasks() {
     }).join("");
     $("#taskList").innerHTML = projectMarkup || empty;
     $("#taskCount").textContent = i18n.count("task.count", tasks.length);
+    $("#deduplicateTasks").disabled = state.deduplicatingTasks || currentTasks.length < 2;
 }
 
 function renderEvents() {
@@ -1065,6 +1099,12 @@ function taskCanAppend(task) {
     return !["queued", "running", "scheduled", "retry_wait"].includes(String(task.status || ""));
 }
 
+function taskCanDelete(task) {
+    return Boolean(task && task.canDelete !== false && !state.deletingTaskIds.has(task.id)
+        && !task.isRunning && !task.loopActive && !task.activeProcess
+        && !["queued", "running", "scheduled", "retry_wait"].includes(String(task.status || "")));
+}
+
 function renderRuntimeContext(task) {
     const subtitle = $("#runtimeTaskSubtitle");
     const badge = $("#runtimeStatusBadge");
@@ -1073,6 +1113,7 @@ function renderRuntimeContext(task) {
     const appendStandard = $("#appendCompletionStandard");
     const eligibility = $("#appendEligibility");
     const archiveButton = $("#archiveTask");
+    const deleteButton = $("#deleteTask");
     const runtimeEditor = $("#runtimeFileEditor");
     const runtimeFileHint = $("#runtimeFileHint");
     const runtimeButtons = [$("#startTask"), $("#scheduleTask"), $("#decomposeTask"), $("#stopTask")].filter(Boolean);
@@ -1090,6 +1131,7 @@ function renderRuntimeContext(task) {
             eligibility.textContent = t("runtime.appendUnavailable");
         }
         if (archiveButton) archiveButton.disabled = true;
+        if (deleteButton) deleteButton.disabled = true;
         if (runtimeEditor) runtimeEditor.disabled = true;
         if (runtimeFileHint) runtimeFileHint.textContent = t("editor.noTask");
         runtimeButtons.forEach((button) => { button.disabled = true; });
@@ -1104,6 +1146,10 @@ function renderRuntimeContext(task) {
     const archived = task.archived === true;
     const busy = task.isRunning || task.loopActive || ["queued", "running", "scheduled", "retry_wait"].includes(String(task.status || ""));
     if (archiveButton) archiveButton.disabled = archived || busy;
+    if (deleteButton) {
+        deleteButton.disabled = !taskCanDelete(task);
+        deleteButton.title = taskCanDelete(task) ? "" : t("task.deleteBusy");
+    }
     if (runtimeEditor) runtimeEditor.disabled = archived;
     if (runtimeFileHint) runtimeFileHint.textContent = archived ? t("runtime.fileArchived") : t("runtime.fileEditable");
     if (runtimeButtons[0]) runtimeButtons[0].disabled = archived || busy;
@@ -1206,16 +1252,44 @@ function renderAll() {
     renderTasks();
     renderEvents();
     renderProfiles();
-    renderPings();
+    if (state.activeView === "pings") renderPings();
     renderSelectors();
     renderProjects();
     renderDirectories();
-    renderRunDetail();
+    if (state.activeView === "runtime") renderRunDetail();
 }
 
-async function refresh() {
-    state.data = await api("/api/state");
+async function refresh({ replacementTaskId = "" } = {}) {
+    const requestId = ++state.refreshRequestId;
+    const incoming = await api(`/api/state?compact=1${state.activeView === "pings" ? "&includePings=1" : ""}`, { conditional: true });
+    if (requestId !== state.refreshRequestId) return;
+    const data = incoming || state.data;
+    if (!data) return;
+    const replacementExists = replacementTaskId && (data.tasks || []).some((task) => task.id === replacementTaskId);
+    const selectionRemoved = (state.selectedTaskId && !(data.tasks || []).some((task) => task.id === state.selectedTaskId))
+        || (replacementExists && state.selectedTaskId !== replacementTaskId);
+    if (!incoming && !selectionRemoved) return;
+    state.data = { ...state.data, ...data };
+    if (selectionRemoved) {
+        state.selectedTaskId = replacementExists ? replacementTaskId : "";
+        state.scheduleTaskId = "";
+        state.fileRequestId += 1;
+        for (const selector of ["#fileEditor", "#runtimeFileEditor", "#appendTaskItems", "#appendCompletionStandard"]) {
+            if ($(selector)) $(selector).value = "";
+        }
+        for (const selector of ["#editorPath", "#runtimeEditorPath"]) {
+            if ($(selector)) $(selector).textContent = t("editor.noTask");
+        }
+        $("#runProfiles").innerHTML = "";
+        await loadLog("");
+    }
     renderAll();
+    if (selectionRemoved && state.selectedTaskId) {
+        await loadFile(state.selectedTaskId);
+        if (state.activeView === "runtime" && state.selectedTaskId) {
+            await loadLog(state.selectedTaskId, { runId: "", forceFollow: true });
+        }
+    }
 }
 
 function updateTokenPlaceholder(profile = null) {
@@ -1339,7 +1413,9 @@ function applySelectedTaskFile(file) {
 async function loadFile(taskId) {
     const task = (state.data?.tasks || []).find((item) => item.id === taskId);
     if (!task) return;
+    const requestId = ++state.fileRequestId;
     const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/file`);
+    if (requestId !== state.fileRequestId || !(state.data?.tasks || []).some((item) => item.id === taskId)) return;
     $("#fileEditor").value = result.content;
     $("#editorPath").textContent = result.filePath;
     if ($("#runtimeFileEditor")) $("#runtimeFileEditor").value = result.content;
@@ -1347,6 +1423,27 @@ async function loadFile(taskId) {
     state.selectedTaskId = taskId;
     $("#editorTask").value = taskId;
     $("#runTask").value = taskId;
+}
+
+async function deleteTask(taskId) {
+    const task = (state.data?.tasks || []).find((item) => item.id === taskId);
+    if (!task) return;
+    if (!taskCanDelete(task)) return toast(t("task.deleteBusy"));
+    if (!window.confirm(t("task.deleteConfirm", { name: task.title }))) return;
+    state.deletingTaskIds.add(taskId);
+    renderTasks();
+    renderRunDetail();
+    try {
+        await api(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+        await refresh();
+        toast(t("toast.taskDeleted"));
+    } catch (error) {
+        toast(error.message);
+    } finally {
+        state.deletingTaskIds.delete(taskId);
+        renderTasks();
+        renderRunDetail();
+    }
 }
 
 function mergeLogEvents(current, incoming) {
@@ -1363,6 +1460,18 @@ function mergeLogEvents(current, incoming) {
     });
 }
 
+function boundLogEvents(events) {
+    let start = events.length;
+    let characters = 0;
+    while (start > 0 && events.length - start < MAX_LOG_EVENTS) {
+        const length = String(events[start - 1].text || "").length;
+        if (start < events.length && characters + length > MAX_LOG_RENDER_CHARS) break;
+        characters += length;
+        start -= 1;
+    }
+    return events.slice(start);
+}
+
 function cancelLogRequest() {
     const controller = state.log.abortController;
     if (!controller) return;
@@ -1373,6 +1482,7 @@ function cancelLogRequest() {
 }
 
 async function loadLog(taskId, options = {}) {
+    if (options.incremental && state.log.loading) return null;
     cancelLogRequest();
     if (!taskId) {
         state.log.requestId += 1;
@@ -1393,6 +1503,12 @@ async function loadLog(taskId, options = {}) {
             loading: false,
             error: "",
             following: true,
+            totalEvents: 0,
+            firstCursor: 0,
+            hasMoreBefore: false,
+            hasMoreAfter: false,
+            historyMode: false,
+            sourceSignature: "",
         });
         renderConversationLog();
         return null;
@@ -1406,6 +1522,7 @@ async function loadLog(taskId, options = {}) {
         && requestedRunId === state.log.runId
         && !state.log.error;
     const afterSequence = incremental ? Number(state.log.nextCursor || 0) : 0;
+    const beforeSequence = Math.max(0, Number(options.beforeSequence) || 0);
     const requestId = state.log.requestId + 1;
     const abortController = new AbortController();
     state.log.requestId = requestId;
@@ -1426,15 +1543,19 @@ async function loadLog(taskId, options = {}) {
         state.log.status = "missing";
         state.log.nextCursor = 0;
         state.log.warnings = [];
-        state.log.following = true;
-        renderConversationLog({ forceFollow: true });
+        state.log.following = !beforeSequence;
+        state.log.historyMode = beforeSequence > 0;
+        state.log.renderVersion += 1;
+        renderConversationLog({ forceFollow: !beforeSequence });
     } else {
         renderLogRunOptions();
     }
 
     const params = new URLSearchParams();
+    params.set("limit", String(LOG_PAGE_SIZE));
     if (requestedRunId) params.set("runId", requestedRunId);
     if (afterSequence > 0) params.set("after", String(afterSequence));
+    if (beforeSequence > 0) params.set("before", String(beforeSequence));
     const query = params.toString();
     try {
         const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/log${query ? `?${query}` : ""}`, {
@@ -1442,12 +1563,23 @@ async function loadLog(taskId, options = {}) {
         });
         if (requestId !== state.log.requestId) return null;
         state.log.abortController = null;
+        if (incremental && result.latestCursor !== undefined && Number(result.latestCursor) < afterSequence) {
+            return loadLog(taskId, { runId: requestedRunId, forceFollow: true });
+        }
         const incomingEvents = Array.isArray(result.events) ? result.events : [];
-        state.log.events = incremental
+        const previousContent = state.log.content;
+        state.log.events = boundLogEvents(incremental
             ? mergeLogEvents(state.log.events, incomingEvents)
-            : mergeLogEvents([], incomingEvents);
+            : mergeLogEvents([], incomingEvents));
         const contentPreview = legacyLogPreview(result.content || state.log.content || "");
         state.log.content = contentPreview.content;
+        if (!incremental || incomingEvents.length || state.log.content !== previousContent) state.log.renderVersion += 1;
+        state.log.totalEvents = Number(result.totalEvents || state.log.events.length);
+        state.log.firstCursor = Number(state.log.events[0]?.sequence || 0);
+        state.log.hasMoreBefore = result.oldestCursor !== undefined
+            ? state.log.firstCursor > Number(result.oldestCursor)
+            : result.hasMoreBefore === true;
+        state.log.hasMoreAfter = result.hasMoreAfter === true;
         state.log.contentBytes = Number(result.contentBytes || 0);
         state.log.contentReturnedBytes = Number(result.contentReturnedBytes || 0);
         state.log.contentOmittedBytes = Number(result.contentOmittedBytes || 0);
@@ -1475,8 +1607,10 @@ async function loadLog(taskId, options = {}) {
         state.log.error = "";
         state.log.runId = String(result.runId || requestedRunId || "");
         state.selectedTaskId = taskId;
+        const task = (state.data?.tasks || []).find((item) => item.id === taskId);
+        state.log.sourceSignature = taskLogSignature(task);
         if ($("#runTask")) $("#runTask").value = taskId;
-        renderConversationLog({ forceFollow: options.forceFollow === true || !incremental });
+        renderConversationLog({ forceFollow: options.forceFollow === true || (!incremental && !beforeSequence) });
         return result;
     } catch (error) {
         if (requestId !== state.log.requestId) return null;
@@ -1495,6 +1629,10 @@ function switchView(view) {
     state.activeView = view;
     $$(".nav").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
     $$(".view").forEach((node) => node.classList.toggle("active", node.id === view));
+    if (view === "pings" && state.data) {
+        renderPings();
+        refresh().catch((error) => toast(error.message));
+    }
 }
 
 function clearDashboardHighlights() {
@@ -1709,41 +1847,82 @@ function bindEvents() {
     });
     $("#taskForm").addEventListener("submit", async (event) => {
         event.preventDefault();
-        const form = event.currentTarget;
-        const formData = new FormData(form);
-        const body = Object.fromEntries(formData.entries());
-        delete body.sourceFile;
-        body.projectId = form.elements.projectId.value || "";
-        body.directory = form.elements.directory.value || "";
-        body.runProfileIds = formData.getAll("runProfileIds").filter(Boolean);
-        body.overwrite = form.elements.overwrite.checked;
-        body.sourceMode = form.elements.sourceMode.value || "agent";
-        if (body.sourceMode === "upload") {
-            const file = form.elements.sourceFile.files?.[0];
-            if (!file) return toast(t("toast.selectTaskFile"));
-            applySelectedTaskFile(file);
-            if (!String(body.targetFileName || "").trim()) body.targetFileName = file.name;
-            if (!String(body.title || "").trim()) body.title = file.name.replace(/\.[^.]+$/, "") || file.name;
-            body.sourceContent = await file.text();
+        if (state.creatingTask) return;
+        state.creatingTask = true;
+        const submitButton = $("#taskSubmitButton");
+        submitButton.disabled = true;
+        try {
+            const form = event.currentTarget;
+            const formData = new FormData(form);
+            const body = Object.fromEntries(formData.entries());
+            delete body.sourceFile;
+            body.projectId = form.elements.projectId.value || "";
+            body.directory = form.elements.directory.value || "";
+            body.runProfileIds = formData.getAll("runProfileIds").filter(Boolean);
+            body.overwrite = form.elements.overwrite.checked;
+            body.sourceMode = form.elements.sourceMode.value || "agent";
+            if (body.sourceMode === "upload") {
+                const file = form.elements.sourceFile.files?.[0];
+                if (!file) return toast(t("toast.selectTaskFile"));
+                applySelectedTaskFile(file);
+                if (!String(body.targetFileName || "").trim()) body.targetFileName = file.name;
+                if (!String(body.title || "").trim()) body.title = file.name.replace(/\.[^.]+$/, "") || file.name;
+                body.sourceContent = await file.text();
+            }
+            const result = await api("/api/tasks", { method: "POST", body });
+            state.selectedTaskId = result.task.id;
+            await refresh();
+            await loadFile(result.task.id);
+            switchView("editor");
+            if (result.deduplicated) {
+                toast(t("toast.taskReused"));
+            } else if (result.generation?.failed) {
+                toast(t("toast.generationFailed", { code: result.generation.exitCode ?? "-" }));
+            } else if (body.sourceMode === "existing") {
+                toast(t("toast.taskLoaded"));
+            } else if (body.sourceMode === "upload") {
+                toast(t("toast.taskImported"));
+            } else {
+                toast(t("toast.taskGenerated"));
+            }
+        } catch (error) {
+            toast(error.message);
+        } finally {
+            state.creatingTask = false;
+            submitButton.disabled = false;
         }
-        const result = await api("/api/tasks", { method: "POST", body });
-        state.selectedTaskId = result.task.id;
-        await refresh();
-        await loadFile(result.task.id);
-        switchView("editor");
-        if (result.generation?.failed) {
-            toast(t("toast.generationFailed", { code: result.generation.exitCode ?? "-" }));
-        } else if (body.sourceMode === "existing") {
-            toast(t("toast.taskLoaded"));
-        } else if (body.sourceMode === "upload") {
-            toast(t("toast.taskImported"));
-        } else {
-            toast(t("toast.taskGenerated"));
+    });
+
+    $("#deduplicateTasks").addEventListener("click", async () => {
+        if (state.deduplicatingTasks) return;
+        if (!window.confirm(t("task.deduplicateConfirm"))) return;
+        state.deduplicatingTasks = true;
+        $("#deduplicateTasks").disabled = true;
+        const selectedTaskId = state.selectedTaskId;
+        try {
+            const result = await api("/api/tasks/deduplicate", { method: "POST" });
+            const replacement = result.duplicates.find((entry) => entry.taskId === selectedTaskId);
+            await refresh({ replacementTaskId: replacement?.keptTaskId || "" });
+            toast(result.deletedCount || result.skippedCount
+                ? t("toast.tasksDeduplicated", { count: result.deletedCount, skipped: result.skippedCount })
+                : t("toast.noDuplicateTasks"));
+        } catch (error) {
+            toast(error.message);
+        } finally {
+            state.deduplicatingTasks = false;
+            renderTasks();
         }
     });
 
     $("#taskList").addEventListener("click", async (event) => {
-        const target = event.target.closest ? event.target.closest("[data-open-history], [data-open-task], [data-edit-task], [data-archive-task]") : event.target;
+        const target = event.target.closest ? event.target.closest("[data-open-history], [data-open-task], [data-edit-task], [data-archive-task], [data-delete-task]") : event.target;
+        if (target?.disabled) return;
+        const deleteId = target?.dataset?.deleteTask;
+        if (deleteId) {
+            event.stopPropagation();
+            await deleteTask(deleteId);
+            return;
+        }
         const historyId = target?.dataset?.openHistory;
         const openId = target?.dataset?.openTask;
         const editId = target?.dataset?.editTask;
@@ -1838,11 +2017,23 @@ function bindEvents() {
     });
     $("#logView").addEventListener("scroll", (event) => {
         if (state.log.loading) return;
-        setLogFollowing(isLogNearBottom(event.currentTarget));
+        setLogFollowing(!state.log.historyMode && isLogNearBottom(event.currentTarget));
     }, { passive: true });
-    $("#followLog").addEventListener("click", () => {
-        const shouldFollow = !state.log.following;
-        setLogFollowing(shouldFollow, shouldFollow);
+    $("#followLog").addEventListener("click", async () => {
+        if (state.log.following) return setLogFollowing(false);
+        try {
+            await loadLog(state.log.taskId, { forceFollow: true });
+        } catch (error) {
+            toast(error.message);
+        }
+    });
+    $("#olderLog").addEventListener("click", async () => {
+        if (!state.log.hasMoreBefore || !state.log.firstCursor || state.log.loading) return;
+        try {
+            await loadLog(state.log.taskId, { beforeSequence: state.log.firstCursor });
+        } catch (error) {
+            toast(error.message);
+        }
     });
     $("#runProfiles").addEventListener("change", (event) => {
         state.selectedProfileId = selectedValues(event.target)[0] || state.selectedProfileId;
@@ -2004,6 +2195,7 @@ function bindEvents() {
             toast(error.message);
         }
     });
+    $("#deleteTask").addEventListener("click", () => deleteTask($("#runTask").value || state.selectedTaskId));
 
     $("#pingEnabled").addEventListener("change", async (event) => {
         await api("/api/pings/settings", {
@@ -2095,12 +2287,48 @@ function bindEvents() {
 }
 
 function tickClock() {
-    $("#serverClock").textContent = new Intl.DateTimeFormat(i18n.getLocale(), {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-    }).format(new Date());
+    if (document.hidden) return;
+    const key = `clock:${i18n.getLocale()}`;
+    if (!timeFormatters.has(key)) {
+        timeFormatters.set(key, new Intl.DateTimeFormat(i18n.getLocale(), {
+            hour: "2-digit", minute: "2-digit", second: "2-digit",
+        }));
+    }
+    $("#serverClock").textContent = timeFormatters.get(key).format(new Date());
     syncScheduleInput();
+}
+
+function taskLogSignature(task) {
+    return task ? `${task.id}:${task.logSize || 0}:${task.updatedAt || ""}:${task.status}` : "";
+}
+
+async function poll() {
+    if (state.pollInFlight || document.hidden) return;
+    clearTimeout(state.pollTimer);
+    state.pollInFlight = true;
+    try {
+        await refresh();
+        const currentTask = $("#runTask").value || state.selectedTaskId;
+        const task = (state.data?.tasks || []).find((item) => item.id === currentTask);
+        if (task && state.activeView === "runtime" && state.log.following && !state.log.historyMode
+            && (state.log.sourceSignature !== taskLogSignature(task) || state.log.hasMoreAfter)) {
+            await loadLog(currentTask, { incremental: true, silent: true });
+        }
+        state.pollFailures = 0;
+    } catch (error) {
+        state.pollFailures += 1;
+        if (state.pollFailures === 1) toast(error.message);
+    } finally {
+        state.pollInFlight = false;
+        if (!document.hidden) {
+            const active = (state.data?.tasks || []).some((task) => task.isRunning
+                || ["running", "queued", "scheduled", "retry_wait"].includes(task.status));
+            const delay = state.pollFailures ? Math.min(30000, 5000 * state.pollFailures)
+                : state.activeView === "runtime" && state.log.following && state.log.hasMoreAfter ? 100
+                    : active ? 2000 : 5000;
+            state.pollTimer = setTimeout(poll, delay);
+        }
+    }
 }
 
 async function boot() {
@@ -2115,24 +2343,12 @@ async function boot() {
     if (firstTask) {
         await loadFile(firstTask.id);
     }
-    setInterval(async () => {
-        try {
-            await refresh();
-            const currentTask = $("#runTask").value || state.selectedTaskId;
-            const task = (state.data?.tasks || []).find((item) => item.id === currentTask);
-            const shouldPollLog = task && (
-                task.isRunning
-                || task.loopActive
-                || task.activeProcess
-                || ["running", "scheduled", "retry_wait"].includes(String(task.status || ""))
-            );
-            if (currentTask && state.activeView === "runtime" && shouldPollLog) {
-                await loadLog(currentTask, { incremental: true, silent: true });
-            }
-        } catch (error) {
-            toast(error.message);
-        }
-    }, 2000);
+    state.pollTimer = setTimeout(poll, 2000);
+    document.addEventListener("visibilitychange", () => {
+        clearTimeout(state.pollTimer);
+        if (document.hidden) cancelLogRequest();
+        else poll();
+    });
 }
 
 window.addEventListener("error", (event) => toast(event.message));

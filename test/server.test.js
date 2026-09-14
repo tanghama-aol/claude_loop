@@ -474,7 +474,7 @@ test("server closes agent stdin so commands do not wait for additional input", a
         "process.stdin.on(\"data\", (chunk) => { input += chunk; });",
         "await new Promise((resolve) => process.stdin.on(\"end\", resolve));",
         "console.log(input ? `stdin-open:${input.trim()}` : \"stdin-closed\");",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -514,7 +514,7 @@ test("server closes agent stdin so commands do not wait for additional input", a
     assert.match(task.lastOutput, /stdin-closed/);
 });
 
-test("server still accepts the legacy all-done marker", async (t) => {
+test("server rejects a single all-done marker", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
     const server = createApp({
@@ -527,12 +527,12 @@ test("server still accepts the legacy all-done marker", async (t) => {
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const script = writeAgentScript(tempRoot, "agent-legacy-all-done.sh", "console.log(\"全部任务完成\");");
+    const script = writeAgentScript(tempRoot, "agent-incomplete-all-done.sh", "console.log(\"GGGG全部完成GGGG\");");
 
     const profile = await request(server, "/api/profiles", {
         method: "POST",
         body: {
-            name: "legacy-all-done-agent",
+            name: "incomplete-all-done-agent",
             agentType: "claude",
             command: script.command,
             args: script.args,
@@ -543,9 +543,9 @@ test("server still accepts the legacy all-done marker", async (t) => {
     const created = await request(server, "/api/tasks", {
         method: "POST",
         body: {
-            title: "legacy all done",
-            requirement: "legacy marker compatibility",
-            targetFileName: "legacy-all-done.md",
+            title: "strict all done",
+            requirement: "a single marker must not finish the task",
+            targetFileName: "strict-all-done.md",
             directory: tempRoot,
             sourceMode: "template",
             decomposeProfileId: profile.profile.id,
@@ -560,9 +560,13 @@ test("server still accepts the legacy all-done marker", async (t) => {
 
     const task = await waitFor(async () => {
         const state = await request(server, "/api/state");
-        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "retry_wait");
     });
     assert.equal(task.lastExitCode, 0);
+    assert.notEqual(task.status, "all_done");
+
+    const log = await request(server, `/api/tasks/${created.task.id}/log`);
+    assert.equal(log.events.some((event) => event.type === "task_all_done"), false);
 });
 
 test("server exposes active agent process while a task is running", async (t) => {
@@ -581,7 +585,7 @@ test("server exposes active agent process while a task is running", async (t) =>
     const script = writeAgentScript(tempRoot, "agent-sleep.sh", [
         "console.log(\"started\");",
         "await sleep(1000);",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -706,7 +710,7 @@ test("server can schedule a task to start once in the future", async (t) => {
     const markerPath = path.join(tempRoot, "scheduled-marker.txt");
     const script = writeAgentScript(tempRoot, "agent-scheduled.sh", [
         `fs.writeFileSync(${JSON.stringify(markerPath)}, "started", "utf8");`,
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -766,7 +770,7 @@ test("server starts a task when its Profile becomes available", async (t) => {
         "    console.error(\"model unavailable\");",
         "    process.exit(2);",
         "}",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -865,7 +869,7 @@ test("server cancels a scheduled task when it is stopped", async (t) => {
     const markerPath = path.join(tempRoot, "cancelled-marker.txt");
     const script = writeAgentScript(tempRoot, "agent-cancelled.sh", [
         `fs.writeFileSync(${JSON.stringify(markerPath)}, "started", "utf8");`,
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -933,7 +937,7 @@ test("server exposes ordered structured task log events with raw output", async 
     const script = writeAgentScript(tempRoot, "agent-structured-log.sh", [
         "console.log(\"first line\\nsecond line\");",
         "console.error(\"warning one\\nwarning two\");",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const profile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1022,7 +1026,7 @@ test("server incrementally persists isolated run logs and reloads them after res
         "console.log(`run-${count}-begin`);",
         "await sleep(350);",
         "console.error(`run-${count}-warning`);",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const profile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1143,7 +1147,7 @@ test("server completes a durable lifecycle with rich output and historical appen
         "    const current = fs.readFileSync(targetPath, \"utf8\");",
         "    fs.writeFileSync(targetPath, current.replace(\"- [ ] 2. \", \"- [x] 2. \"), \"utf8\");",
         "    console.log(\"第二轮完成 ✓\");",
-        "    console.log(\"GGGG全部完成GGGG\");",
+        "    console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
         "}",
     ].join("\n"));
 
@@ -1451,7 +1455,7 @@ test("server logs real prompt and rotates to next profile after failure", async 
         fs.rmSync(tempData, { recursive: true, force: true });
     });
     const failScript = writeAgentScript(tempRoot, "agent-429.sh", "console.log(\"429\");");
-    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "console.log(\"GGGG全部完成GGGG\");");
+    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");");
 
     const failProfile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1527,7 +1531,7 @@ test("server selects the first available task Profile in configured order", asyn
         "    return;",
         "}",
         `fs.writeFileSync(${JSON.stringify(availableRun)}, "ran", "utf8");`,
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -1618,7 +1622,7 @@ test("server applies profile config directory to agent environment", async (t) =
     });
     const script = writeAgentScript(tempRoot, "agent-config.sh", [
         "console.log(process.env.CODEX_HOME || \"\");",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -2604,7 +2608,7 @@ test("server groups tasks by project, queues same-project runs, and archives tar
     const agent = writeAgentScript(tempRoot, "agent-project-queue.js", [
         `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
         "await sleep(100);",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -2709,7 +2713,7 @@ test("server serializes tasks from different projects that share one working dir
     const agent = writeAgentScript(tempRoot, "agent-directory-queue.js", [
         `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
         "await sleep(100);",
-        "console.log(\"GGGG全部完成GGGG\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -2845,4 +2849,332 @@ test("server preserves a requested directory when assigning legacy and unbound p
     });
     assert.equal(deleteInUse.statusCode, 409);
     assert.match(deleteInUse.json().error, /目录仍包含任务/);
+});
+
+function taskManagementFixture(t) {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-task-management-"));
+    const dataDir = path.join(rootDir, ".data");
+    const options = { rootDir, dataDir, disablePingScheduler: true };
+    const server = createApp(options);
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(rootDir, { recursive: true, force: true });
+    });
+    return {
+        server,
+        options,
+        rootDir,
+        dataDir,
+        statePath: path.join(dataDir, "state.json"),
+        createTask: async (fileName, overrides = {}) => (await request(server, "/api/tasks", {
+            method: "POST",
+            body: {
+                title: fileName,
+                targetFileName: fileName,
+                directory: rootDir,
+                sourceMode: "template",
+                requirement: "保留原始任务内容",
+                ...overrides,
+            },
+        })).task,
+    };
+}
+
+test("server deletes task records while preserving files, artifacts, logs and unrelated tasks", async (t) => {
+    const { server, createTask, options } = taskManagementFixture(t);
+    const task = await createTask("delete-me.md", { taskType: "image", outputFileName: "result.png" });
+    const other = await createTask("keep-me.md");
+    const artifactPath = path.join(task.artifactDirectory, "result.png");
+    fs.writeFileSync(artifactPath, "preserved image");
+    const log = await request(server, `/api/tasks/${task.id}/log`);
+    const preservedPaths = [task.filePath, artifactPath, log.logPath, log.eventLogPath];
+    const contents = preservedPaths.map((filePath) => fs.readFileSync(filePath));
+
+    const removed = await request(server, `/api/tasks/${task.id}`, { method: "DELETE" });
+    assert.equal(removed.deletedTaskId, task.id);
+    const state = await request(server, "/api/state");
+    assert.deepEqual(state.tasks.map((item) => item.id), [other.id]);
+    assert.equal(state.projects[0].currentTaskCount, 1);
+    assert.equal(state.projectTaskTree[0].current.length, 1);
+    assert.equal(state.events.some((event) => event.taskId === task.id), false);
+    preservedPaths.forEach((filePath, index) => assert.deepEqual(fs.readFileSync(filePath), contents[index]));
+    for (const suffix of ["", "/file", "/log"]) {
+        const missing = await server.inject({ method: suffix ? "GET" : "DELETE", path: `/api/tasks/${task.id}${suffix}` });
+        assert.equal(missing.statusCode, 404);
+    }
+
+    const reloaded = createApp(options);
+    try {
+        assert.deepEqual((await request(reloaded, "/api/state")).tasks.map((item) => item.id), [other.id]);
+    } finally {
+        reloaded.closeRunners();
+    }
+    const imported = await createTask("delete-me.md", { sourceMode: "existing" });
+    assert.notEqual(imported.id, task.id);
+    assert.deepEqual(fs.readFileSync(imported.filePath), contents[0]);
+});
+
+test("server can delete an archived task without removing its archive", async (t) => {
+    const { server, createTask } = taskManagementFixture(t);
+    const task = await createTask("archive-delete.md");
+    const { task: archived } = await request(server, `/api/tasks/${task.id}/archive`, { method: "POST" });
+    const log = await request(server, `/api/tasks/${task.id}/log`);
+    const paths = [archived.filePath, path.join(archived.archiveDirectory, "task.json"), log.logPath, log.eventLogPath];
+    const contents = paths.map((filePath) => fs.readFileSync(filePath));
+    assert.equal((await request(server, "/api/state")).tasks[0].canDelete, true);
+    await request(server, `/api/tasks/${task.id}`, { method: "DELETE" });
+    assert.equal((await request(server, "/api/state")).tasks.length, 0);
+    paths.forEach((filePath, index) => assert.deepEqual(fs.readFileSync(filePath), contents[index]));
+});
+
+test("server rejects deleting active task states and permits deletion after cancelling a schedule", async (t) => {
+    const { server, createTask, statePath } = taskManagementFixture(t);
+    const task = await createTask("busy.md");
+    for (const status of ["running", "queued", "scheduled", "retry_wait"]) {
+        const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+        saved.tasks[0].status = status;
+        fs.writeFileSync(statePath, JSON.stringify(saved));
+        const denied = await server.inject({ method: "DELETE", path: `/api/tasks/${task.id}` });
+        assert.equal(denied.statusCode, 409, status);
+        assert.equal((await request(server, "/api/state")).tasks[0].canDelete, false, status);
+        assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).tasks[0].status, status);
+    }
+    await request(server, `/api/tasks/${task.id}/stop`, { method: "POST" });
+    const state = await request(server, "/api/state");
+    await request(server, `/api/tasks/${task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [state.profiles[0].id], startAt: new Date(Date.now() + 60000).toISOString() },
+    });
+    assert.equal((await server.inject({ method: "DELETE", path: `/api/tasks/${task.id}` })).statusCode, 409);
+    await request(server, `/api/tasks/${task.id}/stop`, { method: "POST" });
+    await request(server, `/api/tasks/${task.id}`, { method: "DELETE" });
+    assert.equal((await request(server, "/api/state")).tasks.length, 0);
+});
+
+test("server reuses duplicate creates before overwriting files or changing task configuration", async (t) => {
+    const { server, createTask, rootDir, dataDir } = taskManagementFixture(t);
+    const original = await createTask("unique.md");
+    const content = fs.readFileSync(original.filePath, "utf8");
+    const otherProject = await request(server, "/api/projects", {
+        method: "POST", body: { name: "同目录的另一个项目", directory: rootDir },
+    });
+    const results = await Promise.all(["existing", "template", "upload", "agent"].map((sourceMode) => request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "重复的标题",
+            directory: path.join(rootDir, "."),
+            projectId: otherProject.project.id,
+            targetFileName: "../unique.md",
+            sourceMode,
+            overwrite: true,
+            sourceContent: "must not overwrite",
+            requirement: "must not regenerate",
+            taskType: "image",
+        },
+    })));
+    for (const result of results) {
+        assert.equal(result.deduplicated, true);
+        assert.equal(result.task.id, original.id);
+        assert.equal(result.task.title, original.title);
+        assert.equal(result.task.projectId, original.projectId);
+        assert.equal(result.task.taskType, "text");
+    }
+    assert.equal((await request(server, "/api/state")).tasks.length, 1);
+    assert.equal(fs.readFileSync(original.filePath, "utf8"), content);
+    assert.equal(fs.existsSync(path.join(rootDir, ".agent-output")), false);
+    assert.equal(fs.readdirSync(path.join(dataDir, "logs")).length, 2);
+
+    const otherFile = await createTask("different.md", { title: original.title });
+    assert.notEqual(otherFile.id, original.id);
+    const otherDirectory = path.join(rootDir, "other");
+    fs.mkdirSync(otherDirectory);
+    await request(server, "/api/directories", { method: "POST", body: { directory: otherDirectory } });
+    const otherTask = await createTask("unique.md", { directory: otherDirectory });
+    assert.notEqual(otherTask.id, original.id);
+});
+
+test("server deduplicates directory aliases even when the target file is missing", { skip: process.platform === "win32" }, async (t) => {
+    const { server, createTask, rootDir } = taskManagementFixture(t);
+    const original = await createTask("aliased.md");
+    const alias = path.join(rootDir, "alias");
+    fs.symlinkSync(rootDir, alias, "dir");
+    await request(server, "/api/directories", { method: "POST", body: { directory: alias } });
+    // Simulate an externally removed target: do not recreate it on a duplicate request.
+    fs.unlinkSync(original.filePath);
+    const result = await request(server, "/api/tasks", {
+        method: "POST",
+        body: { directory: alias, targetFileName: "aliased.md", sourceMode: "template", overwrite: true },
+    });
+    assert.equal(result.deduplicated, true);
+    assert.equal(result.task.id, original.id);
+    assert.equal(fs.existsSync(original.filePath), false);
+    assert.equal((await request(server, "/api/state")).tasks.length, 1);
+});
+
+test("server deduplicates during generation without starting another agent or deleting a live process", async (t) => {
+    const { server, rootDir } = taskManagementFixture(t);
+    const script = writeAgentScript(rootDir, "generator.js", [
+        'fs.appendFileSync("invocations.txt", "run\\n");',
+        'fs.writeFileSync("generating.md", "# generated content");',
+        "await sleep(500);",
+        'console.log("generated");',
+    ].join("\n"));
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "generator", command: script.command, args: script.args, timeoutSeconds: 2 },
+    });
+    const body = {
+        title: "generating", directory: rootDir, targetFileName: "generating.md", sourceMode: "agent",
+        requirement: "generate", decomposeProfileId: profile.profile.id,
+    };
+    const pending = request(server, "/api/tasks", { method: "POST", body });
+    try {
+        const running = await waitFor(async () => {
+            const state = await request(server, "/api/state");
+            return fs.existsSync(path.join(rootDir, "invocations.txt")) && state.tasks.find((task) => task.status === "running");
+        });
+        const repeated = await request(server, "/api/tasks", { method: "POST", body: { ...body, overwrite: true } });
+        assert.equal(repeated.task.id, running.id);
+        assert.equal(repeated.deduplicated, true);
+        assert.equal((await server.inject({ method: "DELETE", path: `/api/tasks/${running.id}` })).statusCode, 409);
+        await request(server, `/api/tasks/${running.id}/stop`, { method: "POST" });
+        assert.equal((await request(server, "/api/state")).tasks[0].canDelete, false);
+        assert.equal((await server.inject({ method: "DELETE", path: `/api/tasks/${running.id}` })).statusCode, 409);
+    } finally {
+        await pending;
+    }
+    assert.equal(fs.readFileSync(path.join(rootDir, "invocations.txt"), "utf8"), "run\n");
+    assert.equal(fs.readFileSync(path.join(rootDir, "generating.md"), "utf8"), "# generated content");
+    const state = await request(server, "/api/state");
+    assert.equal(state.tasks[0].canDelete, true);
+    await request(server, `/api/tasks/${state.tasks[0].id}`, { method: "DELETE" });
+});
+
+test("server cleans legacy duplicates, keeps active and historical tasks, and leaves archives and files intact", async (t) => {
+    const { server, createTask, rootDir, dataDir, statePath } = taskManagementFixture(t);
+    const history = await createTask("history.md");
+    const busy = await createTask("busy.md");
+    const oldest = await createTask("oldest.md");
+    const unrelated = await createTask("unrelated.md", { title: history.title });
+    const archivedSource = await createTask("archived.md");
+    const { task: archived } = await request(server, `/api/tasks/${archivedSource.id}/archive`, { method: "POST" });
+    const recreated = await createTask("archived.md");
+    assert.notEqual(recreated.id, archived.id);
+
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const byId = (id) => saved.tasks.find((task) => task.id === id);
+    Object.assign(byId(history.id), { status: "all_done", lastRunId: "run_history", createdAt: "2020-01-01T00:00:00.000Z" });
+    Object.assign(byId(busy.id), { status: "running", createdAt: "2010-01-01T00:00:00.000Z" });
+    Object.assign(byId(oldest.id), { createdAt: "2000-01-01T00:00:00.000Z" });
+    const duplicateLog = path.join(dataDir, "logs", "legacy-duplicate.log");
+    fs.writeFileSync(duplicateLog, "legacy execution log");
+    saved.tasks.unshift(
+        { ...history, id: "empty_older", createdAt: "1990-01-01T00:00:00.000Z", logFile: "legacy-duplicate.log" },
+        { ...history, id: "empty_newer", createdAt: "2021-01-01T00:00:00.000Z" },
+        { ...busy, id: "busy_queued", status: "queued", createdAt: "2021-01-01T00:00:00.000Z" },
+        { ...busy, id: "busy_empty", createdAt: "1990-01-01T00:00:00.000Z" },
+        { ...oldest, id: "newer_relative", filePath: "./oldest.md", createdAt: "2021-01-01T00:00:00.000Z" },
+    );
+    saved.events.push({ id: "legacy_event", taskId: "empty_older", type: "task", message: "removed task" });
+    fs.writeFileSync(statePath, JSON.stringify(saved));
+    const preservedPaths = [history.filePath, busy.filePath, oldest.filePath, unrelated.filePath, archived.filePath, recreated.filePath, duplicateLog];
+    const contents = preservedPaths.map((filePath) => fs.readFileSync(filePath));
+
+    const result = await request(server, "/api/tasks/deduplicate", { method: "POST" });
+    assert.equal(result.deletedCount, 4);
+    assert.deepEqual(result.deletedTaskIds.slice().sort(), ["busy_empty", "empty_newer", "empty_older", "newer_relative"]);
+    assert.deepEqual(result.skippedTaskIds, ["busy_queued"]);
+    assert.equal(result.skippedCount, 1);
+    assert.equal(result.duplicates.find((item) => item.taskId === "empty_older").keptTaskId, history.id);
+    assert.equal(result.duplicates.find((item) => item.taskId === "newer_relative").keptTaskId, oldest.id);
+    const current = await request(server, "/api/state");
+    assert.equal(current.tasks.length, 7);
+    assert.equal(current.tasks.find((task) => task.id === history.id).lastRunId, "run_history");
+    assert.equal(current.tasks.find((task) => task.id === busy.id).status, "running");
+    assert.equal(current.tasks.find((task) => task.id === "busy_queued").status, "queued");
+    assert.equal(current.tasks.find((task) => task.id === archived.id).archived, true);
+    assert.ok(current.tasks.some((task) => task.id === recreated.id));
+    assert.equal(current.events.some((event) => result.deletedTaskIds.includes(event.taskId)), false);
+    preservedPaths.forEach((filePath, index) => assert.deepEqual(fs.readFileSync(filePath), contents[index]));
+
+    const beforeSecondPass = fs.readFileSync(statePath, "utf8");
+    const again = await request(server, "/api/tasks/deduplicate", { method: "POST" });
+    assert.equal(again.deletedCount, 0);
+    assert.equal(again.skippedCount, 1);
+    assert.equal(fs.readFileSync(statePath, "utf8"), beforeSecondPass);
+    assert.equal(fs.readFileSync(path.join(rootDir, "history.md"), "utf8"), contents[0].toString());
+});
+
+test("server pages large logs with stable cursors and preserves complete history access", async (t) => {
+    const { server, createTask, dataDir } = taskManagementFixture(t);
+    const task = await createTask("large-log.md");
+    const eventPath = path.join(dataDir, "logs", task.logEventsFile);
+    const event = (sequence) => ({ sequence, id: `${task.id}:${sequence}`, taskId: task.id, runId: "history", type: "stdout", text: "输出 😀".repeat(100) });
+    fs.writeFileSync(eventPath, Array.from({ length: 1000 }, (_, i) => JSON.stringify(event(i + 1))).join("\n") + "\n");
+    const endpoint = `/api/tasks/${task.id}/log`;
+    const latest = await request(server, `${endpoint}?limit=25`);
+    assert.equal(latest.events.length, 25);
+    assert.equal(latest.firstCursor, 976);
+    assert.equal(latest.nextCursor, 1000);
+    assert.equal(latest.oldestCursor, 1);
+    assert.equal(latest.totalEvents, 1000);
+    assert.equal(latest.contentIncluded, false);
+    assert.equal(latest.content, "");
+    assert.equal(latest.hasMoreBefore, true);
+    assert.equal(latest.hasMoreAfter, false);
+    const older = await request(server, `${endpoint}?before=976&limit=25`);
+    assert.equal(older.firstCursor, 951);
+    assert.equal(older.nextCursor, 975);
+    const catchUp = await request(server, `${endpoint}?after=975&limit=10`);
+    assert.equal(catchUp.firstCursor, 976);
+    assert.equal(catchUp.nextCursor, 985);
+    assert.equal(catchUp.hasMoreAfter, true);
+    const unchanged = await request(server, `${endpoint}?after=1000&limit=25`);
+    assert.deepEqual(unchanged.events, []);
+    assert.equal(unchanged.nextCursor, 1000);
+
+    fs.appendFileSync(eventPath, `${JSON.stringify(event(1001))}\n`);
+    const appended = await request(server, `${endpoint}?after=1000&limit=25`);
+    assert.deepEqual(appended.events, [event(1001)]);
+    assert.equal(appended.totalEvents, 1001);
+    const run = await request(server, `/api/tasks/${task.id}/logs/history?limit=10`);
+    assert.equal(run.events.length, 10);
+    assert.equal(run.nextCursor, 1001);
+    assert.equal((await request(server, endpoint)).events.length, 1001);
+    assert.equal((await request(server, `${endpoint}?full=1&limit=25`)).events.length, 1001);
+
+    fs.writeFileSync(eventPath, `${JSON.stringify(event(1))}\n`);
+    const replaced = await request(server, `${endpoint}?after=1001&limit=25`);
+    assert.equal(replaced.latestCursor, 1);
+    assert.equal(replaced.totalEvents, 1);
+});
+
+test("server provides compact conditional state and invalidates it after external and API changes", async (t) => {
+    const { server, createTask, statePath } = taskManagementFixture(t);
+    const task = await createTask("cached-state.md");
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    saved.pingRecords = [{ id: "ping_saved", date: "2026-09-13", inputText: "input", outputText: "output" }];
+    fs.writeFileSync(statePath, JSON.stringify(saved));
+    const first = await server.inject({ path: "/api/state?compact=1" });
+    assert.equal(first.json().projectTaskTree, undefined);
+    assert.equal(first.json().pingDays, undefined);
+    assert.equal(first.json().pingRecords, undefined);
+    assert.equal(first.json().pingRecordCount, 1);
+    assert.ok(first.headers.etag);
+    const same = await server.inject({ path: "/api/state?compact=1", headers: { "If-None-Match": first.headers.etag } });
+    assert.equal(same.statusCode, 304);
+    assert.equal(same.body, "");
+    assert.equal((await request(server, "/api/state?compact=1&includePings=1")).pingRecords.length, 1);
+    assert.equal((await request(server, "/api/state")).projectTaskTree.length, 1);
+
+    saved.tasks[0].title = "external update";
+    fs.writeFileSync(statePath, JSON.stringify(saved));
+    const updated = await server.inject({ path: "/api/state?compact=1", headers: { "if-none-match": first.headers.etag } });
+    assert.equal(updated.statusCode, 200);
+    assert.equal(updated.json().tasks[0].title, "external update");
+    assert.notEqual(updated.headers.etag, first.headers.etag);
+    await request(server, `/api/tasks/${task.id}`, { method: "DELETE" });
+    const deleted = await server.inject({ path: "/api/state?compact=1", headers: { "if-none-match": updated.headers.etag } });
+    assert.equal(deleted.statusCode, 200);
+    assert.deepEqual(deleted.json().tasks, []);
 });

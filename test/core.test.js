@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
     ALL_DONE_MARKER,
+    ALL_DONE_OUTPUT,
     CODEX_AUTO_CONFIRM_FLAG,
     DEFAULT_RUN_PROMPT,
     appendTaskItemsToMarkdown,
@@ -11,6 +12,7 @@ const {
     createDefaultProfiles,
     fillTemplate,
     generateTaskMarkdown,
+    isAllDoneOutput,
     maskEnvText,
     nextProfileId,
     nextTaskItemNumber,
@@ -102,7 +104,16 @@ test("provider and modality helpers preserve compatible defaults", () => {
 
 test("default run prompt uses the command-safe all-done marker", () => {
     assert.equal(ALL_DONE_MARKER, "GGGG全部完成GGGG");
+    assert.equal(ALL_DONE_OUTPUT, "GGGG全部完成GGGGGGGG全部完成GGGG");
     assert.match(DEFAULT_RUN_PROMPT, /GGGG全部完成GGGG/);
+});
+
+test("all-done output requires two consecutive markers", () => {
+    assert.equal(isAllDoneOutput(`done\n${ALL_DONE_OUTPUT}\n`), true);
+    assert.equal(isAllDoneOutput(ALL_DONE_MARKER), false);
+    assert.equal(isAllDoneOutput(`${ALL_DONE_MARKER}\n${ALL_DONE_MARKER}`), false);
+    assert.equal(isAllDoneOutput(`${ALL_DONE_MARKER} ${ALL_DONE_MARKER}`), false);
+    assert.equal(isAllDoneOutput("全部任务完成"), false);
 });
 
 test("nextProfileId rotates through configured profiles", () => {

@@ -564,6 +564,21 @@ label {
     flex-wrap: wrap;
 }
 
+.task-list-head {
+    flex-wrap: wrap;
+}
+
+.task-cleanup-hint {
+    margin: 12px 16px 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.tree-task .task-actions {
+    max-width: 290px;
+}
+
 .task-title,
 .profile-title {
     margin: 0;
@@ -1989,9 +2004,15 @@ textarea.secret.revealed {
     }
 
     .task-card,
+    .tree-task,
     .directory-form,
     .directory-item {
         grid-template-columns: 1fr;
+    }
+
+    .tree-task .task-actions {
+        max-width: none;
+        justify-content: start;
     }
 
     .inline-actions {

@@ -4,16 +4,15 @@ const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { URL } = require("node:url");
+const { createLogReader, selectLogEntries } = require("./lib/log-reader");
 
 const {
-    ALL_DONE_MARKER,
     CODEX_AUTO_CONFIRM_FLAG,
     DEFAULT_GENERATE_PROMPT,
     DEFAULT_MEDIA_RUN_PROMPT,
     DEFAULT_CODEX_ARGS,
     DEFAULT_RUN_PROMPT,
     appendTaskItemsToMarkdown,
-    LEGACY_ALL_DONE_MARKERS,
     LEGACY_CODEX_ARGS,
     LEGACY_RUN_PROMPT,
     configEnvForProfile,
@@ -21,6 +20,7 @@ const {
     createDefaultProfiles,
     fillTemplate,
     generateTaskMarkdown,
+    isAllDoneOutput,
     makeId,
     maskEnvText,
     nextProfileId,
@@ -30,7 +30,6 @@ const {
     nowISO,
     parseArgs,
     parseEnvText,
-    parseTaskLogEvents,
     providerForAgentType,
     safeTaskFileName,
 } = require("./lib/core");
@@ -476,7 +475,10 @@ function createApp(options = {}) {
     const logDir = path.join(dataDir, "logs");
     const stateFile = path.join(dataDir, "state.json");
     const runners = new Map();
+    const taskProcesses = new Map();
     const logEventCounters = new Map();
+    const logReader = createLogReader();
+    let stateReadCache = null;
     let pingTimer = null;
     let pingInProgress = false;
     let runnersClosing = false;
@@ -755,10 +757,15 @@ function createApp(options = {}) {
         return normalized;
     }
 
-    function loadState() {
+    function loadState(readOnly = false) {
         if (!fs.existsSync(stateFile)) return initialState();
         try {
-            return normalizeState(JSON.parse(fs.readFileSync(stateFile, "utf8")));
+            const stat = fs.statSync(stateFile);
+            const signature = `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+            if (stateReadCache?.signature !== signature) {
+                stateReadCache = { signature, value: normalizeState(JSON.parse(fs.readFileSync(stateFile, "utf8"))) };
+            }
+            return readOnly ? stateReadCache.value : structuredClone(stateReadCache.value);
         } catch (error) {
             const backup = `${stateFile}.${Date.now()}.broken`;
             fs.copyFileSync(stateFile, backup);
@@ -772,6 +779,7 @@ function createApp(options = {}) {
         const tmp = `${stateFile}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
         fs.renameSync(tmp, stateFile);
+        stateReadCache = null;
     }
 
     if (!fs.existsSync(stateFile)) saveState(initialState());
@@ -859,6 +867,89 @@ function createApp(options = {}) {
 
     function findTask(state, id) {
         return state.tasks.find((task) => task.id === id);
+    }
+
+    function taskIsBusy(task) {
+        return runners.has(task.id)
+            || Boolean(taskProcesses.get(task.id)?.size)
+            || [STATUS.queued, STATUS.running, STATUS.scheduled, STATUS.retryWait].includes(task.status);
+    }
+
+    function taskFileKey(task) {
+        if (!task.filePath && !task.targetFileName) return "";
+        const filePath = path.resolve(task.directory || rootDir, task.filePath || safeTaskFileName(task.targetFileName));
+        let canonicalPath = filePath;
+        try {
+            canonicalPath = fs.realpathSync(filePath);
+        } catch {
+            // Missing target files can still have duplicate task records.
+            try {
+                canonicalPath = path.join(fs.realpathSync(path.dirname(filePath)), path.basename(filePath));
+            } catch {
+                // Keep the normalized absolute path when the directory is missing too.
+            }
+        }
+        return process.platform === "win32" ? canonicalPath.toLowerCase() : canonicalPath;
+    }
+
+    function compareDuplicateTasks(left, right) {
+        const hasHistory = (task) => Boolean(task.logRuns?.length || task.lastRunId || task.lastRunAt
+            || task.appendedItems?.length || [STATUS.completed, STATUS.allDone].includes(task.status));
+        return Number(taskIsBusy(right)) - Number(taskIsBusy(left))
+            || Number(hasHistory(right)) - Number(hasHistory(left))
+            || String(left.createdAt || "").localeCompare(String(right.createdAt || ""))
+            || String(left.id).localeCompare(String(right.id));
+    }
+
+    function matchingTasks(state, candidate) {
+        const key = taskFileKey(candidate);
+        if (!key) return [];
+        return state.tasks.filter((task) => !task.archived && taskFileKey(task) === key)
+            .sort(compareDuplicateTasks);
+    }
+
+    function removeTaskRecords(state, taskIds) {
+        const removedIds = new Set(taskIds);
+        state.tasks = state.tasks.filter((task) => !removedIds.has(task.id));
+        state.events = state.events.filter((event) => !removedIds.has(event.taskId));
+        for (const id of removedIds) logEventCounters.delete(id);
+        // Target files, artifacts, archives and logs may be shared or still useful.
+        // Deletion only removes records from the console.
+    }
+
+    function deduplicateTasks(state) {
+        const groups = new Map();
+        for (const task of state.tasks) {
+            if (task.archived) continue;
+            const key = taskFileKey(task);
+            if (!key) continue;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(task);
+        }
+        const duplicates = [];
+        const skippedTaskIds = [];
+        for (const tasks of groups.values()) {
+            if (tasks.length < 2) continue;
+            const [kept, ...rest] = tasks.sort(compareDuplicateTasks);
+            for (const task of rest) {
+                if (taskIsBusy(task)) skippedTaskIds.push(task.id);
+                else duplicates.push({ taskId: task.id, keptTaskId: kept.id });
+            }
+        }
+        const deletedTaskIds = duplicates.map((entry) => entry.taskId);
+        if (deletedTaskIds.length) {
+            removeTaskRecords(state, deletedTaskIds);
+            addEvent(state, "task", null, `任务去重：移除 ${deletedTaskIds.length} 条重复记录，保留目标文件和日志`);
+            saveState(state);
+        }
+        return {
+            ok: true,
+            deletedCount: deletedTaskIds.length,
+            deletedTaskIds,
+            duplicates,
+            skippedCount: skippedTaskIds.length,
+            skippedTaskIds,
+        };
     }
 
     function findProject(state, id) {
@@ -1083,8 +1174,8 @@ function createApp(options = {}) {
         };
     }
 
-    function publicState() {
-        const state = loadState();
+    function publicState({ compact = false, includePings = true } = {}) {
+        const state = loadState(true);
         const directoryQueuePositions = new Map();
         const queueDirectories = new Set(
             state.tasks
@@ -1116,6 +1207,8 @@ function createApp(options = {}) {
             }));
             return {
                 ...task,
+                ...(compact ? { loop: undefined, appendHistory: undefined } : {}),
+                canDelete: !taskIsBusy(task),
                 projectName: project?.name || "",
                 projectDirectory: project?.directory || "",
                 archivePath: task.archiveDirectory || null,
@@ -1142,8 +1235,10 @@ function createApp(options = {}) {
             projects: publicProjects,
             profiles: state.profiles.map(profileForClient),
             tasks: publicTasks,
-            projectTaskTree,
-            pingDays: pingDays(state.pingRecords),
+            projectTaskTree: compact ? undefined : projectTaskTree,
+            pingRecords: includePings ? state.pingRecords : undefined,
+            pingDays: includePings ? pingDays(state.pingRecords) : undefined,
+            pingRecordCount: state.pingRecords.length,
             pingSettings: state.pingSettings,
             pingQuestionCount: PING_QUESTIONS.length,
             pingRunning: pingInProgress,
@@ -1946,7 +2041,7 @@ function createApp(options = {}) {
             let existingEvents = [];
             try {
                 existingEvents = logFilePathIsSafe(eventPath, taskLogRoot(task)) && fs.existsSync(eventPath)
-                    ? parseTaskLogEvents(fs.readFileSync(eventPath, "utf8"))
+                    ? logReader.inspect(eventPath).events
                     : [];
             } catch {
                 existingEvents = [];
@@ -2025,11 +2120,6 @@ function createApp(options = {}) {
         return event;
     }
 
-    function readTaskLogEvents(task, afterSequence = 0) {
-        return inspectTaskLogFile(taskLogPath(task, true), taskLogRoot(task)).events
-            .filter((event) => Number(event.sequence || 0) > afterSequence);
-    }
-
     function inspectTaskLogFile(filePath, directory = logDir) {
         if (!logFilePathIsSafe(filePath, directory)) {
             return {
@@ -2040,44 +2130,7 @@ function createApp(options = {}) {
                 readError: "日志文件路径无效",
             };
         }
-        if (!fs.existsSync(filePath)) {
-            return {
-                exists: false,
-                content: "",
-                events: [],
-                malformedLines: 0,
-                readError: null,
-            };
-        }
-        let content = "";
-        try {
-            content = fs.readFileSync(filePath, "utf8");
-        } catch (error) {
-            return {
-                exists: true,
-                content: "",
-                events: [],
-                malformedLines: 0,
-                readError: error?.message || String(error),
-            };
-        }
-        let malformedLines = 0;
-        for (const line of content.split(/\r?\n/)) {
-            if (!line.trim()) continue;
-            try {
-                const value = JSON.parse(line);
-                if (!value || typeof value !== "object" || Array.isArray(value)) malformedLines += 1;
-            } catch {
-                malformedLines += 1;
-            }
-        }
-        return {
-            exists: true,
-            content,
-            events: parseTaskLogEvents(content),
-            malformedLines,
-            readError: null,
-        };
+        return logReader.inspect(filePath);
     }
 
     function readLegacyLogFile(filePath, options = {}, directory = logDir) {
@@ -2247,30 +2300,33 @@ function createApp(options = {}) {
             ? Math.trunc(Number(options.afterSequence))
             : 0;
         const legacyMaxBytes = options.fullContent === true ? null : DEFAULT_LEGACY_LOG_PREVIEW_BYTES;
+        const limit = options.fullContent === true ? 0 : Math.max(0, Number(options.limit) || 0);
         const root = taskLogRoot(task);
         const aggregateStructured = inspectTaskLogFile(taskLogPath(task, true), root);
-        const aggregateLegacy = readLegacyLogFile(taskLogPath(task), { maxBytes: legacyMaxBytes }, root);
         const allRuns = taskLogRuns(task, aggregateStructured.events);
         const requestedRunId = String(options.runId || "").trim();
         const selectedRun = requestedRunId ? allRuns.find((run) => run.runId === requestedRunId) : null;
         if (requestedRunId && !selectedRun) return null;
         let structured = aggregateStructured;
-        let legacy = aggregateLegacy;
         let events = aggregateStructured.events;
+        let structuredFilePath = taskLogPath(task, true);
         if (selectedRun) {
             const runEventPath = taskRunLogPath(task, selectedRun, true);
-            const runLegacyPath = taskRunLogPath(task, selectedRun, false);
             const runStructured = inspectTaskLogFile(runEventPath, root);
-            const runLegacy = readLegacyLogFile(runLegacyPath, { maxBytes: legacyMaxBytes }, root);
             if (runStructured.exists || runStructured.readError) {
                 structured = runStructured;
                 events = runStructured.events;
+                structuredFilePath = runEventPath;
             } else {
                 events = aggregateStructured.events.filter((event) => event.runId === selectedRun.runId);
             }
-            legacy = runLegacy;
         }
-        const filteredEvents = events.filter((event) => Number(event.sequence || 0) > afterSequence);
+        const includeContent = !limit || events.length === 0;
+        const legacy = readLegacyLogFile(selectedRun ? taskRunLogPath(task, selectedRun, false) : taskLogPath(task), {
+            maxBytes: includeContent ? legacyMaxBytes : 0,
+        }, root);
+        const page = selectLogEntries(events, { after: afterSequence, before: options.beforeSequence, limit });
+        const filteredEvents = logReader.readEvents(structuredFilePath, page.entries);
         const warnings = [];
         if (structured.malformedLines > 0) {
             warnings.push({ code: "malformed_jsonl", count: structured.malformedLines, message: "结构化日志包含无法解析的行，已跳过损坏行" });
@@ -2281,7 +2337,7 @@ function createApp(options = {}) {
         if (structured.readError || legacy.readError) {
             warnings.push({ code: "read_error", message: structured.readError || legacy.readError });
         }
-        if (legacy.truncated) {
+        if (legacy.truncated && includeContent) {
             warnings.push({
                 code: "content_truncated",
                 message: `日志较大，界面仅加载末尾 ${Math.ceil(legacy.returnedBytes / 1024)} KB；完整日志仍保存在文件中`,
@@ -2300,6 +2356,13 @@ function createApp(options = {}) {
             logPath: selectedRun ? taskRunLogPath(task, selectedRun, false) : taskLogPath(task),
             eventLogPath: selectedRun ? taskRunLogPath(task, selectedRun, true) : taskLogPath(task, true),
             events: filteredEvents,
+            totalEvents: page.totalEvents,
+            hasMoreBefore: page.hasMoreBefore,
+            hasMoreAfter: page.hasMoreAfter,
+            firstCursor: Number(filteredEvents[0]?.sequence || 0),
+            oldestCursor: Number(events[0]?.sequence || 0),
+            latestCursor: Number(events.at(-1)?.sequence || 0),
+            contentIncluded: includeContent,
             contentBytes: legacy.totalBytes,
             contentReturnedBytes: legacy.returnedBytes,
             contentOmittedBytes: legacy.omittedBytes,
@@ -2534,12 +2597,6 @@ function createApp(options = {}) {
             .join("\n");
     }
 
-    function isAllDoneOutput(output) {
-        const text = String(output || "");
-        return [ALL_DONE_MARKER + ALL_DONE_MARKER, ALL_DONE_MARKER, ...LEGACY_ALL_DONE_MARKERS]
-            .some((marker) => marker && text.includes(marker));
-    }
-
     function profileConfigDescription(profile) {
         const keys = Object.keys(configEnvForProfile(profile));
         return [
@@ -2674,6 +2731,13 @@ function createApp(options = {}) {
                 return;
             }
             const runner = runners.get(task.id);
+            if (!taskProcesses.has(task.id)) taskProcesses.set(task.id, new Set());
+            const processes = taskProcesses.get(task.id);
+            processes.add(child);
+            child.once("close", () => {
+                processes.delete(child);
+                if (processes.size === 0) taskProcesses.delete(task.id);
+            });
             if (runner) {
                 runner.child = child;
                 runner.currentRunStartedAt = processStartedAt;
@@ -4213,7 +4277,14 @@ function createApp(options = {}) {
         const pathname = url.pathname;
 
         if (method === "GET" && pathname === "/api/state") {
-            sendJson(response, 200, publicState());
+            const compact = url.searchParams.get("compact") === "1";
+            const content = JSON.stringify(publicState({ compact, includePings: !compact || url.searchParams.get("includePings") === "1" }));
+            const etag = `"${crypto.createHash("sha1").update(content).digest("hex")}"`;
+            const unchanged = request.headers?.["if-none-match"] === etag;
+            response.writeHead(unchanged ? 304 : 200, {
+                "content-type": "application/json; charset=utf-8", "cache-control": "no-cache", etag,
+            });
+            response.end(unchanged ? "" : content);
             return;
         }
 
@@ -4470,6 +4541,11 @@ function createApp(options = {}) {
             const sourceMode = normalizeTaskSourceMode(body.sourceMode, body);
             const targetFileName = safeTaskFileName(body.targetFileName || `${title}.md`);
             const filePath = resolveTaskFile(directory, targetFileName);
+            const duplicate = matchingTasks(state, { directory, filePath })[0];
+            if (duplicate) {
+                sendJson(response, 200, { ok: true, task: duplicate, deduplicated: true });
+                return;
+            }
             const explicitRunProfileIds = normalizeProfileIdList(body.runProfileIds);
             const requestedRunProfileIds = explicitRunProfileIds.length
                 ? explicitRunProfileIds
@@ -4619,6 +4695,30 @@ function createApp(options = {}) {
             return;
         }
 
+        if (method === "POST" && pathname === "/api/tasks/deduplicate") {
+            sendJson(response, 200, deduplicateTasks(loadState()));
+            return;
+        }
+
+        const taskDeleteMatch = pathname.match(/^\/api\/tasks\/([^/]+)$/);
+        if (method === "DELETE" && taskDeleteMatch) {
+            const state = loadState();
+            const task = findTask(state, decodePathSegment(taskDeleteMatch[1], "任务 ID"));
+            if (!task) {
+                sendJson(response, 404, { error: "任务不存在" });
+                return;
+            }
+            if (taskIsBusy(task)) {
+                sendJson(response, 409, { error: "任务正在运行、排队、预约或等待重试，请先停止任务并等待进程退出后再删除" });
+                return;
+            }
+            removeTaskRecords(state, [task.id]);
+            addEvent(state, "task", null, `删除任务：${task.title}（目标文件和日志已保留）`);
+            saveState(state);
+            sendJson(response, 200, { ok: true, deletedTaskId: task.id });
+            return;
+        }
+
         const taskAppendMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/(?:items|append|append-item|append-items|append-task|append-tasks|append-task-items|add|add-item|add-items|add-task|add-tasks|task-items|tasks)\/?$/);
         if (["POST", "PATCH", "PUT"].includes(method) && taskAppendMatch) {
             let body;
@@ -4731,7 +4831,7 @@ function createApp(options = {}) {
 
         const taskLogMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/logs?(?:\/([^/]+))?\/?$/);
         if (method === "GET" && taskLogMatch) {
-            const state = loadState();
+            const state = loadState(true);
             const task = findTask(state, decodePathSegment(taskLogMatch[1], "任务 ID"));
             if (!task) {
                 sendJson(response, 404, { error: "任务不存在" });
@@ -4742,8 +4842,12 @@ function createApp(options = {}) {
             const pathRunId = taskLogMatch[2] ? decodePathSegment(taskLogMatch[2], "运行 ID") : "";
             const queryRunId = String(url.searchParams.get("runId") || "").trim();
             const fullContent = ["1", "true"].includes(String(url.searchParams.get("full") || "").toLowerCase());
+            const requestedLimit = Number(url.searchParams.get("limit"));
+            const beforeValue = Number(url.searchParams.get("before"));
             const payload = buildTaskLogPayload(task, {
                 afterSequence,
+                beforeSequence: Number.isFinite(beforeValue) && beforeValue > 0 ? Math.trunc(beforeValue) : 0,
+                limit: Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(1000, Math.trunc(requestedLimit)) : 0,
                 runId: pathRunId || queryRunId,
                 fullContent,
             });
@@ -4897,11 +5001,12 @@ function createApp(options = {}) {
         }
     });
 
-    server.inject = async ({ method = "GET", path: requestPath = "/", body = null } = {}) => {
+    server.inject = async ({ method = "GET", path: requestPath = "/", body = null, headers = {} } = {}) => {
         const payload = body === null ? "" : JSON.stringify(body);
         const request = {
             method,
             url: requestPath,
+            headers: Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value])),
             async *[Symbol.asyncIterator]() {
                 if (payload) yield Buffer.from(payload);
             },
