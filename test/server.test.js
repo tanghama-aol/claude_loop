@@ -57,8 +57,8 @@ test("server defaults to all interfaces while preserving explicit HOST and PORT"
     });
 
     const startup = formatStartupMessage({ host: DEFAULT_HOST, port: DEFAULT_PORT });
-    assert.match(startup, /127\.0\.0\.1:3000/);
-    assert.match(startup, /listening on 0\.0\.0\.0:3000/);
+    assert.match(startup, /127\.0\.0\.1:13100/);
+    assert.match(startup, /listening on 0\.0\.0\.0:13100/);
     assert.match(startup, /network and firewall/i);
 });
 
@@ -356,9 +356,10 @@ test("server asks generator profile to write target file instead of using stdout
 test("server resolves Windows PowerShell command shims", { skip: process.platform !== "win32" }, async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    // The all-done marker has to appear twice back to back on one line, as the run prompt demands.
     fs.writeFileSync(path.join(tempRoot, "fake-codex.ps1"), [
         "$marker = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(\"5YWo6YOo5a6M5oiQ\"))",
-        "Write-Output ('GGGG' + $marker + 'GGGG')",
+        "Write-Output ('GGGG' + $marker + 'GGGG' + 'GGGG' + $marker + 'GGGG')",
     ].join("\r\n"), "utf8");
 
     const server = createApp({
@@ -404,11 +405,134 @@ test("server resolves Windows PowerShell command shims", { skip: process.platfor
 
     const task = await waitFor(async () => {
         const state = await request(server, "/api/state");
-        return state.tasks.find((item) => item.id === created.task.id && item.status === "all_done");
+        const item = state.tasks.find((entry) => entry.id === created.task.id);
+        return item && item.lastExitCode !== null ? item : null;
     });
     assert.equal(task.lastExitCode, 0);
-    assert.match(task.lastCommand, /powershell\.exe/i);
+    assert.match(task.lastCommand, /pwsh(\.exe)?|powershell\.exe/i);
     assert.match(task.lastCommand, /fake-codex\.ps1/i);
+    if (/pwsh/i.test(task.lastCommand)) {
+        // pwsh runs through the UTF-8 delegate, so PowerShell-authored Chinese survives the pipe
+        // and the all-done marker is detected. The legacy host encodes with the OEM code page.
+        assert.equal(task.status, "all_done");
+        assert.match(task.lastOutput, /GGGG全部完成GGGGGGGG全部完成GGGG/);
+    }
+});
+
+test("server reports a missing working directory instead of a spawn ENOENT", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const vanishingDirectory = path.join(tempRoot, "vanishing-directory");
+    fs.mkdirSync(vanishingDirectory, { recursive: true });
+
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const script = writeAgentScript(tempRoot, "agent-vanishing-cwd.sh", "console.log(\"should never run\");");
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "vanishing-cwd-agent",
+            agentType: "claude",
+            command: script.command,
+            args: script.args,
+            timeoutSeconds: 5,
+            enabled: true,
+        },
+    });
+    await request(server, "/api/directories", {
+        method: "POST",
+        body: { directory: vanishingDirectory },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "工作目录消失",
+            requirement: "确认报错指向工作目录而不是命令",
+            targetFileName: "vanishing-cwd.md",
+            directory: vanishingDirectory,
+            sourceMode: "template",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+
+    fs.rmSync(vanishingDirectory, { recursive: true, force: true });
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+
+    const task = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.lastExitCode !== null);
+    });
+    assert.equal(task.lastExitCode, 127);
+    assert.match(task.lastOutput, /工作目录不存在/);
+    assert.match(task.lastOutput, /vanishing-directory/);
+    assert.doesNotMatch(task.lastOutput, /ENOENT/);
+});
+
+test("server keeps a relative profile working directory relative to the project", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const script = writeAgentScript(tempRoot, "agent-relative-cwd.sh", [
+        "fs.writeFileSync(\"agent-cwd.txt\", process.cwd(), \"utf8\");",
+        "console.log(\"pong\");",
+    ].join("\n"));
+
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "relative-cwd-agent",
+            agentType: "claude",
+            command: script.command,
+            args: script.args,
+            defaultDirectory: "default_work_dir",
+            timeoutSeconds: 5,
+            enabled: true,
+        },
+    });
+    assert.equal(profile.profile.defaultDirectory, "default_work_dir");
+
+    const resolved = await request(server, "/api/state").then((state) => state.profiles[0].defaultDirectory);
+    assert.equal(resolved, "default_work_dir");
+    await assert.rejects(
+        request(server, "/api/profiles", {
+            method: "POST",
+            body: { id: profile.profile.id, defaultDirectory: "../outside-project" },
+        }),
+        /必须位于项目目录内/,
+    );
+
+    const result = await request(server, "/api/pings/run", { method: "POST" });
+    const record = result.records.find((item) => item.profileId === profile.profile.id);
+    assert.ok(record);
+    assert.equal(record.success, true);
+
+    // The agent ran inside the project-relative directory, which the server created on demand.
+    const cwdFile = path.join(tempRoot, "default_work_dir", "agent-cwd.txt");
+    assert.equal(fs.existsSync(cwdFile), true);
+    assert.match(fs.readFileSync(cwdFile, "utf8").trim(), /default_work_dir$/);
 });
 
 test("server migrates legacy default codex profile to auto-confirm args", async (t) => {

@@ -1,10 +1,12 @@
 const assert = require("node:assert/strict");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
     ALL_DONE_MARKER,
     ALL_DONE_OUTPUT,
     CODEX_AUTO_CONFIRM_FLAG,
+    DEFAULT_PROFILE_DIRECTORY,
     DEFAULT_RUN_PROMPT,
     appendTaskItemsToMarkdown,
     configEnvForProfile,
@@ -196,9 +198,16 @@ test("appendTaskItemsToMarkdown appends numbered checklist blocks without rewrit
 });
 
 test("default codex profile bypasses confirmations", () => {
-    const codexProfile = createDefaultProfiles("/tmp/project").find((profile) => profile.id === "profile_codex_default");
+    const codexProfile = createDefaultProfiles().find((profile) => profile.id === "profile_codex_default");
     assert.ok(codexProfile);
     assert.match(codexProfile.args, new RegExp(CODEX_AUTO_CONFIRM_FLAG));
     assert.equal(codexProfile.provider, "openai");
     assert.deepEqual(codexProfile.outputModalities, ["text"]);
+});
+
+test("default profiles use a project-relative working directory", () => {
+    for (const profile of createDefaultProfiles()) {
+        assert.equal(profile.defaultDirectory, DEFAULT_PROFILE_DIRECTORY);
+        assert.equal(path.isAbsolute(profile.defaultDirectory), false);
+    }
 });

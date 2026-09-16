@@ -13,7 +13,7 @@
 
 ## 构建、测试与开发命令
 
-- `npm start`：启动 Web 应用，默认访问 `http://127.0.0.1:3000`。
+- `npm start`：启动 Web 应用，默认访问 `http://127.0.0.1:13100`。
 - `PORT=3100 npm start`：使用自定义端口启动。
 - `npm run check`：对 `server.js`、`public/app.js`、`lib/core.js` 做语法检查。
 - `npm test`：运行 Node 测试套件。

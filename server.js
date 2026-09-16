@@ -11,6 +11,7 @@ const {
     DEFAULT_GENERATE_PROMPT,
     DEFAULT_MEDIA_RUN_PROMPT,
     DEFAULT_CODEX_ARGS,
+    DEFAULT_PROFILE_DIRECTORY,
     DEFAULT_RUN_PROMPT,
     appendTaskItemsToMarkdown,
     LEGACY_CODEX_ARGS,
@@ -53,7 +54,7 @@ const SCHEDULE_MODE = {
 };
 
 const DEFAULT_HOST = "0.0.0.0";
-const DEFAULT_PORT = 3000;
+const DEFAULT_PORT = 13100;
 const DEFAULT_LEGACY_LOG_PREVIEW_BYTES = 256 * 1024;
 
 /**
@@ -222,6 +223,22 @@ const PING_SCHEDULER_TICK_MS = 60 * 1000;
 const PING_DETAIL_MAX_CHARS = 64 * 1024;
 const AVAILABILITY_CHECK_INTERVAL_MINUTES = 30;
 const AVAILABILITY_CHECK_INTERVAL_MS = AVAILABILITY_CHECK_INTERVAL_MINUTES * 60 * 1000;
+const POWERSHELL_UTF8_DELEGATE_NAME = "powershell-utf8.ps1";
+// PowerShell writes its own strings in the OEM code page (GBK on Chinese Windows) while native
+// command output stays UTF-8, and the server decodes everything as UTF-8. Running .ps1 commands
+// through this delegate switches the host to UTF-8 first, so both halves survive.
+const POWERSHELL_UTF8_DELEGATE = [
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$target = $args[0]",
+    "if ($args.Count -gt 1) {",
+    "    $rest = $args[1..($args.Count - 1)]",
+    "} else {",
+    "    $rest = @()",
+    "}",
+    "& $target @rest",
+    "exit $LASTEXITCODE",
+].join("\r\n");
 
 function tokenCount(value) {
     if (value === null || value === undefined || value === "") return null;
@@ -497,7 +514,7 @@ function createApp(options = {}) {
             version: 3,
             directories: [rootDir],
             projects: [defaultProject],
-            profiles: createDefaultProfiles(rootDir),
+            profiles: createDefaultProfiles(),
             tasks: [],
             events: [],
             pingRecords: [],
@@ -537,7 +554,7 @@ function createApp(options = {}) {
             pingIntervalMinutes,
             pingEnabled: profile?.pingEnabled !== false,
             configDirectory: rawConfigDirectory ? path.resolve(rawConfigDirectory) : "",
-            defaultDirectory: path.resolve(profile?.defaultDirectory || rootDir),
+            defaultDirectory: String(profile?.defaultDirectory ?? "").trim(),
         };
         const isLegacyDefaultCodex = normalized.id === "profile_codex_default"
             && normalized.name === "codex-default"
@@ -718,7 +735,7 @@ function createApp(options = {}) {
             : [];
         normalized.profiles = Array.isArray(normalized.profiles)
             ? normalized.profiles.map(normalizeProfile)
-            : createDefaultProfiles(rootDir);
+            : createDefaultProfiles();
         normalized.tasks = Array.isArray(normalized.tasks) ? normalized.tasks.map(normalizeTask) : [];
         if (normalized.projects.length === 0) {
             normalized.projects.push(normalizeProject({
@@ -798,6 +815,14 @@ function createApp(options = {}) {
     function safeStat(filePath) {
         try {
             return fs.statSync(filePath);
+        } catch {
+            return null;
+        }
+    }
+
+    function safeLstat(filePath) {
+        try {
+            return fs.lstatSync(filePath);
         } catch {
             return null;
         }
@@ -1272,6 +1297,30 @@ function createApp(options = {}) {
             throw error;
         }
         return resolved;
+    }
+
+    function profileDirectorySetting(profile) {
+        return String(profile?.defaultDirectory ?? "").trim() || DEFAULT_PROFILE_DIRECTORY;
+    }
+
+    function profileDirectoryIsRelative(profile) {
+        return !path.isAbsolute(profileDirectorySetting(profile));
+    }
+
+    // Profile 的默认目录可以是相对项目目录的路径（默认 default_work_dir），也可以是绝对路径。
+    // 相对路径属于项目内部，Ping 前按需创建；绝对路径不做创建，缺失时由启动检查报错。
+    function profileWorkingDirectory(profile) {
+        const configured = profileDirectorySetting(profile);
+        return path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(rootDir, configured);
+    }
+
+    function ensureProfileWorkingDirectory(profile) {
+        const directory = profileWorkingDirectory(profile);
+        if (!profileDirectoryIsRelative(profile)) return directory;
+        const relative = path.relative(rootDir, directory);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) return directory;
+        if (!safeStat(directory)?.isDirectory()) fs.mkdirSync(directory, { recursive: true });
+        return directory;
     }
 
     function resolveTaskFile(directory, targetFileName) {
@@ -2432,17 +2481,74 @@ function createApp(options = {}) {
             const baseName = isPathLike ? path.basename(commandText) : commandText;
             for (const candidate of windowsCommandCandidates(baseName)) {
                 const filePath = path.join(directory, candidate);
-                if (safeStat(filePath)?.isFile()) return filePath;
+                if (isRunnableCommandPath(filePath)) return filePath;
             }
         }
 
         return commandText;
     }
 
-    function powershellHostPath() {
-        const systemRoot = process.env.SystemRoot || "C:\\Windows";
-        const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-        return safeStat(powershell)?.isFile() ? powershell : "powershell.exe";
+    function isRunnableCommandPath(filePath) {
+        const stat = safeStat(filePath);
+        if (stat) return stat.isFile();
+        // Windows Store app aliases (for example pwsh.exe under WindowsApps) are symlinks that
+        // point into a protected package directory, so stat fails with EACCES while the alias
+        // itself is still spawnable.
+        return Boolean(safeLstat(filePath)?.isSymbolicLink());
+    }
+
+    function isPwshHost(command) {
+        return path.basename(String(command || "")).toLowerCase().startsWith("pwsh");
+    }
+
+    let powershellDelegatePath = null;
+
+    // The legacy host ignores [Console]::OutputEncoding when stdout is redirected, so only pwsh is
+    // routed through the delegate. If the file cannot be written, run the script directly instead.
+    function powershellUtf8DelegatePath() {
+        if (powershellDelegatePath !== null) return powershellDelegatePath;
+        try {
+            const filePath = path.join(dataDir, POWERSHELL_UTF8_DELEGATE_NAME);
+            if (!safeStat(filePath)?.isFile() || fs.readFileSync(filePath, "utf8") !== POWERSHELL_UTF8_DELEGATE) {
+                fs.writeFileSync(filePath, POWERSHELL_UTF8_DELEGATE, "utf8");
+            }
+            powershellDelegatePath = filePath;
+        } catch {
+            powershellDelegatePath = "";
+        }
+        return powershellDelegatePath;
+    }
+
+    // Windows PowerShell 5.1 is deprecated and can be removed from the OS, while PowerShell 7
+    // (pwsh) has no fixed install path: the Store package carries its version in the directory
+    // name. Probe the known locations, prefer pwsh, and only then fall back to the legacy host.
+    function powershellHostPath(env = process.env, cwd = rootDir) {
+        const override = stripCommandQuotes(process.env.CLAUDE_LOOP_POWERSHELL || "");
+        if (override) return override;
+
+        const candidates = [];
+        const addCandidate = (directory) => {
+            if (!directory) return;
+            const candidate = path.join(path.resolve(cwd, directory), "pwsh.exe");
+            if (!candidates.includes(candidate)) candidates.push(candidate);
+        };
+
+        addCandidate(path.dirname(process.execPath));
+        for (const directory of windowsPathValue(env).split(path.delimiter)) addCandidate(directory);
+        for (const base of [env.ProgramFiles, env.ProgramW6432]) {
+            if (!base) continue;
+            addCandidate(path.join(base, "PowerShell", "7"));
+            addCandidate(path.join(base, "PowerShell", "7-preview"));
+        }
+        if (env.LOCALAPPDATA) addCandidate(path.join(env.LOCALAPPDATA, "Microsoft", "WindowsApps"));
+
+        for (const candidate of candidates) {
+            if (isRunnableCommandPath(candidate)) return candidate;
+        }
+
+        const systemRoot = env.SystemRoot || "C:\\Windows";
+        const legacy = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        return isRunnableCommandPath(legacy) ? legacy : "powershell.exe";
     }
 
     function quoteCmdArgument(value) {
@@ -2458,8 +2564,10 @@ function createApp(options = {}) {
         const resolvedCommand = resolveWindowsCommandPath(spawnSpec.command, env, cwd);
         const ext = path.extname(resolvedCommand).toLowerCase();
         if (ext === ".ps1") {
-            const command = powershellHostPath();
-            const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", resolvedCommand, ...spawnSpec.args];
+            const command = powershellHostPath(env, cwd);
+            const delegate = isPwshHost(command) ? powershellUtf8DelegatePath() : "";
+            const script = delegate ? [delegate, resolvedCommand] : [resolvedCommand];
+            const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ...script, ...spawnSpec.args];
             return {
                 command,
                 args,
@@ -2690,6 +2798,25 @@ function createApp(options = {}) {
         };
     }
 
+    // spawn() reports a missing working directory as ENOENT on the command path, which makes a
+    // stale profile directory look like a broken shell. Fail with the real reason instead.
+    function spawnWorkingDirectory(directory) {
+        const cwd = directory || rootDir;
+        if (safeStat(cwd)?.isDirectory()) return cwd;
+        throw new Error(`工作目录不存在：${cwd}，请更新 Profile 的默认目录或恢复该目录`);
+    }
+
+    function spawnFailureMessage(error, spawnSpec, directory) {
+        const message = error?.message || String(error);
+        if (error?.code !== "ENOENT") return message;
+        const cwd = directory || rootDir;
+        if (!safeStat(cwd)?.isDirectory()) return `${message}（工作目录不存在：${cwd}）`;
+        if (/[\\/]/.test(spawnSpec.command) && !isRunnableCommandPath(spawnSpec.command)) {
+            return `${message}（命令不存在：${spawnSpec.command}）`;
+        }
+        return message;
+    }
+
     function runProfileCommand({ profile, task, prompt, spawnSpec = null, onOutput = () => {}, onLifecycle = null }) {
         return new Promise((resolve) => {
             const emitLifecycle = (type, text, metadata = {}) => {
@@ -2703,13 +2830,13 @@ function createApp(options = {}) {
             let child;
             try {
                 child = childProcess.spawn(actualSpawnSpec.command, actualSpawnSpec.args, {
-                    cwd: task.directory,
+                    cwd: spawnWorkingDirectory(task.directory),
                     env,
                     shell: false,
                     stdio: ["ignore", "pipe", "pipe"],
                 });
             } catch (error) {
-                const message = error?.message || String(error);
+                const message = spawnFailureMessage(error, actualSpawnSpec, task.directory);
                 emitLifecycle("process_error", `Agent 启动错误：${message}`, { error: message });
                 onOutput(message, "error");
                 resolve({
@@ -2884,9 +3011,10 @@ function createApp(options = {}) {
                 onOutput(text, "stderr");
             });
             child.on("error", (error) => {
-                output += `\n${error.message}`;
-                emitLifecycle("process_error", `Agent 启动错误：${error.message}`, { error: error.message });
-                onOutput(error.message, "error");
+                const message = spawnFailureMessage(error, actualSpawnSpec, task.directory);
+                output += `\n${message}`;
+                emitLifecycle("process_error", `Agent 启动错误：${message}`, { error: message });
+                onOutput(message, "error");
                 settle({ exitCode: 127, signal: null, timedOut: false });
             });
             child.on("close", (exitCode, signal) => {
@@ -2923,7 +3051,7 @@ function createApp(options = {}) {
             title: `ping ${profile.name}`,
             targetFileName: "",
             requirement: "",
-            directory: path.resolve(profile.defaultDirectory || rootDir),
+            directory: ensureProfileWorkingDirectory(profile),
         };
         runners.set(task.id, {
             stopped: false,
@@ -4355,7 +4483,7 @@ function createApp(options = {}) {
                 pingEnabled: body.pingEnabled !== false,
                 enabled: body.enabled !== false,
                 nonInteractive: body.nonInteractive !== false,
-                defaultDirectory: path.resolve(body.defaultDirectory || existing?.defaultDirectory || rootDir),
+                defaultDirectory: String(body.defaultDirectory ?? existing?.defaultDirectory ?? "").trim(),
                 configDirectory: rawConfigDirectory ? path.resolve(rawConfigDirectory) : "",
                 createdAt: existing?.createdAt || nowISO(),
                 updatedAt: nowISO(),
@@ -4366,6 +4494,11 @@ function createApp(options = {}) {
             }
             if (!profile.inputModalities.includes("text")) {
                 sendJson(response, 400, { error: "当前任务调用至少需要支持文本输入" });
+                return;
+            }
+            const relativeDefault = path.relative(rootDir, profileWorkingDirectory(profile));
+            if (profileDirectoryIsRelative(profile) && (relativeDefault.startsWith("..") || path.isAbsolute(relativeDefault))) {
+                sendJson(response, 400, { error: `默认工作目录的相对路径必须位于项目目录内：${rootDir}` });
                 return;
             }
             if (existing) {

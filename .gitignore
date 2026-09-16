@@ -1,4 +1,5 @@
 .claude-loop-data/
+default_work_dir/
 .agents/
 .codex/
 .git/

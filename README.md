@@ -21,10 +21,10 @@ npm start
 默认访问地址：
 
 ```text
-http://127.0.0.1:3000
+http://127.0.0.1:13100
 ```
 
-服务默认绑定 `0.0.0.0:3000`（所有网卡），但 `0.0.0.0` 是监听地址，不是浏览器访问目标。本机请使用上面的 `127.0.0.1`；局域网设备请将 `127.0.0.1` 换成本机实际局域网 IP，并确认本机网络和防火墙允许该端口访问。
+服务默认绑定 `0.0.0.0:13100`（所有网卡），但 `0.0.0.0` 是监听地址，不是浏览器访问目标。本机请使用上面的 `127.0.0.1`；局域网设备请将 `127.0.0.1` 换成本机实际局域网 IP，并确认本机网络和防火墙允许该端口访问。
 
 可以通过 `HOST` 和 `PORT` 覆盖监听配置：
 
@@ -41,6 +41,16 @@ npm start
 ```
 
 运行数据保存在 `.claude-loop-data/`，该目录默认不提交。
+
+## Profile 的默认工作目录
+
+Profile 上的「默认工作目录」只用于 Ping：Ping 会真的启动一次 Agent 进程，这个字段决定它在哪个目录里运行。普通任务使用的是项目/任务的目录，与它无关。
+
+- **相对路径**按服务根目录解析，例如默认值 `default_work_dir` 表示 `<项目目录>/default_work_dir`，因此状态文件在不同机器之间搬动时不会指向失效的绝对路径。相对路径在 Ping 前按需创建，且必须位于项目目录内。
+- **绝对路径**按原样使用，不会被创建；目录缺失时 Ping 会直接报「工作目录不存在：…」，不会再表现为 `spawn … ENOENT`。
+- 留空等同内置默认值 `default_work_dir`。字段可在 Profile 编辑表单中修改，也会显示在 Profile 卡片上。
+
+历史状态文件里保存的绝对路径不会被自动改写，需要在界面上逐个改成相对路径（或改成仍然存在的绝对路径）。
 
 ## 删除与去重
 
@@ -102,7 +112,7 @@ GET /api/tasks/<taskId>/logs/<runId>         # 读取某一次运行
 已结束任务可以在运行视图底部逐行或批量追加任务项。追加项会按原 Markdown 清单的最大编号顺序写入，初始状态为“未开始”，旧文件内容、旧日志和旧运行记录不会被重排或覆盖：
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/tasks/<taskId>/items \
+curl -X POST http://127.0.0.1:13100/api/tasks/<taskId>/items \
   -H 'content-type: application/json' \
   -d '{"items":["补充回归测试",{"text":"更新说明","completionCriteria":"README 已更新"}]}'
 ```
@@ -165,6 +175,27 @@ claude --dangerously-skip-permissions -p "<prompt>"
 ```powershell
 .\claude_loop.ps1 -AgentCommand "codex" -AgentArguments @("exec", "--skip-git-repo-check")
 ```
+
+## Windows 上的 PowerShell 宿主
+
+Profile 的命令解析到 `.ps1`（例如 nvm 生成的 `claude.ps1`、`codex.ps1`）时，服务会用 PowerShell 宿主执行它。Windows 上按以下顺序选择宿主：
+
+1. `CLAUDE_LOOP_POWERSHELL` 环境变量；
+2. PATH 中第一个可用的 `pwsh.exe`；
+3. `%ProgramFiles%\PowerShell\7\pwsh.exe`（含 `7-preview`）；
+4. Microsoft Store 版 `pwsh.exe` 别名（`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`）；
+5. 系统自带的 Windows PowerShell 5.1（`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`）。
+
+需要固定宿主时设置环境变量（值可以带引号）：
+
+```powershell
+$env:CLAUDE_LOOP_POWERSHELL = "C:\Program Files\PowerShell\7\pwsh.exe"
+npm start
+```
+
+选到 `pwsh` 时，`.ps1` 会先经过数据目录下的 `powershell-utf8.ps1` 委托脚本，把宿主的输出编码固定为 UTF-8。否则 PowerShell 自身输出的中文会按 OEM 代码页（简体中文为 GBK）写出，被服务当成 UTF-8 解码而乱码；Agent 原生输出（node/CLI）本身是 UTF-8，不受影响。Windows PowerShell 5.1 在重定向输出时忽略该设置，因此回退到它时仍可能出现上述乱码。
+
+Profile 的默认目录（或任务的 `directory`）不存在时，启动会直接给出「工作目录不存在：…」，不再表现为 `spawn … ENOENT`。
 
 ## 验证
 

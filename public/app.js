@@ -893,6 +893,7 @@ function renderProfiles() {
                     ? t("profile.card.testOff")
                     : t("profile.card.testInterval", { minutes: profile.pingIntervalMinutes || 60 }))}</span>
                 <span>${escapeHtml(t("profile.card.config", { value: profile.configDirectory || "-" }))}</span>
+                <span>${escapeHtml(t("profile.card.workDir", { value: profile.defaultDirectory || "-" }))}</span>
             </div>
             <button class="ghost" type="button" data-edit-profile="${escapeHtml(profile.id)}">${escapeHtml(t("common.edit"))}</button>
         </article>
@@ -1327,6 +1328,7 @@ function resetProfileForm(profile = null) {
     updateTokenPlaceholder(profile);
     form.elements.modelName.value = profile?.modelName || "";
     form.elements.pingIntervalMinutes.value = profile?.pingIntervalMinutes || 60;
+    form.elements.defaultDirectory.value = profile ? profile.defaultDirectory || "" : "default_work_dir";
     form.elements.configDirectory.value = profile?.configDirectory || "";
     form.elements.envText.value = profile?.envText || "";
     form.elements.promptTemplate.value = profile?.promptTemplate || "";
