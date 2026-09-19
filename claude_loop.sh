@@ -1,9 +1,11 @@
 #!/bin/bash
 
 TASK_FILE="claude_loop_task.md"
+ALL_DONE_MARKER="GGGG全部完成GGGG"
+ALL_DONE_OUTPUT="${ALL_DONE_MARKER}${ALL_DONE_MARKER}"
 PROMPT="1.从 ${TASK_FILE} 获取一条任务进行工作，完成后将任务标记为完成，不要启动子agent，直接在主agent中完成，成功完成后修改 ${TASK_FILE}，失败则不修改，输出错误。
 2.如果任务完成，则输出\"任务完成\"
-3.如果目标文件中任务全部完成，输出\"GGGG全部完成GGGG\""
+3.只有目标文件中所有任务及子任务均已完成并验证，才在 ${TASK_FILE} 文件末尾另起一行写入\"${ALL_DONE_MARKER}\"两遍，中间不要有空格、换行或其他间隔，不重复添加已有的结束标志行；然后连续输出相同标志两遍。不要把完整的连续双标志写入规则、示例或未完成任务。"
 
 LAST_OUTPUT=""
 SAME_COUNT=0
@@ -22,6 +24,12 @@ while true; do
     EXIT_CODE=$?
     echo "[$(date)] 输出: $OUTPUT"
 
+    # 命令返回后优先检查文件，完成标志不受输出内容或退出码影响。
+    if [ -f "$TASK_FILE" ] && grep -Fq -- "$ALL_DONE_OUTPUT" "$TASK_FILE" 2>/dev/null; then
+        echo "[$(date)] 任务文件标记全部完成，退出。"
+        exit 0
+    fi
+
     # 检查是否遇到 429 错误
     if echo "$OUTPUT" | grep -qi "429"; then
         echo "[$(date)] 检测到 429 错误，等待 5 分钟后重试..."
@@ -30,12 +38,12 @@ while true; do
     fi
 
     # 检查是否全部完成
-    if echo "$OUTPUT" | grep -q "GGGG全部完成GGGG"; then
+    if echo "$OUTPUT" | grep -Fq -- "$ALL_DONE_OUTPUT"; then
         echo "[$(date)] 所有任务已完成，退出。"
         exit 0
     fi
 
-    # 检查是否输出"任务完成"（且没有"GGGG全部完成GGGG"，已先判断）
+    # 检查是否输出"任务完成"（完整结束标志已先判断）
     if echo "$OUTPUT" | grep -q "任务完成"; then
         echo "[$(date)] 任务完成，10 秒后继续下一轮。"
         # 重置连续相同计数

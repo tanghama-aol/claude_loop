@@ -13,10 +13,14 @@ const {
     resolveServerConfig,
 } = require("../server");
 const {
+    ALL_DONE_MARKER,
+    ALL_DONE_OUTPUT,
     DEFAULT_CODEX_ARGS,
     DEFAULT_RUN_PROMPT,
     LEGACY_CODEX_ARGS,
     LEGACY_RUN_PROMPT,
+    LEGACY_RUN_PROMPT_V2,
+    LEGACY_RUN_PROMPT_V3,
 } = require("../lib/core");
 
 async function request(server, pathName, options = {}) {
@@ -141,6 +145,9 @@ test("server creates task files and supports editing", async (t) => {
     const publicTask = (await request(server, "/api/state")).tasks.find((item) => item.id === created.task.id);
     assert.equal(publicTask.runtimeState, RUNTIME_STATE.loopNotStarted);
     assert.equal(publicTask.activeProcess, null);
+    assert.match(publicTask.lastPrompt, /详细方案/);
+    assert.match(publicTask.lastPrompt, /开发步骤/);
+    assert.match(publicTask.lastPrompt, /不得将新增任务标记为 FINISHED/);
 
     const file = await request(server, `/api/tasks/${created.task.id}/file`);
     assert.match(file.content, /实现任务文件生成/);
@@ -194,12 +201,17 @@ test("server appends task items to historical tasks and restores executable stat
         "## 任务列表",
         "",
         "- [x] 1. 已完成的旧任务",
-        "  - 状态：已完成",
+        "  - 状态：FINISHED",
         "  - 完成标准：旧任务完成",
+        "  - 详细方案：历史方案",
+        "  - 开发步骤：",
+        "    - [x] 1. 明确改动范围",
+        "    - [x] 2. 完成实现",
+        "    - [x] 3. 验证结果",
         "  - 执行记录：此前运行",
         "",
     ].join("\n");
-    fs.writeFileSync(path.join(tempRoot, targetFileName), originalContent, "utf8");
+    fs.writeFileSync(path.join(tempRoot, targetFileName), `${originalContent}\n${ALL_DONE_OUTPUT}\n`, "utf8");
     let server = createApp({
         rootDir: tempRoot,
         dataDir: tempData,
@@ -247,9 +259,12 @@ test("server appends task items to historical tasks and restores executable stat
 
     const file = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/file`);
     assert.ok(file.content.startsWith(originalContent));
+    assert.equal(file.content.includes(ALL_DONE_OUTPUT), false);
     assert.match(file.content, /- \[ \] 2\. 追加的第一项/);
     assert.match(file.content, /- \[ \] 3\. 追加的第二项/);
     assert.match(file.content, /完成标准：通过追加测试/);
+    assert.equal(file.content.match(/^  - 详细方案：/gm).length, 3);
+    assert.equal(file.content.match(/^    - \[ \] /gm).length, 6);
     const log = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/log`);
     assert.ok(log.events.some((event) => event.type === "task_items_appended"));
     assert.match(log.content, /追加的第一项/);
@@ -535,7 +550,7 @@ test("server keeps a relative profile working directory relative to the project"
     assert.match(fs.readFileSync(cwdFile, "utf8").trim(), /default_work_dir$/);
 });
 
-test("server migrates legacy default codex profile to auto-confirm args", async (t) => {
+test("server migrates all legacy default prompts and preserves custom prompts", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
     fs.mkdirSync(tempData, { recursive: true });
@@ -557,6 +572,30 @@ test("server migrates legacy default codex profile to auto-confirm args", async 
             configDirectory: "",
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+        }, {
+            id: "profile_claude_previous",
+            name: "previous-default",
+            agentType: "claude",
+            command: "claude",
+            promptTemplate: LEGACY_RUN_PROMPT_V2,
+        }, {
+            id: "profile_claude_planned",
+            name: "planned-default",
+            agentType: "claude",
+            command: "claude",
+            promptTemplate: LEGACY_RUN_PROMPT_V3,
+        }, {
+            id: "profile_custom_prompt",
+            name: "custom-prompt",
+            agentType: "gemini",
+            command: "gemini",
+            promptTemplate: `${LEGACY_RUN_PROMPT_V2}\n保留用户的自定义规则。`,
+        }, {
+            id: "profile_custom_planned_prompt",
+            name: "custom-planned-prompt",
+            agentType: "codex",
+            command: "codex",
+            promptTemplate: `${LEGACY_RUN_PROMPT_V3}\n保留用户的自定义计划规则。`,
         }],
         tasks: [],
         events: [],
@@ -577,6 +616,10 @@ test("server migrates legacy default codex profile to auto-confirm args", async 
     const state = await request(server, "/api/state");
     assert.equal(state.profiles[0].args, DEFAULT_CODEX_ARGS);
     assert.equal(state.profiles[0].promptTemplate, DEFAULT_RUN_PROMPT);
+    assert.equal(state.profiles[1].promptTemplate, DEFAULT_RUN_PROMPT);
+    assert.equal(state.profiles[2].promptTemplate, DEFAULT_RUN_PROMPT);
+    assert.equal(state.profiles[3].promptTemplate, `${LEGACY_RUN_PROMPT_V2}\n保留用户的自定义规则。`);
+    assert.equal(state.profiles[4].promptTemplate, `${LEGACY_RUN_PROMPT_V3}\n保留用户的自定义计划规则。`);
 });
 
 test("server closes agent stdin so commands do not wait for additional input", async (t) => {
@@ -691,6 +734,103 @@ test("server rejects a single all-done marker", async (t) => {
 
     const log = await request(server, `/api/tasks/${created.task.id}/log`);
     assert.equal(log.events.some((event) => event.type === "task_all_done"), false);
+});
+
+test("server checks task-file completion after each agent command", async (t) => {
+    const cases = [
+        { name: "Claude writes the marker but only reports task progress", agentType: "claude", marker: ALL_DONE_OUTPUT, output: "任务完成", allDone: true },
+        { name: "Codex writes the marker without output", agentType: "codex", marker: ALL_DONE_OUTPUT, allDone: true },
+        { name: "file completion takes priority over a 429 error", agentType: "codex", marker: ALL_DONE_OUTPUT, output: "429 rate limit", exitCode: 1, allDone: true },
+        { name: "an unchanged completed file stops a failed command", agentType: "claude", marker: ALL_DONE_OUTPUT, preexisting: true, exitCode: 2, allDone: true },
+        { name: "a single marker is incomplete", agentType: "claude", marker: ALL_DONE_MARKER },
+        { name: "a newline between markers is incomplete", agentType: "codex", marker: `${ALL_DONE_MARKER}\r\n${ALL_DONE_MARKER}` },
+        { name: "a space between markers is incomplete", agentType: "claude", marker: `${ALL_DONE_MARKER} ${ALL_DONE_MARKER}` },
+        { name: "a missing task file does not interrupt retry handling", agentType: "codex", removeFile: true },
+        { name: "a directory cannot be read as a task file", agentType: "claude", removeFile: true, directoryInstead: true },
+        { name: "media tasks still need an artifact", agentType: "codex", marker: ALL_DONE_OUTPUT, taskType: "image" },
+    ];
+    for (const scenario of cases) {
+        await t.test(scenario.name, async (t) => {
+            const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-marker-"));
+            const server = createApp({
+                rootDir: tempRoot,
+                dataDir: path.join(tempRoot, "data"),
+                publicDir: path.join(__dirname, "..", "public"),
+                disablePingScheduler: true,
+            });
+            t.after(() => {
+                server.closeRunners();
+                fs.rmSync(tempRoot, { recursive: true, force: true });
+            });
+            const targetFileName = "marker-task.md";
+            const completedContent = `# 任务\n\n- [x] 1. 已验证\n  - 状态：FINISHED\n\n${scenario.marker || ""}\n`;
+            const script = writeAgentScript(tempRoot, "agent-file-marker.js", [
+                "fs.appendFileSync(\"invocations.txt\", \"run\\n\", \"utf8\");",
+                scenario.removeFile
+                    ? `fs.unlinkSync(${JSON.stringify(targetFileName)});`
+                    : scenario.preexisting
+                        ? ""
+                        : `fs.writeFileSync(${JSON.stringify(targetFileName)}, ${JSON.stringify(completedContent)}, "utf8");`,
+                scenario.directoryInstead ? `fs.mkdirSync(${JSON.stringify(targetFileName)});` : "",
+                scenario.output ? `console.log(${JSON.stringify(scenario.output)});` : "",
+                `process.exitCode = ${scenario.exitCode || 0};`,
+            ].join("\n"));
+            const taskType = scenario.taskType || "text";
+            const profile = await request(server, "/api/profiles", {
+                method: "POST",
+                body: {
+                    name: "file-marker-agent",
+                    agentType: scenario.agentType,
+                    command: script.command,
+                    args: script.args,
+                    outputModalities: [taskType],
+                    enabled: true,
+                },
+            });
+            const created = await request(server, "/api/tasks", {
+                method: "POST",
+                body: {
+                    title: scenario.name,
+                    targetFileName,
+                    directory: tempRoot,
+                    sourceMode: "template",
+                    taskType,
+                    runProfileIds: [profile.profile.id],
+                },
+            });
+            if (scenario.preexisting) fs.writeFileSync(created.task.filePath, completedContent, "utf8");
+            const started = await request(server, `/api/tasks/${created.task.id}/start`, {
+                method: "POST",
+                body: { profileIds: [profile.profile.id] },
+            });
+            const expectedStatus = scenario.allDone ? "all_done" : "retry_wait";
+            const task = await waitFor(async () => {
+                const state = await request(server, "/api/state");
+                return state.tasks.find((item) => item.id === created.task.id && item.status === expectedStatus);
+            });
+            assert.equal(task.lastExitCode, scenario.exitCode || 0);
+            assert.equal(task.lastOutput.includes(ALL_DONE_OUTPUT), false);
+            assert.equal(fs.readFileSync(path.join(tempRoot, "invocations.txt"), "utf8"), "run\n");
+            const log = await request(server, `/api/tasks/${created.task.id}/log`);
+            const completionEvents = log.events.filter((event) => event.type === "task_all_done");
+            if (scenario.allDone) {
+                assert.equal(task.nextRunAt, null);
+                assert.equal(task.retryCount, 0);
+                assert.equal(task.runtimeState, RUNTIME_STATE.loopNotStarted);
+                assert.equal(task.activeProcess, null);
+                assert.equal(completionEvents.length, 1);
+                assert.equal(completionEvents[0].metadata.completionSource, "task_file");
+                assert.equal(log.events.some((event) => ["retry_wait", "task_completed"].includes(event.type)), false);
+                const runLog = await request(server, `/api/tasks/${created.task.id}/logs/${started.runId}`);
+                assert.equal(runLog.run.status, "all_done");
+                assert.ok(runLog.run.endedAt);
+            } else {
+                assert.equal(completionEvents.length, 0);
+                assert.ok(task.nextRunAt);
+                assert.equal(task.artifactCount, 0);
+            }
+        });
+    }
 });
 
 test("server exposes active agent process while a task is running", async (t) => {
@@ -816,6 +956,10 @@ test("server reports idle waiting while loop is between agent runs", async (t) =
     assert.equal(waitingTask.isIdleWaiting, true);
     assert.equal(waitingTask.activeProcess, null);
     assert.ok(waitingTask.runtimeNextRunAt);
+    assert.match(waitingTask.lastPrompt, /idle-task\.md/);
+    assert.match(waitingTask.lastPrompt, /详细方案/);
+    assert.match(waitingTask.lastPrompt, /开发步骤/);
+    assert.match(waitingTask.lastPrompt, /FINISHED/);
 });
 
 test("server can schedule a task to start once in the future", async (t) => {
@@ -1269,7 +1413,8 @@ test("server completes a durable lifecycle with rich output and historical appen
         "    process.stdout.write(\"\\nGGGG全部完成GGGGGGGG全部完成GGGG\\n\");",
         "} else {",
         "    const current = fs.readFileSync(targetPath, \"utf8\");",
-        "    fs.writeFileSync(targetPath, current.replace(\"- [ ] 2. \", \"- [x] 2. \"), \"utf8\");",
+        "    const completed = current.replaceAll(\"- [ ]\", \"- [x]\").replace(\"状态：未开始\", \"状态：FINISHED\");",
+        "    fs.writeFileSync(targetPath, completed, \"utf8\");",
         "    console.log(\"第二轮完成 ✓\");",
         "    console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
         "}",
@@ -1383,7 +1528,8 @@ test("server completes a durable lifecycle with rich output and historical appen
     assert.equal(afterAppend.content.slice(0, originalContent.length), originalContent);
     assert.match(afterAppend.content, /- \[x\] 1\. 原始任务/);
     assert.ok(afterAppend.content.includes(`- [ ] 2. ${appendedText}`));
-    assert.equal((afterAppend.content.match(/- \[ \]/g) || []).length, 1);
+    assert.equal((afterAppend.content.match(/^- \[ \]/gm) || []).length, 1);
+    assert.equal((afterAppend.content.match(/^    - \[ \]/gm) || []).length, 3);
     const appendLog = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/log`);
     assert.ok(appendLog.events.some((event) => event.type === "task_items_appended"));
     assert.match(appendLog.content, /追加 <危险标签> & Unicode 🚀/);
@@ -1415,7 +1561,10 @@ test("server completes a durable lifecycle with rich output and historical appen
     const finalFile = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/file`);
     assert.match(finalFile.content, /- \[x\] 1\. 原始任务/);
     assert.ok(finalFile.content.includes(`- [x] 2. ${appendedText}`));
-    assert.equal((finalFile.content.match(/- \[x\]/g) || []).length, 2);
+    assert.equal((finalFile.content.match(/^- \[x\]/gm) || []).length, 2);
+    assert.equal((finalFile.content.match(/^    - \[x\]/gm) || []).length, 3);
+    assert.doesNotMatch(finalFile.content, /- \[ \]/);
+    assert.match(finalFile.content, /状态：FINISHED/);
     const secondLog = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/logs/${encodeURIComponent(secondStarted.runId)}`);
     assert.equal(secondLog.run.status, "all_done");
     assert.match(secondLog.content, /第二轮完成 ✓/);
@@ -2609,7 +2758,7 @@ test("server runs image and video tasks with provider metadata and artifact prev
         aspectRatio: "3:4",
         resolution: "1536x2048",
         durationSeconds: "",
-        referenceFiles: "assets/reference.png",
+        referenceFiles: path.join("assets", "reference.png"),
     });
 
     const artifactResponse = await server.inject({

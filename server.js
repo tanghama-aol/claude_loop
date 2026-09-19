@@ -16,6 +16,8 @@ const {
     appendTaskItemsToMarkdown,
     LEGACY_CODEX_ARGS,
     LEGACY_RUN_PROMPT,
+    LEGACY_RUN_PROMPT_V2,
+    LEGACY_RUN_PROMPT_V3,
     configEnvForProfile,
     createTaskLogEvent,
     createDefaultProfiles,
@@ -562,7 +564,9 @@ function createApp(options = {}) {
             && String(normalized.command || "") === "codex"
             && String(normalized.args || "") === LEGACY_CODEX_ARGS;
         if (isLegacyDefaultCodex) normalized.args = DEFAULT_CODEX_ARGS;
-        if (normalized.promptTemplate === LEGACY_RUN_PROMPT) normalized.promptTemplate = DEFAULT_RUN_PROMPT;
+        if ([LEGACY_RUN_PROMPT, LEGACY_RUN_PROMPT_V2, LEGACY_RUN_PROMPT_V3].includes(normalized.promptTemplate)) {
+            normalized.promptTemplate = DEFAULT_RUN_PROMPT;
+        }
         return normalized;
     }
 
@@ -833,6 +837,14 @@ function createApp(options = {}) {
             return crypto.createHash("md5").update(fs.readFileSync(filePath)).digest("hex");
         } catch {
             return "";
+        }
+    }
+
+    function taskFileHasAllDoneMarker(filePath) {
+        try {
+            return Boolean(safeStat(filePath)?.isFile() && isAllDoneOutput(fs.readFileSync(filePath, "utf8")));
+        } catch {
+            return false;
         }
     }
 
@@ -1556,9 +1568,8 @@ function createApp(options = {}) {
             status: STATUS.notStarted,
             appendedAt,
         }));
-        const suffix = appended.content.slice(originalContent.length);
         const previousStatus = String(task.status || STATUS.notStarted);
-        fs.appendFileSync(filePath, suffix, "utf8");
+        fs.writeFileSync(filePath, appended.content, "utf8");
 
         const previousItems = normalizeAppendedTaskItems(task.appendedItems || task.appendHistory);
         const allAppendedItems = [...previousItems, ...records];
@@ -4160,6 +4171,7 @@ function createApp(options = {}) {
 
         const output = result.output || "";
         const afterHash = fileHash(task.filePath);
+        const taskFileAllDone = normalizeTaskType(task.taskType) === "text" && taskFileHasAllDoneMarker(task.filePath);
         const generatedArtifacts = changedArtifacts(beforeArtifacts, task);
 
         if (runner.stopped) {
@@ -4178,7 +4190,9 @@ function createApp(options = {}) {
             return;
         }
 
-        if (/429/i.test(output)) {
+        // A persisted completion marker must stop the loop even if the command
+        // also reports a rate limit or exits unsuccessfully after writing it.
+        if (/429/i.test(output) && !taskFileAllDone) {
             task.status = STATUS.retryWait;
             task.retryCount = (task.retryCount || 0) + 1;
             const switched = rotateProfile(state, task);
@@ -4228,7 +4242,7 @@ function createApp(options = {}) {
             return;
         }
 
-        if (normalizeTaskType(task.taskType) === "text" && isAllDoneOutput(output)) {
+        if (normalizeTaskType(task.taskType) === "text" && (taskFileAllDone || isAllDoneOutput(output))) {
             task.status = STATUS.allDone;
             task.nextRunAt = null;
             task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
@@ -4237,6 +4251,7 @@ function createApp(options = {}) {
                 runId,
                 profile,
                 runStatus: STATUS.allDone,
+                metadata: { completionSource: taskFileAllDone ? "task_file" : "output" },
             });
             updateTaskRunLog(task, runId, { status: STATUS.allDone, endedAt: nowISO() });
             saveState(state);

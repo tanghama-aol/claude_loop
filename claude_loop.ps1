@@ -18,15 +18,13 @@ function ConvertFrom-Utf8Base64 {
 $TaskDoneMarker = ConvertFrom-Utf8Base64 "5Lu75Yqh5a6M5oiQ"
 $AllDoneText = ConvertFrom-Utf8Base64 "5YWo6YOo5a6M5oiQ"
 $AllDoneMarker = "GGGG" + $AllDoneText + "GGGG"
-$LegacyAllDoneText = ConvertFrom-Utf8Base64 "5YWo6YOo5Lu75Yqh5a6M5oiQ"
-$LegacyWrappedAllDoneMarker = '$$$' + $LegacyAllDoneText + '$$$'
-$LegacyDoubleDollarAllDoneMarker = '$$' + $LegacyAllDoneText + '$$'
+$AllDoneOutput = $AllDoneMarker + $AllDoneMarker
 
 $Prompt = @(
     ("1. Read one task from {0} and work on it. Mark it done when finished. Do not start sub-agents; complete it in the current agent." -f $TaskFile),
     ("2. If successful, update {0}. If failed, do not update it and print the error." -f $TaskFile),
     ("3. If one task is complete, output `"{0}`"." -f $TaskDoneMarker),
-    ("4. If every task in the target file is complete, output `"{0}`"." -f $AllDoneMarker)
+    ("4. Only when every task and subtask is complete and verified, append `"{0}`" twice consecutively on one line at the end of {1}, with no spaces or line breaks between the two markers. Do not duplicate an existing completion line. Then output the same two consecutive markers. Do not put the complete marker pair in instructions, examples, or unfinished tasks." -f $AllDoneMarker, $TaskFile)
 ) -join [Environment]::NewLine
 
 $lastOutput = ""
@@ -46,6 +44,19 @@ function Get-TaskFileHash {
         return (Get-FileHash -LiteralPath $TaskFile -Algorithm MD5 -ErrorAction Stop).Hash.ToLowerInvariant()
     } catch {
         return ""
+    }
+}
+
+function Test-TaskFileAllDone {
+    if (-not (Test-Path -LiteralPath $TaskFile -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $content = [string](Get-Content -LiteralPath $TaskFile -Raw -Encoding UTF8 -ErrorAction Stop)
+        return $content.Contains($AllDoneOutput)
+    } catch {
+        return $false
     }
 }
 
@@ -82,13 +93,18 @@ while ($true) {
     Write-LoopLog "Exit code: $($result.ExitCode)"
     Write-LoopLog "Output: $output"
 
+    if (Test-TaskFileAllDone) {
+        Write-LoopLog "Task file marks all tasks complete; exiting."
+        exit 0
+    }
+
     if ($output -match "429") {
         Write-LoopLog "Detected 429; waiting $RateLimitWaitSeconds seconds before retry."
         Start-Sleep -Seconds $RateLimitWaitSeconds
         continue
     }
 
-    if ($output.Contains($AllDoneMarker) -or $output.Contains($LegacyWrappedAllDoneMarker) -or $output.Contains($LegacyDoubleDollarAllDoneMarker) -or $output.Contains($LegacyAllDoneText)) {
+    if ($output.Contains($AllDoneOutput)) {
         Write-LoopLog "All tasks are complete; exiting."
         exit 0
     }
