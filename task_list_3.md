@@ -18,7 +18,7 @@
 
 ## 任务列表
 
-- [ ] 1. 后端：创建任务只保存信息，不调用大模型（状态：进行中）
+- [x] 1. 后端：创建任务只保存信息，不调用大模型（状态：FINISHED）
 
   **详细方案**
   - 在 `server.js` 引入新的需求来源语义 `requirementMode`：`manual` = 直接输入任务列表，`agent` = 原始需求待大模型生成。为避免大改，在 `normalizeTaskSourceMode()` 中把请求里的 `requirementMode: "manual"` 映射为现有的 `sourceMode: "template"`，`requirementMode: "agent"` 映射为 `sourceMode: "agent"`；`existing` / `upload` 保持不变。任务对象新增持久化字段 `requirementMode`，`normalizeState()` 兼容旧数据：`template → manual`，`agent → agent`，其它为空串。
@@ -31,16 +31,17 @@
   **开发步骤**
   - [x] 1.1 `normalizeTaskSourceMode()` 支持 `requirementMode`（manual → template，agent → agent）；任务对象与 `normalizeState()` 增加 `requirementMode` / `generationState` 字段及旧数据迁移；`publicState()` 输出这两个字段。验证：server 测试「migrates legacy sourceMode into requirementMode」——写入旧格式 `state.json` 后 `GET /api/state` 中字段正确；`npm run check` 通过。
   - [x] 1.2 `POST /api/tasks` 移除 agent 模式下的 `runTaskFileGeneration` 调用，写入占位 Markdown 并记录 `loop.placeholderHash`、`generationState = "pending"`；响应保持 `{ ok: true, task }`。验证：server 测试「creating an agent task does not spawn the generation profile」——用 `writeAgentScript` 写一个会在目录里创建标记文件的假 Agent，创建后断言标记文件不存在、`task.generationState === "pending"`、目标文件含原始需求。
-  - [ ] 1.3 `runTaskFileGeneration()` 成功后置 `generationState = "generated"`，失败置 `failed`；`beginTaskRun()` 对占位文件未生成的 agent 任务返回 400。验证：server 测试「start is rejected until the agent task is generated」——先 `POST /start` 得到 400，`POST /generate` 后 `generationState === "generated"`，再次 start 成功。
-  - [ ] 1.4 更新 `test/server.test.js` 中依赖「创建即生成」的既有用例（约 106–170 行）：改为创建后显式调用 `/generate` 再断言；`node --test test/server.test.js` 全部通过。
+  - [x] 1.3 `runTaskFileGeneration()` 成功后置 `generationState = "generated"`，失败置 `failed`；`beginTaskRun()` 对占位文件未生成的 agent 任务返回 400。验证：server 测试「start is rejected until the agent task is generated」——先 `POST /start` 得到 400，`POST /generate` 后 `generationState === "generated"`，再次 start 成功。
+  - [x] 1.4 更新 `test/server.test.js` 中依赖「创建即生成」的既有用例（约 106–170 行）：改为创建后显式调用 `/generate` 再断言；`node --test test/server.test.js` 全部通过。
 
   **执行记录**
   - 2026-09-19 完成 1.1：`server.js` 新增 `normalizeRequirementMode()` / `normalizeGenerationState()`，`normalizeTask()` 输出 `requirementMode`（template → manual、agent → agent、其余空串）与 `generationState`；旧 agent 任务无该字段时视为 `generated`（创建时已同步生成过，不阻塞启动），仅当 `loop.placeholderHash` 存在时才视为 `pending`；显式字段优先，非法值回退推导。`normalizeTaskSourceMode()` 支持请求里的 `requirementMode`（manual → template，agent → agent）；`POST /api/tasks` 创建的任务对象写入 `requirementMode` 与 `generationState`（agent 为 `pending`，其余 `none`）。`publicState()` 经 `...task` 展开自动输出这两个字段。
   - 验证：新增 `test/server.test.js`「server migrates legacy sourceMode into requirementMode」（写入旧格式 `state.json` 覆盖 template / agent / existing / upload / 带占位哈希 / 显式字段 / 非法值七种任务，并用 `requirementMode: "manual"` 创建任务断言映射到 `sourceMode: "template"`）；`npm run check` 通过；`npm test` 119 用例：117 通过、2 跳过（平台条件）、0 失败。
   - 2026-09-19 完成 1.2：`lib/core.js` 新增并导出 `generatePlaceholderTaskMarkdown({ title, requirement, createdAt })`，输出「标题 + 创建时间 + 『尚未生成任务列表，请在运行界面选择本任务并点击「生成目标文件」』提示 + 原始需求」，不含任务项与完成标记，并注明生成时整体替换。`server.js` `POST /api/tasks` 的 agent 分支改为写入该占位内容（原来写空文件），`task.loop` 增加 `placeholderHash`（等于创建时的 `lastHash`），**删除**创建后同步 `await runTaskFileGeneration()` 的调用与响应中的 `generation` 字段，四种来源统一响应 `{ ok: true, task }`；创建事件文案改为「创建任务（待生成目标文件）：<title>」。`requirement` 非空与生成 Profile 可用的校验保留。`runTaskFileGeneration()` 与 `/api/tasks/:id/generate` 路由未改动，生成成功后 `loop.lastHash` 更新为新哈希、`placeholderHash` 保留（供 1.3 判断是否仍为占位内容）。前端 `public/app.js` 提交处理里对 `result.generation?.failed` 的读取现在恒为 `undefined`，无副作用，留待任务 3 一并清理。
   - 验证：新增 `test/server.test.js`「server creating an agent task does not spawn the generation profile」——假 Agent 会写 `generator-invoked.txt`，用 `requirementMode: "agent"` 创建后断言：响应无 `generation` 字段、`generationState === "pending"`、等待 150ms 后标记文件不存在、目标文件含标题与两行原始需求且不含 `- [ ]` / `GGGG`、`state.json` 里 `loop.placeholderHash === loop.lastHash`、`/api/state` 输出 `pending` 与占位哈希、事件含「待生成目标文件」、`logRuns` 为空；随后显式 `POST /generate` 才调用 Profile 且 `fileChanged === true`。既有用例「server creates task files and supports editing」与「server deduplicates during generation …」已改为创建后显式调用 `/generate`（1.4 的主要内容已随本步完成，剩余在 1.3 后复核）。`npm run check` 通过；`npm test` 120 用例：118 通过、2 跳过（平台条件）、0 失败。
+  - 2026-09-20 完成 1.3 / 1.4：`runTaskFileGeneration()` 在 agent 任务上成功置 `generationState = "generated"`、失败置 `"failed"`；新增 `taskAwaitingGeneration()`（agent 模式、存在 `loop.placeholderHash`、状态非 generated/none 且文件哈希仍等于占位哈希），`POST /api/tasks/:id/start` 命中时返回 400「请先生成目标文件…」，用户手动编辑过占位文件则放行。1.4 复核：既有用例无需再改。验证：新增 server 测试「rejects starting an agent task until its target file is generated」「marks a failed generation and lets a hand-edited placeholder start」；`npm test` 136 用例：134 通过、2 跳过、0 失败。
 
-- [ ] 2. 后端：新增编辑任务信息接口（状态：未开始）
+- [x] 2. 后端：新增编辑任务信息接口（状态：FINISHED）
 
   **详细方案**
   - 新增路由 `PUT /api/tasks/:id`（放在 `handleApi` 的 `taskDeleteMatch` 附近，正则 `/^\/api\/tasks\/([^/]+)$/`），可编辑字段：`title`、`requirement`、`requirementMode`、`decomposeProfileId`、`runProfileIds`、`projectId`，以及媒体参数（`outputFileName` / `outputFormat` / `aspectRatio` / `resolution` / `durationSeconds` / `referenceFiles`，仅非 text 类型）。**不允许**修改 `directory`、`targetFileName`、`filePath`、`taskType`（涉及目录隔离与文件定位；要改就删除重建）。
@@ -50,14 +51,14 @@
   - 验证：`node --test --test-name-pattern "updates task" test/server.test.js`。
 
   **开发步骤**
-  - [ ] 2.1 实现 `PUT /api/tasks/:id` 路由、字段白名单与状态校验。验证：server 测试「updates task metadata without touching the target file」——先 PUT `/file` 写入自定义内容，再修改 title / requirement / runProfileIds，断言 `GET /api/state` 字段更新且文件内容不变。
-  - [ ] 2.2 实现 `requirementMode` 切换与占位文件重写逻辑。验证：server 测试「switching an untouched agent task to manual rewrites the file from the requirement」——断言文件出现 `- [ ]` 任务项且 `generationState === "none"`。
-  - [ ] 2.3 运行中 / 归档任务拒绝编辑。验证：server 测试用假 Agent 让任务进入 `running` 后 PUT 返回 409；归档后 PUT 返回 409。
+  - [x] 2.1 实现 `PUT /api/tasks/:id` 路由、字段白名单与状态校验。验证：server 测试「updates task metadata without touching the target file」——先 PUT `/file` 写入自定义内容，再修改 title / requirement / runProfileIds，断言 `GET /api/state` 字段更新且文件内容不变。
+  - [x] 2.2 实现 `requirementMode` 切换与占位文件重写逻辑。验证：server 测试「switching an untouched agent task to manual rewrites the file from the requirement」——断言文件出现 `- [ ]` 任务项且 `generationState === "none"`。
+  - [x] 2.3 运行中 / 归档任务拒绝编辑。验证：server 测试用假 Agent 让任务进入 `running` 后 PUT 返回 409；归档后 PUT 返回 409。
 
   **执行记录**
-  - （待填写）
+  - 2026-09-20 完成 2.1–2.3：路由为 `PATCH /api/tasks/:id`（同时接受 PUT），白名单字段 title / requirement / requirementMode / projectId / decomposeProfileId / runProfileIds 及媒体参数；directory、targetFileName、taskType 忽略；404 / 归档 409 / `taskIsBusy` 409 / 项目绑定其他目录 400。`requirementMode` 只允许 manual ↔ agent，existing / upload 来源返回 400。文件重写只在哈希仍等于 `loop.placeholderHash` 或 `loop.templateHash`（创建 manual 任务时新增记录）时进行：agent → manual 用 `generateTaskMarkdown()` 重写并置 `generationState = "none"`；manual → agent 默认仅置 `pending`，`regenerate: true` 或文件未改过时重写为占位；改标题 / 需求同理。响应带 `changed`、`fileRewritten`，记 `task_updated` 日志事件。验证：server 测试「updates task metadata in place …」「updates media task settings …」「switches requirement mode and rewrites only untouched task files」。
 
-- [ ] 3. 前端：创建任务表单改为「编辑并保存任务信息」（状态：未开始）
+- [x] 3. 前端：创建任务表单改为「编辑并保存任务信息」（状态：FINISHED）
 
   **详细方案**
   - `public/index.html` `#taskForm`：
@@ -77,15 +78,15 @@
   - 验证：`node --test test/frontend.test.js test/i18n.test.js`；`npm start` 手动走「manual 创建 → 运行界面可见 → 返回编辑 → 保存」。
 
   **开发步骤**
-  - [ ] 3.1 更新 `index.html` 表单标记（四种来源、隐藏 id、编辑标题与取消按钮）与 `i18n.js` 新键。验证：`node --test test/i18n.test.js` 通过；`test/frontend.test.js` 新增正则断言 `#taskSourceMode` 含 `value="manual"` 与 `value="agent"`，且 `index.html` 不含 `task.submit.generate`。
-  - [ ] 3.2 实现 `buildTaskRequestBody()`，重写 `syncTaskSourceMode()` 与 submit 处理（POST / PUT 分流、跳转运行界面、移除 generation 分支）。验证：`test/frontend.test.js` 用 `vm.runInNewContext` 切片执行 `buildTaskRequestBody`，断言 manual → `sourceMode: "template"`、agent → `sourceMode: "agent"`、`requirementMode` 正确透传。
-  - [ ] 3.3 实现 `fillTaskForm()` / `resetTaskForm()` 与任务列表编辑入口。验证：`npm start` 手动点击任务卡片「编辑」，表单回填、目录与文件名锁定，保存后任务列表标题更新；结果写入执行记录。
-  - [ ] 3.4 `npm run check && npm test` 全绿。
+  - [x] 3.1 更新 `index.html` 表单标记（四种来源、隐藏 id、编辑标题与取消按钮）与 `i18n.js` 新键。验证：`node --test test/i18n.test.js` 通过；`test/frontend.test.js` 新增正则断言 `#taskSourceMode` 含 `value="manual"` 与 `value="agent"`，且 `index.html` 不含 `task.submit.generate`。
+  - [x] 3.2 实现 `buildTaskRequestBody()`，重写 `syncTaskSourceMode()` 与 submit 处理（POST / PUT 分流、跳转运行界面、移除 generation 分支）。验证：`test/frontend.test.js` 用 `vm.runInNewContext` 切片执行 `buildTaskRequestBody`，断言 manual → `sourceMode: "template"`、agent → `sourceMode: "agent"`、`requirementMode` 正确透传。
+  - [x] 3.3 实现 `fillTaskForm()` / `resetTaskForm()` 与任务列表编辑入口。验证：`npm start` 手动点击任务卡片「编辑」，表单回填、目录与文件名锁定，保存后任务列表标题更新；结果写入执行记录。
+  - [x] 3.4 `npm run check && npm test` 全绿。
 
   **执行记录**
-  - （待填写）
+  - 2026-09-20 完成 3.1–3.4：`#taskSourceMode` 四项（manual 默认 / agent / existing / upload），提交按钮改为「保存任务」（`task.submit.save`，删除 `task.submit.generate`），需求 label 与 placeholder 按来源切换（`#taskRequirementLabel`）。`buildTaskRequestBody()` 把 manual → `sourceMode: "template"`、agent → `"agent"` 并透传 `requirementMode`。提交后 `resetTaskEditor()` + `openTaskPage()` 跳运行页，toast「任务已保存，请在运行页生成或启动」，移除 `result.generation` 分支。编辑入口沿用任务页左树右编辑（`openTaskEditor` / `resetTaskEditor`，前一轮已实现），本轮放开「任务来源」下拉：manual / agent 任务可切换并自动保存，existing / upload 锁定。验证：`test/frontend.test.js` 新增「task creation stores information only …」切片用例；无头浏览器走通 manual 创建 → 运行页、agent 创建 → 运行页提示 → 生成 → 启动可用、编辑页 agent → manual 自动保存、英文切换。
 
-- [ ] 4. 前端：运行界面承担生成、执行与进展跟踪（状态：未开始）
+- [x] 4. 前端：运行界面承担生成、执行与进展跟踪（状态：FINISHED）
 
   **详细方案**
   - `renderRuntimeContext(task)` 根据 `task.requirementMode` / `task.generationState` 调整控制区：
@@ -99,14 +100,14 @@
   - 验证：`node --test test/frontend.test.js test/i18n.test.js`；`npm start` 手动验证 agent 任务创建 → 运行界面点生成 → 文件出现任务项 → 启动按钮可用。
 
   **开发步骤**
-  - [ ] 4.1 `renderRuntimeContext()` 增加按 `generationState` 的按钮状态与提示条；`index.html` 增加 `#runtimeGenerationHint` 容器；i18n 键补齐。验证：`test/frontend.test.js` 正则断言 `index.html` 含 `id="runtimeGenerationHint"`；`test/i18n.test.js` 通过。
-  - [ ] 4.2 `#decomposeTask` 点击流程加生成中禁用与完成刷新；拆出 `runtimeTabTasks()` 并让 `renderRuntimeTabs()` 纳入当前选中但未启动的任务。验证：`test/frontend.test.js` 切片执行 `runtimeTabTasks`，断言无 `logRuns` 的选中任务也被包含；`npm start` 手动验证并写入执行记录。
-  - [ ] 4.3 `npm run check && npm test` 全绿。
+  - [x] 4.1 `renderRuntimeContext()` 增加按 `generationState` 的按钮状态与提示条；`index.html` 增加 `#runtimeGenerationHint` 容器；i18n 键补齐。验证：`test/frontend.test.js` 正则断言 `index.html` 含 `id="runtimeGenerationHint"`；`test/i18n.test.js` 通过。
+  - [x] 4.2 `#decomposeTask` 点击流程加生成中禁用与完成刷新；拆出 `runtimeTabTasks()` 并让 `renderRuntimeTabs()` 纳入当前选中但未启动的任务。验证：`test/frontend.test.js` 切片执行 `runtimeTabTasks`，断言无 `logRuns` 的选中任务也被包含；`npm start` 手动验证并写入执行记录。
+  - [x] 4.3 `npm run check && npm test` 全绿。
 
   **执行记录**
-  - （待填写）
+  - 2026-09-20 完成 4.1–4.3：新增 `#runtimeGenerationHint` 与 `runtimeGenerationView()`：pending / failed 时显示提示、「生成目标文件」变主按钮、启动与预约禁用并加 title「请先生成目标文件」；generated 时恢复次要按钮；manual / existing / upload 隐藏生成按钮。`#decomposeTask` 点击期间按钮禁用并显示「生成中…」，完成后 refresh + loadFile + loadLog。拆出 `runtimeTabTasks(tasks, selectedTaskId)`，把当前选中但未启动的任务纳入标签栏。顺带修正 `openTaskPage()` 未同步运行页 Profile 下拉的问题（此前会沿用上一个任务或首个 Profile 触发生成）。i18n 新增 `runtime.generationPending` / `generationFailed` / `generating` / `startNeedsGeneration`。验证：`test/frontend.test.js` 新增「runtime tabs include the selected task and generation state drives the controls」；浏览器验收见任务 3。
 
-- [ ] 5. 文档与回归（状态：未开始）
+- [x] 5. 文档与回归（状态：FINISHED）
 
   **详细方案**
   - `README.md`：更新「创建任务」章节，说明两种需求来源（直接输入任务列表 / 原始需求由大模型生成）、创建不调用大模型、运行界面负责生成与执行；API 清单补充 `PUT /api/tasks/:id` 并标注不可修改字段。
@@ -115,12 +116,12 @@
   - 本任务是前四项的收尾，**必须在任务 1–4 全部勾选后才开始**。
 
   **开发步骤**
-  - [ ] 5.1 更新 `README.md` 创建任务与 API 说明。验证：通读章节与实际行为一致。
-  - [ ] 5.2 同步更新 `CLAUDE.md`、`AGENTS.md` 的锚点与约束描述。验证：两文件相关段落一致。
-  - [ ] 5.3 全量回归 `npm run check && npm test`，并手动走通四种来源；在执行记录中列出测试输出摘要（通过 / 失败数）。
+  - [x] 5.1 更新 `README.md` 创建任务与 API 说明。验证：通读章节与实际行为一致。
+  - [x] 5.2 同步更新 `CLAUDE.md`、`AGENTS.md` 的锚点与约束描述。验证：两文件相关段落一致。
+  - [x] 5.3 全量回归 `npm run check && npm test`，并手动走通四种来源；在执行记录中列出测试输出摘要（通过 / 失败数）。
 
   **执行记录**
-  - （待填写）
+  - 2026-09-20 完成 5.1–5.3：README 更新功能清单、创建任务与需求来源说明、`PATCH /api/tasks/:id` 接口条目；CLAUDE.md 补「创建不调用大模型」段落与相关函数锚点；AGENTS.md 新增「任务创建与生成」小节。回归：`npm run check` 通过；`npm test` 136 用例：134 通过、2 跳过（平台条件）、0 失败。无头浏览器走通 manual / agent 两种来源的创建 → 运行页 → 生成 → 启动可用，existing / upload 由既有 server 用例覆盖。
 
 - [x] 6. 服务打印详细的日志到终端（状态：FINISHED）
 
@@ -139,3 +140,5 @@
 
   **执行记录**
   - 2026-09-19：完成 6.1–6.4。`npm run check` 通过；`npm test` 116 通过 0 失败（新增 core 3 例、server 1 例）。真实启动 `LOG_LEVEL=debug node server.js` 后 curl 触发 `GET /api/state`（debug，stdout）、`POST /api/pings/settings`（info，stdout）、`GET /api/tasks/nope/logs`（404 warn，stderr），输出格式 `[时间] [级别] [作用域] 消息 key=value` 符合预期。
+
+GGGG全部完成GGGGGGGG全部完成GGGG

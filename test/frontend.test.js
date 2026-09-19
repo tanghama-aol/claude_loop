@@ -100,7 +100,8 @@ test("runtime view lists started tasks as switchable tabs", () => {
     const escapeEnd = appSource.indexOf("\nfunction formatTime", escapeStart);
     const startedStart = appSource.indexOf("function taskIsStarted(");
     const startedEnd = appSource.indexOf("\nfunction renderRuntimeContext", startedStart);
-    const renderStart = appSource.indexOf("function renderRuntimeTabs(");
+    // renderRuntimeTabs 依赖紧邻其前的 runtimeTabTasks，一并切入
+    const renderStart = appSource.indexOf("function runtimeTabTasks(");
     const renderEnd = appSource.indexOf("\nasync function selectRuntimeTask(", renderStart);
     assert.ok(startedStart >= 0 && startedEnd > startedStart, "started-task filter must remain present");
     assert.ok(renderStart >= 0 && renderEnd > renderStart, "runtime tab renderer must remain present");
@@ -428,4 +429,80 @@ test("task page pairs the project tree with an auto-saving task editor", () => {
     assert.deepEqual(payload.runProfileIds, ["p1", "p2"]);
     form.dataset.taskType = "text";
     assert.deepEqual(Object.keys(context.taskEditorPayload(form)).sort(), ["decomposeProfileId", "projectId", "requirement", "runProfileIds", "title"]);
+});
+
+test("task creation stores information only and the runtime page owns generation", () => {
+    // 3.1 表单来源四选一，创建按钮不再是「调用 Agent 生成」
+    assert.match(indexSource, /id="taskSourceMode"[\s\S]*?value="manual"[\s\S]*?value="agent"[\s\S]*?value="existing"[\s\S]*?value="upload"/);
+    assert.doesNotMatch(indexSource, /task\.submit\.generate/);
+    assert.match(indexSource, /id="taskSubmitButton" data-i18n="task\.submit\.save"/);
+    assert.match(indexSource, /id="taskRequirementLabel"/);
+    // 4.1 运行页有生成提示容器
+    assert.match(indexSource, /id="runtimeGenerationHint"[^>]*hidden/);
+
+    // 3.2 buildTaskRequestBody：manual → template，agent → agent，requirementMode 透传；existing / upload 不带 requirementMode
+    const start = appSource.indexOf("function buildTaskRequestBody(values)");
+    const end = appSource.indexOf("\nfunction syncTaskSourceMode", start);
+    assert.ok(start >= 0 && end > start);
+    const context = {};
+    vm.runInNewContext(`${appSource.slice(start, end)}\nthis.buildTaskRequestBody = buildTaskRequestBody;`, context);
+    const manual = context.buildTaskRequestBody({ title: "a", sourceMode: "manual", sourceFile: {} });
+    assert.equal(manual.sourceMode, "template");
+    assert.equal(manual.requirementMode, "manual");
+    assert.equal("sourceFile" in manual, false);
+    const agent = context.buildTaskRequestBody({ title: "b", sourceMode: "agent" });
+    assert.equal(agent.sourceMode, "agent");
+    assert.equal(agent.requirementMode, "agent");
+    const existing = context.buildTaskRequestBody({ title: "c", sourceMode: "existing", requirementMode: "manual" });
+    assert.equal(existing.sourceMode, "existing");
+    assert.equal("requirementMode" in existing, false);
+    assert.equal(context.buildTaskRequestBody({ title: "d" }).sourceMode, "template", "default source is the manual task list");
+
+    // submit 不再处理 result.generation，保存后跳转运行页
+    const submitStart = appSource.indexOf('$("#taskForm").addEventListener("submit"');
+    const submitEnd = appSource.indexOf('$("#deduplicateTasks").addEventListener', submitStart);
+    const submitSource = appSource.slice(submitStart, submitEnd);
+    assert.doesNotMatch(submitSource, /result\.generation/);
+    assert.match(submitSource, /await openTaskPage\(result\.task\.id\)/);
+    assert.match(submitSource, /toast\.taskCreated/);
+});
+
+test("runtime tabs include the selected task and generation state drives the controls", () => {
+    const tabsStart = appSource.indexOf("function runtimeTabTasks(tasks, selectedTaskId)");
+    const tabsEnd = appSource.indexOf("\nfunction renderRuntimeTabs", tabsStart);
+    assert.ok(tabsStart >= 0 && tabsEnd > tabsStart);
+    const context = {
+        taskIsStarted: (task) => Boolean(task.isRunning),
+    };
+    vm.runInNewContext(`${appSource.slice(tabsStart, tabsEnd)}\nthis.runtimeTabTasks = runtimeTabTasks;`, context);
+    const tasks = [
+        { id: "running", isRunning: true },
+        { id: "fresh", isRunning: false },
+        { id: "archived", isRunning: false, archived: true },
+    ];
+    assert.deepEqual(context.runtimeTabTasks(tasks, "fresh").map((task) => task.id), ["running", "fresh"], "a just-created selected task without runs is listed");
+    assert.deepEqual(context.runtimeTabTasks(tasks, "running").map((task) => task.id), ["running"], "no duplicate when the selected task is already started");
+    assert.deepEqual(context.runtimeTabTasks(tasks, "archived").map((task) => task.id), ["running"], "archived tasks never appear");
+    assert.deepEqual(context.runtimeTabTasks(tasks, "").map((task) => task.id), ["running"]);
+
+    const viewStart = appSource.indexOf("function runtimeGenerationView(task)");
+    const viewEnd = appSource.indexOf("\n// 运行页标签", viewStart);
+    assert.ok(viewStart >= 0 && viewEnd > viewStart);
+    const viewContext = {};
+    vm.runInNewContext(`${appSource.slice(viewStart, viewEnd)}\nthis.runtimeGenerationView = runtimeGenerationView;`, viewContext);
+    const pending = viewContext.runtimeGenerationView({ requirementMode: "agent", generationState: "pending" });
+    assert.deepEqual([pending.showGenerate, pending.primaryGenerate, pending.blockStart, pending.hint], [true, true, true, "runtime.generationPending"]);
+    const failed = viewContext.runtimeGenerationView({ requirementMode: "agent", generationState: "failed" });
+    assert.deepEqual([failed.blockStart, failed.hint], [true, "runtime.generationFailed"]);
+    const generated = viewContext.runtimeGenerationView({ requirementMode: "agent", generationState: "generated" });
+    assert.deepEqual([generated.showGenerate, generated.primaryGenerate, generated.blockStart, generated.hint], [true, false, false, ""]);
+    const manual = viewContext.runtimeGenerationView({ requirementMode: "manual", generationState: "none" });
+    assert.deepEqual([manual.showGenerate, manual.blockStart], [false, false]);
+
+    const clickStart = appSource.indexOf('$("#decomposeTask").addEventListener("click"');
+    const clickEnd = appSource.indexOf('$("#copyLog").addEventListener', clickStart);
+    const clickSource = appSource.slice(clickStart, clickEnd);
+    assert.match(clickSource, /runtime\.generating/);
+    assert.match(clickSource, /state\.generatingTaskId = taskId/);
+    assert.match(clickSource, /finally \{/);
 });

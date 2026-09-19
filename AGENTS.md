@@ -30,6 +30,10 @@ JavaScript 使用 CommonJS 和四空格缩进。后端保持同步文件写入�
 
 `state.json` 的 `pingSettings.profileIds` 决定哪些 Profile 参与自动 Ping，未列出的 Profile 不会被自动 Ping；Profile 上的 `pingEnabled` 只是该名单的派生视图。新增或修改 Ping 行为时请同步更新 `README.md` 的「自动 Ping 的 Profile」章节与 `test/server.test.js` 中的 Ping 用例。
 
+## 任务创建与生成
+
+创建任务（`POST /api/tasks`）只保存信息、不调用大模型：`requirementMode` 为 `manual` 时按需求逐行生成模板任务项（`sourceMode: "template"`），为 `agent` 时只写占位文件并置 `generationState: "pending"`。生成在运行页通过 `POST /api/tasks/:id/generate` 触发；占位文件未生成也未被用户改动时，`POST /api/tasks/:id/start` 返回 400。编辑任务信息走 `PATCH /api/tasks/:id`，不能修改目录、目标文件名与任务类型。相关函数：`normalizeRequirementMode`、`normalizeGenerationState`、`taskAwaitingGeneration`（server.js），`buildTaskRequestBody`、`runtimeGenerationView`、`runtimeTabTasks`（public/app.js）。
+
 ## 测试指南
 
 新增核心逻辑时优先补 `test/core.test.js`；新增 API 行为时补 `test/server.test.js`。测试不要监听真实端口，使用 `server.inject()` 调用接口。提交前至少运行：

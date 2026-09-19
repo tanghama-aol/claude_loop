@@ -3607,6 +3607,10 @@ function createApp(options = {}) {
         task.decomposeProfileId = profile.id;
         task.fileMtime = stat?.mtime?.toISOString() || null;
         task.loop = { ...(task.loop || {}), failureStreak: 0, stallCount: 0, lastOutput: "", lastHash: afterHash };
+        // 生成成功且文件已不是占位内容 → generated；失败 → failed（占位哈希保留，启动仍会被拦下）。
+        if (task.requirementMode === "agent" || task.sourceMode === "agent") {
+            task.generationState = failed ? "failed" : "generated";
+        }
         task.updatedAt = nowISO();
 
         if (failed) {
@@ -4009,6 +4013,18 @@ function createApp(options = {}) {
             changed = true;
         }
         if (changed) saveState(state);
+    }
+
+    // agent 模式的任务在目标文件仍是创建时的占位内容时不能启动；用户手动编辑过占位文件则放行。
+    function taskAwaitingGeneration(task) {
+        if (!task || task.archived) return false;
+        const requirementMode = normalizeRequirementMode(task);
+        if (requirementMode !== "agent") return false;
+        const placeholderHash = task.loop?.placeholderHash;
+        if (!placeholderHash) return false;
+        const generationState = normalizeGenerationState(task, requirementMode);
+        if (generationState === "generated" || generationState === "none") return false;
+        return fileHash(task.filePath) === placeholderHash;
     }
 
     function beginTaskRun(state, task, options = {}) {
@@ -5136,6 +5152,8 @@ function createApp(options = {}) {
                     lastHash: fileHash(filePath),
                     // 占位内容哈希：目标文件仍等于它时，表示用户尚未生成也未手动编辑。
                     ...(sourceMode === "agent" ? { placeholderHash: fileHash(filePath) } : {}),
+                    // 模板哈希：manual 任务的文件仍是系统生成的模板时，编辑需求可以安全重写。
+                    ...(sourceMode === "template" ? { templateHash: fileHash(filePath) } : {}),
                 },
                 createdAt: nowISO(),
                 updatedAt: nowISO(),
@@ -5197,6 +5215,27 @@ function createApp(options = {}) {
                 const requirement = String(body.requirement || "").trim();
                 if (requirement !== (task.requirement || "")) changes.push("requirement");
                 task.requirement = requirement;
+            }
+            // 需求来源切换：manual（直接输入任务列表，sourceMode=template）↔ agent（原始需求待生成）。
+            // existing / upload 来源的任务不允许切换。
+            let switchedMode = "";
+            if (has("requirementMode")) {
+                const requested = String(body.requirementMode || "").trim().toLowerCase();
+                if (!REQUIREMENT_MODES.includes(requested)) {
+                    sendJson(response, 400, { error: "需求来源只能是 manual 或 agent" });
+                    return;
+                }
+                const current = normalizeRequirementMode(task);
+                if (!current) {
+                    sendJson(response, 400, { error: "该任务来源为工作目录文件或上传文件，不能切换需求来源" });
+                    return;
+                }
+                if (requested !== current) {
+                    switchedMode = requested;
+                    changes.push("requirementMode");
+                    task.requirementMode = requested;
+                    task.sourceMode = requested === "manual" ? "template" : "agent";
+                }
             }
             if (has("projectId")) {
                 const projectId = String(body.projectId || "").trim();
@@ -5273,14 +5312,52 @@ function createApp(options = {}) {
                 sendJson(response, 200, { ok: true, task, changed: [] });
                 return;
             }
-            // Agent 生成模式下目标文件仍是占位内容时，同步重写占位文件，让后续生成使用最新标题与需求。
+            // 文件是否仍是系统写入的原样内容（占位或模板）：只有这种情况才允许随元数据重写，用户改过的文件不碰。
+            const currentHash = fileHash(task.filePath);
+            const fileUntouched = Boolean(task.loop?.placeholderHash && task.loop.placeholderHash === currentHash)
+                || Boolean(task.loop?.templateHash && task.loop.templateHash === currentHash);
+            const metadataChanged = changes.includes("title") || changes.includes("requirement");
             let placeholderRewritten = false;
-            if (task.sourceMode === "agent" && task.loop?.placeholderHash && task.loop.placeholderHash === fileHash(task.filePath)
-                && (changes.includes("title") || changes.includes("requirement"))) {
-                fs.writeFileSync(task.filePath, generatePlaceholderTaskMarkdown({ title: task.title, requirement: task.requirement }), "utf8");
-                task.loop = { ...task.loop, placeholderHash: fileHash(task.filePath), lastHash: fileHash(task.filePath) };
+            const writeTemplateFile = () => {
+                fs.writeFileSync(task.filePath, generateTaskMarkdown({
+                    title: task.title,
+                    requirement: task.requirement,
+                    taskType,
+                    artifactDirectory: task.artifactDirectory,
+                    outputFile: task.artifactDirectory && task.outputFileName ? path.join(task.artifactDirectory, task.outputFileName) : "",
+                    outputFormat: task.outputFormat,
+                    aspectRatio: task.aspectRatio,
+                    resolution: task.resolution,
+                    durationSeconds: task.durationSeconds,
+                    referenceFiles: task.referenceFiles,
+                }), "utf8");
+                const hash = fileHash(task.filePath);
+                const { placeholderHash, ...loop } = task.loop || {};
+                task.loop = { ...loop, templateHash: hash, lastHash: hash };
+                task.generationState = "none";
                 task.fileMtime = safeStat(task.filePath)?.mtime?.toISOString() || null;
                 placeholderRewritten = true;
+            };
+            const writePlaceholderFile = () => {
+                fs.writeFileSync(task.filePath, generatePlaceholderTaskMarkdown({ title: task.title, requirement: task.requirement }), "utf8");
+                const hash = fileHash(task.filePath);
+                const { templateHash, ...loop } = task.loop || {};
+                task.loop = { ...loop, placeholderHash: hash, lastHash: hash };
+                task.generationState = "pending";
+                task.fileMtime = safeStat(task.filePath)?.mtime?.toISOString() || null;
+                placeholderRewritten = true;
+            };
+            if (switchedMode === "manual") {
+                // agent → manual：文件未被改过就按新需求生成任务列表；改过则只换元数据。
+                if (fileUntouched) writeTemplateFile();
+                else task.generationState = "none";
+            } else if (switchedMode === "agent") {
+                // manual → agent：默认只标记待生成；regenerate=true 时把文件重写为占位内容。
+                if (body.regenerate === true || fileUntouched) writePlaceholderFile();
+                else task.generationState = "pending";
+            } else if (metadataChanged && fileUntouched) {
+                if (task.sourceMode === "agent") writePlaceholderFile();
+                else if (task.sourceMode === "template") writeTemplateFile();
             }
             task.updatedAt = nowISO();
             addEvent(state, "task", task.id, `编辑任务：${task.title}（${changes.join(", ")}）`);
@@ -5289,7 +5366,7 @@ function createApp(options = {}) {
                 phase: "setup",
                 metadata: { changed: changes, placeholderRewritten },
             });
-            sendJson(response, 200, { ok: true, task, changed: changes, placeholderRewritten });
+            sendJson(response, 200, { ok: true, task, changed: changes, placeholderRewritten, fileRewritten: placeholderRewritten });
             return;
         }
 
@@ -5471,6 +5548,10 @@ function createApp(options = {}) {
             }
             if (runners.has(task.id)) {
                 sendJson(response, 409, { error: "任务已经在运行" });
+                return;
+            }
+            if (taskAwaitingGeneration(task)) {
+                sendJson(response, 400, { error: "请先生成目标文件：该任务的目标文件仍是占位内容，请在运行页点击「生成目标文件」或手动编辑后再启动" });
                 return;
             }
             const requestedIds = normalizeProfileIdList(body.profileIds).length

@@ -67,6 +67,7 @@ const state = {
     deduplicatingTasks: false,
     // 任务页右侧编辑器：taskId 为空表示「创建任务」模式，否则编辑该任务并自动保存。
     taskEditor: { taskId: "", timer: null, saving: false, dirty: false, lastSavedAt: null, error: "" },
+    generatingTaskId: "",
     deletingTaskIds: new Set(),
     responseEtags: new Map(),
     pollTimer: null,
@@ -1198,9 +1199,27 @@ function renderRuntimeContext(task) {
     }
     if (runtimeEditor) runtimeEditor.disabled = archived;
     if (runtimeFileHint) runtimeFileHint.textContent = archived ? t("runtime.fileArchived") : t("runtime.fileEditable");
-    if (runtimeButtons[0]) runtimeButtons[0].disabled = archived || busy;
-    if (runtimeButtons[1]) runtimeButtons[1].disabled = archived || busy;
-    if (runtimeButtons[2]) runtimeButtons[2].disabled = archived || busy;
+    // agent 任务未生成目标文件时：生成按钮成为主操作，启动 / 预约先禁用并给出提示。
+    const generation = runtimeGenerationView(task);
+    const hint = $("#runtimeGenerationHint");
+    if (hint) {
+        hint.hidden = !generation.hint;
+        hint.textContent = generation.hint ? t(generation.hint) : "";
+        hint.classList.toggle("is-failed", generation.state === "failed");
+    }
+    if (runtimeButtons[0]) {
+        runtimeButtons[0].disabled = archived || busy || generation.blockStart;
+        runtimeButtons[0].title = generation.blockStart ? t("runtime.startNeedsGeneration") : "";
+    }
+    if (runtimeButtons[1]) {
+        runtimeButtons[1].disabled = archived || busy || generation.blockStart;
+        runtimeButtons[1].title = generation.blockStart ? t("runtime.startNeedsGeneration") : "";
+    }
+    if (runtimeButtons[2]) {
+        runtimeButtons[2].disabled = archived || busy || state.generatingTaskId === task.id;
+        runtimeButtons[2].hidden = !generation.showGenerate;
+        runtimeButtons[2].classList.toggle("ghost", !generation.primaryGenerate);
+    }
     if (runtimeButtons[3]) runtimeButtons[3].disabled = archived || !busy;
     const canAppend = taskCanAppend(task);
     if (appendButton) appendButton.disabled = !canAppend;
@@ -1496,11 +1515,35 @@ function renderRunDetail() {
     `).join("") + artifactSection;
 }
 
+// 运行页对生成状态的呈现：pending 显示提示并把「生成」作为主按钮、拦下启动；failed 同样拦下并提示；其余照常。
+function runtimeGenerationView(task) {
+    const requirementMode = String(task?.requirementMode || "");
+    const stateValue = String(task?.generationState || "none");
+    const isAgent = requirementMode === "agent";
+    const pending = isAgent && stateValue === "pending";
+    const failed = isAgent && stateValue === "failed";
+    return {
+        state: stateValue,
+        showGenerate: isAgent,
+        primaryGenerate: pending || failed,
+        blockStart: pending || failed,
+        hint: pending ? "runtime.generationPending" : failed ? "runtime.generationFailed" : "",
+    };
+}
+
+// 运行页标签：已启动的任务 + 当前选中的任务（新建后立刻跳转到运行页时它还没有运行记录）。
+function runtimeTabTasks(tasks, selectedTaskId) {
+    const list = (tasks || []).filter(taskIsStarted);
+    const selected = (tasks || []).find((task) => task.id === selectedTaskId && !task.archived);
+    if (selected && !list.some((task) => task.id === selected.id)) list.push(selected);
+    return list;
+}
+
 function renderRuntimeTabs() {
     const bar = $("#runtimeTabsBar");
     const node = $("#runtimeTabs");
     if (!bar || !node) return;
-    const tasks = (state.data?.tasks || []).filter(taskIsStarted);
+    const tasks = runtimeTabTasks(state.data?.tasks || [], state.selectedTaskId);
     bar.hidden = tasks.length === 0;
     const signature = `${state.selectedTaskId}#${tasks
         .map((task) => `${task.id}:${taskRuntimeState(task)}:${taskDisplayStatus(task)}`)
@@ -1638,12 +1681,29 @@ function resetProfileForm(profile = null) {
     state.selectedProfileId = profile?.id || "";
 }
 
+// 表单「任务来源」下拉的四个值 → API 请求体：manual / agent 走 requirementMode，sourceMode 分别为 template / agent。
+function buildTaskRequestBody(values) {
+    const source = String(values.sourceMode || "manual");
+    const body = { ...values };
+    delete body.sourceFile;
+    if (source === "manual" || source === "agent") {
+        body.requirementMode = source;
+        body.sourceMode = source === "manual" ? "template" : "agent";
+    } else {
+        body.sourceMode = source;
+        delete body.requirementMode;
+    }
+    return body;
+}
+
 function syncTaskSourceMode() {
     const form = $("#taskForm");
-    const mode = form.elements.sourceMode.value || "agent";
+    const mode = form.elements.sourceMode.value || "manual";
     const isAgent = mode === "agent";
+    const isManual = mode === "manual";
     const isUpload = mode === "upload";
     const sourceHelp = {
+        manual: t("task.sourceHelp.manual"),
         agent: t("task.sourceHelp.agent"),
         existing: t("task.sourceHelp.existing"),
         upload: t("task.sourceHelp.upload"),
@@ -1654,15 +1714,20 @@ function syncTaskSourceMode() {
     $$(".task-upload-field").forEach((node) => {
         node.hidden = !isUpload;
     });
-    form.elements.requirement.required = isAgent;
+    form.elements.requirement.required = isAgent || isManual;
     form.elements.decomposeProfileId.required = isAgent;
     form.elements.sourceFile.required = isUpload;
-    $("#taskSubmitButton").textContent = isAgent
-        ? t("task.submit.generate")
-        : isUpload
-            ? t("task.submit.import")
-            : t("task.submit.load");
-    $("#taskSourceHelp").textContent = sourceHelp[mode] || sourceHelp.agent;
+    const requirementLabel = $("#taskRequirementLabel");
+    if (requirementLabel) {
+        requirementLabel.dataset.i18n = isAgent ? "task.requirement.agent" : isManual ? "task.requirement.manual" : "task.requirement";
+        requirementLabel.textContent = t(requirementLabel.dataset.i18n);
+    }
+    form.elements.requirement.dataset.i18nPlaceholder = isAgent ? "task.requirementPlaceholder.agent" : isManual ? "task.requirementPlaceholder.manual" : "task.requirementPlaceholder";
+    form.elements.requirement.placeholder = t(form.elements.requirement.dataset.i18nPlaceholder);
+    const submitKey = isUpload ? "task.submit.import" : mode === "existing" ? "task.submit.load" : "task.submit.save";
+    $("#taskSubmitButton").dataset.i18n = submitKey;
+    $("#taskSubmitButton").textContent = t(submitKey);
+    $("#taskSourceHelp").textContent = sourceHelp[mode] || sourceHelp.manual;
 }
 
 function syncTaskType() {
@@ -1694,7 +1759,7 @@ function syncTaskType() {
     runSelect.innerHTML = profileOptions(selected, taskType);
 }
 
-const TASK_EDITOR_LOCKED_FIELDS = ["taskType", "targetFileName", "directory", "sourceMode", "sourceFile", "overwrite"];
+const TASK_EDITOR_LOCKED_FIELDS = ["taskType", "targetFileName", "directory", "sourceFile", "overwrite"];
 const TASK_EDITOR_AUTOSAVE_DELAY_MS = 600;
 
 function taskEditorCanEdit(task) {
@@ -1749,7 +1814,11 @@ function fillTaskEditor(task) {
     form.elements.projectId.value = task.projectId || "";
     form.elements.directory.innerHTML = directoryOptions(task.directory || "");
     form.elements.directory.value = task.directory || "";
-    form.elements.sourceMode.value = task.sourceMode === "template" ? "existing" : (task.sourceMode || "agent");
+    // manual / agent 任务可以切换需求来源；existing / upload 来源固定。
+    form.elements.sourceMode.value = task.requirementMode === "manual" ? "manual"
+        : task.requirementMode === "agent" ? "agent"
+            : task.sourceMode === "template" ? "manual" : (task.sourceMode || "agent");
+    form.elements.sourceMode.disabled = !["manual", "agent"].includes(String(task.requirementMode || ""));
     form.elements.decomposeProfileId.innerHTML = profileOptions(task.decomposeProfileId || "", "text");
     form.elements.runProfileIds.innerHTML = profileOptions(taskProfileIds(task), task.taskType || "text");
     form.elements.requirement.value = task.requirement || "";
@@ -1792,6 +1861,7 @@ function openTaskEditor(taskId) {
 function resetTaskEditor() {
     const form = $("#taskForm");
     if (!form) return;
+    if (form.elements.sourceMode) form.elements.sourceMode.disabled = false;
     flushTaskAutosave();
     state.taskEditor = { taskId: "", timer: null, saving: false, dirty: false, lastSavedAt: null, error: "" };
     form.dataset.mode = "create";
@@ -1820,6 +1890,8 @@ function taskEditorPayload(form) {
         decomposeProfileId: form.elements.decomposeProfileId.value || "",
         runProfileIds: selectedValues(form.elements.runProfileIds),
     };
+    const sourceMode = form.elements.sourceMode?.value;
+    if (!form.elements.sourceMode?.disabled && (sourceMode === "manual" || sourceMode === "agent")) payload.requirementMode = sourceMode;
     if (taskType !== "text") {
         Object.assign(payload, {
             artifactDirectoryName: form.elements.artifactDirectoryName.value,
@@ -2173,6 +2245,11 @@ async function openTaskPage(taskId) {
         return false;
     }
     state.selectedTaskId = taskId;
+    // 运行页的 Profile 下拉必须跟随所选任务：否则「生成」会沿用上一个任务或首项 Profile。
+    const runProfileIds = taskProfileIds(task);
+    if ($("#runTask")) $("#runTask").innerHTML = taskOptions(taskId, true);
+    $("#runProfiles").innerHTML = profileOptions(runProfileIds.length ? runProfileIds : [state.selectedProfileId].filter(Boolean), task.taskType || "text");
+    $("#decomposeProfile").innerHTML = profileOptions(task.decomposeProfileId || state.selectedProfileId, "text");
     renderSelectors();
     renderRunDetail();
     renderRuntimeTabs();
@@ -2390,13 +2467,14 @@ function bindEvents() {
         try {
             const form = event.currentTarget;
             const formData = new FormData(form);
-            const body = Object.fromEntries(formData.entries());
-            delete body.sourceFile;
-            body.projectId = form.elements.projectId.value || "";
-            body.directory = form.elements.directory.value || "";
-            body.runProfileIds = formData.getAll("runProfileIds").filter(Boolean);
-            body.overwrite = form.elements.overwrite.checked;
-            body.sourceMode = form.elements.sourceMode.value || "agent";
+            const body = buildTaskRequestBody({
+                ...Object.fromEntries(formData.entries()),
+                projectId: form.elements.projectId.value || "",
+                directory: form.elements.directory.value || "",
+                runProfileIds: formData.getAll("runProfileIds").filter(Boolean),
+                overwrite: form.elements.overwrite.checked,
+                sourceMode: form.elements.sourceMode.value || "manual",
+            });
             if (body.sourceMode === "upload") {
                 const file = form.elements.sourceFile.files?.[0];
                 if (!file) return toast(t("toast.selectTaskFile"));
@@ -2407,19 +2485,18 @@ function bindEvents() {
             }
             const result = await api("/api/tasks", { method: "POST", body });
             state.selectedTaskId = result.task.id;
+            resetTaskEditor();
             await refresh();
-            await loadFile(result.task.id);
-            openTaskEditor(result.task.id);
+            // 创建只保存信息；生成与启动都在运行页完成，保存后直接跳过去。
+            await openTaskPage(result.task.id);
             if (result.deduplicated) {
                 toast(t("toast.taskReused"));
-            } else if (result.generation?.failed) {
-                toast(t("toast.generationFailed", { code: result.generation.exitCode ?? "-" }));
             } else if (body.sourceMode === "existing") {
                 toast(t("toast.taskLoaded"));
             } else if (body.sourceMode === "upload") {
                 toast(t("toast.taskImported"));
             } else {
-                toast(t("toast.taskGenerated"));
+                toast(t("toast.taskCreated"));
             }
         } catch (error) {
             toast(error.message);
@@ -2631,19 +2708,33 @@ function bindEvents() {
         toast(t("toast.taskStopped"));
     });
     $("#decomposeTask").addEventListener("click", async () => {
-        const taskId = $("#runTask").value;
+        const taskId = $("#runTask").value || state.selectedTaskId;
         const profileId = $("#decomposeProfile").value || selectedValues($("#runProfiles"))[0];
         if (!taskId || !profileId) return toast(t("toast.selectTaskProfile"));
-        const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/generate`, {
-            method: "POST",
-            body: { profileId },
-        });
-        await refresh();
-        await loadFile(taskId);
-        await loadLog(taskId, { runId: "", forceFollow: true });
-        toast(result.failed
-            ? t("toast.generateFailed", { code: result.exitCode ?? "-" })
-            : t("toast.taskGenerated"));
+        if (state.generatingTaskId) return;
+        const button = $("#decomposeTask");
+        const originalLabel = button.textContent;
+        state.generatingTaskId = taskId;
+        button.disabled = true;
+        button.textContent = t("runtime.generating");
+        try {
+            const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/generate`, {
+                method: "POST",
+                body: { profileId },
+            });
+            await refresh();
+            await loadFile(taskId);
+            await loadLog(taskId, { runId: "", forceFollow: true });
+            toast(result.failed
+                ? t("toast.generateFailed", { code: result.result?.exitCode ?? result.exitCode ?? "-" })
+                : t("toast.taskGenerated"));
+        } catch (error) {
+            toast(error.message);
+        } finally {
+            state.generatingTaskId = "";
+            button.textContent = originalLabel === t("runtime.generating") ? t("runtime.generate") : originalLabel;
+            renderRunDetail();
+        }
     });
     $("#copyLog").addEventListener("click", async () => {
         await navigator.clipboard.writeText(logPlainText());

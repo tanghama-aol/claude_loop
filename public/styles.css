@@ -1723,6 +1723,23 @@ textarea.secret.revealed {
     padding: 14px;
 }
 
+.runtime-generation-hint {
+    margin: 0 16px 10px;
+    border: 1px solid var(--amber);
+    border-left-width: 4px;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--ink);
+    background: #fff7e6;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.runtime-generation-hint.is-failed {
+    border-color: var(--red);
+    background: #fdeeee;
+}
+
 .runtime-stats-section {
     margin-top: 12px;
     border-top: 2px solid var(--line-strong);

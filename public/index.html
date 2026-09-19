@@ -256,7 +256,8 @@
                             <label>
                                 <span data-i18n="task.source">任务来源</span>
                                 <select name="sourceMode" id="taskSourceMode">
-                                    <option value="agent" data-i18n="task.source.agent">Agent 生成</option>
+                                    <option value="manual" data-i18n="task.source.manual">直接输入任务列表</option>
+                                    <option value="agent" data-i18n="task.source.agent">输入原始需求，稍后由大模型生成</option>
                                     <option value="existing" data-i18n="task.source.existing">使用工作目录文件</option>
                                     <option value="upload" data-i18n="task.source.upload">从电脑选择文件</option>
                                 </select>
@@ -316,15 +317,15 @@
                                 <input name="sourceFile" type="file" accept=".md,.markdown,text/markdown,text/plain">
                             </label>
                             <label class="full">
-                                <span data-i18n="task.requirement">任务需求</span>
-                                <textarea name="requirement" rows="13" required data-i18n-placeholder="task.requirementPlaceholder" placeholder="输入原始需求，生成 Profile 会创建可编辑的任务目标文件。"></textarea>
+                                <span id="taskRequirementLabel" data-i18n="task.requirement.manual">任务列表（每行一个任务项）</span>
+                                <textarea name="requirement" rows="13" required data-i18n-placeholder="task.requirementPlaceholder.manual" placeholder="每行一个任务项，例如：&#10;实现登录页&#10;补充单元测试"></textarea>
                             </label>
                             <label class="checkline full task-overwrite-field">
                                 <input name="overwrite" type="checkbox">
                                 <span data-i18n="task.overwrite">覆盖同名文件</span>
                             </label>
                             <div class="task-editor-actions full">
-                                <button type="submit" id="taskSubmitButton" data-i18n="task.submit.generate">调用 Agent 生成</button>
+                                <button type="submit" id="taskSubmitButton" data-i18n="task.submit.save">保存任务</button>
                                 <button type="button" class="ghost" id="taskOpenRuntime" data-i18n="task.openRuntime" hidden>打开运行页</button>
                             </div>
                         </form>
@@ -363,6 +364,7 @@
                             </div>
                             <span id="runtimeStatusBadge" class="badge loop_not_started">-</span>
                         </div>
+                        <div id="runtimeGenerationHint" class="runtime-generation-hint" role="status" aria-live="polite" hidden></div>
                         <div class="control-stack">
                             <label>
                                 <span data-i18n="runtime.task">任务</span>

@@ -4236,3 +4236,184 @@ test("server updates media task settings within the working directory", async (t
     await assert.rejects(request(server, `/api/tasks/${created.task.id}`, { method: "PATCH", body: { artifactDirectoryName: "../outside" } }), /工作目录内/);
     await assert.rejects(request(server, `/api/tasks/${created.task.id}`, { method: "PATCH", body: { referenceFiles: "../secret.png" } }), /工作目录内/);
 });
+
+test("server rejects starting an agent task until its target file is generated", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const generator = writeAgentScript(tempRoot, "agent-gen-guard.js", [
+        "if (process.env.AGENT_TASK_FILE) fs.writeFileSync(process.env.AGENT_TASK_FILE, \"# 生成结果\\n\\n- [ ] 1. 任务项\\n  - 状态：未开始\\n\", \"utf8\");",
+        "console.log(\"generated\");",
+    ].join("\n"));
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "gen-guard", agentType: "codex", command: generator.command, args: generator.args, enabled: true },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "待生成任务",
+            requirement: "先生成再启动",
+            targetFileName: "guard.md",
+            directory: tempRoot,
+            requirementMode: "agent",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    assert.equal(created.task.generationState, "pending");
+
+    await assert.rejects(request(server, `/api/tasks/${created.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } }), /请先生成目标文件/);
+    const untouched = (await request(server, "/api/state")).tasks.find((item) => item.id === created.task.id);
+    assert.equal(untouched.status, "not_started");
+    assert.equal(untouched.isRunning, false);
+
+    const generation = await request(server, `/api/tasks/${created.task.id}/generate`, { method: "POST" });
+    assert.equal(generation.ok, true);
+    assert.equal(generation.task.generationState, "generated");
+    const generated = (await request(server, "/api/state")).tasks.find((item) => item.id === created.task.id);
+    assert.equal(generated.generationState, "generated");
+
+    const started = await request(server, `/api/tasks/${created.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } });
+    assert.equal(started.ok, true);
+    await request(server, `/api/tasks/${created.task.id}/stop`, { method: "POST" });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        const task = state.tasks.find((item) => item.id === created.task.id);
+        return task && !task.isRunning ? task : null;
+    }, { timeoutMs: 5000 });
+});
+
+test("server marks a failed generation and lets a hand-edited placeholder start", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const failing = writeAgentScript(tempRoot, "agent-gen-fail.js", "console.error(\"boom\"); process.exit(3);");
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "gen-fail", agentType: "codex", command: failing.command, args: failing.args, enabled: true },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: { title: "生成失败", requirement: "需求", targetFileName: "fail.md", directory: tempRoot, requirementMode: "agent", decomposeProfileId: profile.profile.id, runProfileIds: [profile.profile.id] },
+    });
+    const generation = await request(server, `/api/tasks/${created.task.id}/generate`, { method: "POST" });
+    assert.equal(generation.failed, true);
+    assert.equal(generation.task.generationState, "failed");
+    await assert.rejects(request(server, `/api/tasks/${created.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } }), /请先生成目标文件/);
+
+    // 用户手动编辑过占位文件后允许启动。
+    await request(server, `/api/tasks/${created.task.id}/file`, { method: "PUT", body: { content: "# 手写任务\n\n- [ ] 1. 自己写的\n" } });
+    const started = await request(server, `/api/tasks/${created.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } });
+    assert.equal(started.ok, true);
+    await request(server, `/api/tasks/${created.task.id}/stop`, { method: "POST" });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        const task = state.tasks.find((item) => item.id === created.task.id);
+        return task && !task.isRunning ? task : null;
+    }, { timeoutMs: 5000 });
+});
+
+test("server switches requirement mode and rewrites only untouched task files", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const script = writeAgentScript(tempRoot, "agent-mode.js", "console.log('noop');");
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "mode-agent", agentType: "codex", command: script.command, args: script.args, enabled: true },
+    });
+
+    // agent → manual：占位文件未改动，按新需求生成任务列表。
+    const agentTask = await request(server, "/api/tasks", {
+        method: "POST",
+        body: { title: "切换任务", requirement: "原始需求", targetFileName: "switch.md", directory: tempRoot, requirementMode: "agent", decomposeProfileId: profile.profile.id, runProfileIds: [profile.profile.id] },
+    });
+    assert.equal(agentTask.task.requirementMode, "agent");
+    await assert.rejects(request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirementMode: "bogus" } }), /manual 或 agent/);
+    const toManual = await request(server, `/api/tasks/${agentTask.task.id}`, {
+        method: "PATCH",
+        body: { requirementMode: "manual", requirement: "第一项\n第二项" },
+    });
+    assert.deepEqual(toManual.changed, ["requirement", "requirementMode"]);
+    assert.equal(toManual.task.requirementMode, "manual");
+    assert.equal(toManual.task.sourceMode, "template");
+    assert.equal(toManual.task.generationState, "none");
+    assert.equal(toManual.fileRewritten, true);
+    const manualFile = fs.readFileSync(agentTask.task.filePath, "utf8");
+    assert.match(manualFile, /- \[ \] 1\. 第一项/);
+    assert.match(manualFile, /- \[ \] 2\. 第二项/);
+    assert.doesNotMatch(manualFile, /尚未生成任务列表/);
+    const publicManual = (await request(server, "/api/state")).tasks.find((item) => item.id === agentTask.task.id);
+    assert.equal(publicManual.requirementMode, "manual");
+    assert.equal(publicManual.generationState, "none");
+
+    // manual 任务的模板未改动时，改需求会重写模板；改过后不再重写。
+    const editedRequirement = await request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirement: "第三项" } });
+    assert.equal(editedRequirement.fileRewritten, true);
+    assert.match(fs.readFileSync(agentTask.task.filePath, "utf8"), /- \[ \] 1\. 第三项/);
+    fs.writeFileSync(agentTask.task.filePath, "# 用户手改\n", "utf8");
+    const afterManualEdit = await request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirement: "第四项" } });
+    assert.equal(afterManualEdit.fileRewritten, false);
+    assert.equal(fs.readFileSync(agentTask.task.filePath, "utf8"), "# 用户手改\n");
+
+    // manual → agent：文件已被改过，默认只标记待生成；regenerate=true 才重写为占位内容。
+    const toAgent = await request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirementMode: "agent" } });
+    assert.equal(toAgent.task.requirementMode, "agent");
+    assert.equal(toAgent.task.sourceMode, "agent");
+    assert.equal(toAgent.task.generationState, "pending");
+    assert.equal(toAgent.fileRewritten, false);
+    assert.equal(fs.readFileSync(agentTask.task.filePath, "utf8"), "# 用户手改\n");
+    const startedAnyway = await request(server, `/api/tasks/${agentTask.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } });
+    assert.equal(startedAnyway.ok, true, "a hand-edited file is not a placeholder, so start is allowed");
+    await request(server, `/api/tasks/${agentTask.task.id}/stop`, { method: "POST" });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        const task = state.tasks.find((item) => item.id === agentTask.task.id);
+        return task && !task.isRunning && task.status === "stopped" ? task : null;
+    }, { timeoutMs: 5000 });
+    const regenerated = await request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirementMode: "manual" } });
+    assert.equal(regenerated.task.requirementMode, "manual");
+    const backToAgent = await request(server, `/api/tasks/${agentTask.task.id}`, { method: "PATCH", body: { requirementMode: "agent", regenerate: true } });
+    assert.equal(backToAgent.fileRewritten, true);
+    assert.match(fs.readFileSync(agentTask.task.filePath, "utf8"), /尚未生成任务列表/);
+    await assert.rejects(request(server, `/api/tasks/${agentTask.task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } }), /请先生成目标文件/);
+
+    // existing 来源的任务不能切换需求来源。
+    fs.writeFileSync(path.join(tempRoot, "existing.md"), "# existing\n", "utf8");
+    const existingTask = await request(server, "/api/tasks", {
+        method: "POST",
+        body: { title: "已有文件", targetFileName: "existing.md", directory: tempRoot, sourceMode: "existing", runProfileIds: [profile.profile.id] },
+    });
+    await assert.rejects(request(server, `/api/tasks/${existingTask.task.id}`, { method: "PATCH", body: { requirementMode: "manual" } }), /不能切换需求来源/);
+});

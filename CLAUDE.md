@@ -68,7 +68,13 @@ JSON 损坏时备份为 `state.json.<ts>.broken` 并回退到初始状态。`eve
 
 任务页（`#tasks`）左树右编辑：`openTaskEditor()` / `resetTaskEditor()` 切换 `#taskForm` 的 `data-mode`（`create` / `edit`），
 编辑态由 `scheduleTaskAutosave()` 去抖后 `PATCH /api/tasks/:id`（仅元数据；`TASK_EDITOR_LOCKED_FIELDS` 列出创建后锁定的字段），
-后端路由拒绝忙碌 / 归档任务，占位文件未被改动时会随标题需求重写。
+后端路由拒绝忙碌 / 归档任务；文件仍等于 `loop.placeholderHash` / `loop.templateHash` 时才随标题需求重写。
+
+**创建不调用大模型**：`POST /api/tasks` 只写文件（manual → `generateTaskMarkdown` 模板；agent → `generatePlaceholderTaskMarkdown` 占位）。
+`requirementMode`（manual / agent）与 `generationState`（none / pending / generated / failed）由 `normalizeRequirementMode()` /
+`normalizeGenerationState()` 从旧数据推导。`runTaskFileGeneration()` 成功置 `generated`、失败置 `failed`；
+`taskAwaitingGeneration()` 在启动路由拦下「文件仍是占位内容」的 agent 任务（用户改过文件即放行）。前端 `buildTaskRequestBody()` 把表单
+来源映射为请求体，`runtimeGenerationView()` 决定运行页提示 / 主按钮 / 启动禁用，`runtimeTabTasks()` 让选中任务进入标签栏。
 
 前端：`public/app.js` 持有单一快照 `state.data`，全量重渲染；`api()` 是唯一的 fetch 封装（带 ETag 缓存）；
 `poll()` 只在前台轮询（活动任务约 2s、空闲约 5s、日志跟随约 100ms），`/api/state` 返回 `304` 时客户端复用原快照。
