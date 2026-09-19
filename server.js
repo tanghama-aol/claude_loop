@@ -13,15 +13,24 @@ const {
     DEFAULT_CODEX_ARGS,
     DEFAULT_PROFILE_DIRECTORY,
     DEFAULT_RUN_PROMPT,
+    DEFAULT_TIMEOUT_SECONDS,
+    LOOP_TIMING,
     appendTaskItemsToMarkdown,
     LEGACY_CODEX_ARGS,
     LEGACY_RUN_PROMPT,
+    LEGACY_RUN_PROMPT_V4,
     LEGACY_RUN_PROMPT_V2,
     LEGACY_RUN_PROMPT_V3,
     configEnvForProfile,
     createTaskLogEvent,
+    createTerminalLogger,
     createDefaultProfiles,
+    createRunToken,
+    createStreamJsonRenderer,
+    ensureRunTokenInstruction,
+    failureBackoffMs,
     fillTemplate,
+    generatePlaceholderTaskMarkdown,
     generateTaskMarkdown,
     isAllDoneOutput,
     makeId,
@@ -34,7 +43,13 @@ const {
     parseArgs,
     parseEnvText,
     providerForAgentType,
+    resolveTerminalLogLevel,
     safeTaskFileName,
+    taskFileHasRunToken,
+    appendTaskCycle,
+    estimateCycleCostUsd,
+    extractUsageFromOutput,
+    summarizeTaskCycles,
 } = require("./lib/core");
 
 const STATUS = {
@@ -73,7 +88,23 @@ function resolveServerConfig(env = process.env) {
     return {
         host: rawHost || DEFAULT_HOST,
         port: Number(source.PORT || DEFAULT_PORT),
+        logLevel: resolveTerminalLogLevel(source.LOG_LEVEL),
     };
+}
+
+const TERMINAL_LOG_TEXT_MAX_CHARS = 400;
+
+function summarizeTerminalLogText(text, maxChars = TERMINAL_LOG_TEXT_MAX_CHARS) {
+    const value = String(text ?? "").replace(/\s+/g, " ").trim();
+    return value.length > maxChars ? `${value.slice(0, maxChars)}…(+${value.length - maxChars})` : value;
+}
+
+// 终端日志级别：显式 options.logLevel > LOG_LEVEL 环境变量 > 默认 info；
+// node --test 环境下默认静音，避免 TAP 输出被服务日志淹没（测试可显式传入 logger 捕获）。
+function resolveAppLogLevel(options, env = process.env) {
+    if (options.logLevel !== undefined) return resolveTerminalLogLevel(options.logLevel);
+    if (String(env.LOG_LEVEL ?? "").trim()) return resolveTerminalLogLevel(env.LOG_LEVEL);
+    return env.NODE_TEST_CONTEXT ? "silent" : resolveTerminalLogLevel(undefined);
 }
 
 function hostForUrl(host) {
@@ -220,9 +251,11 @@ const PING_QUESTIONS = [
     "How many wheels does a bicycle have?",
     "What is the last letter of the English alphabet?",
 ];
+const PING_AGENT_TYPES = ["claude", "claudecode", "codex"];
 const PING_INTERVAL_MS = 60 * 60 * 1000;
 const PING_SCHEDULER_TICK_MS = 60 * 1000;
 const PING_DETAIL_MAX_CHARS = 64 * 1024;
+const LEGACY_TIMEOUT_SECONDS = 1800;
 const AVAILABILITY_CHECK_INTERVAL_MINUTES = 30;
 const AVAILABILITY_CHECK_INTERVAL_MS = AVAILABILITY_CHECK_INTERVAL_MINUTES * 60 * 1000;
 const POWERSHELL_UTF8_DELEGATE_NAME = "powershell-utf8.ps1";
@@ -497,12 +530,19 @@ function createApp(options = {}) {
     const taskProcesses = new Map();
     const logEventCounters = new Map();
     const logReader = createLogReader();
+    const logger = options.logger || createTerminalLogger({ level: resolveAppLogLevel(options), scope: "server" });
+    const httpLog = logger.child("http");
+    const stateLog = logger.child("state");
+    const taskLog = logger.child("task");
+    const agentLog = logger.child("agent");
+    const pingLog = logger.child("ping");
     let stateReadCache = null;
     let pingTimer = null;
     let pingInProgress = false;
     let runnersClosing = false;
 
     fs.mkdirSync(logDir, { recursive: true });
+    logger.info("服务初始化", { rootDir, dataDir, logDir, logLevel: logger.level, pid: process.pid, node: process.version });
 
     function initialState() {
         const defaultProject = {
@@ -564,9 +604,11 @@ function createApp(options = {}) {
             && String(normalized.command || "") === "codex"
             && String(normalized.args || "") === LEGACY_CODEX_ARGS;
         if (isLegacyDefaultCodex) normalized.args = DEFAULT_CODEX_ARGS;
-        if ([LEGACY_RUN_PROMPT, LEGACY_RUN_PROMPT_V2, LEGACY_RUN_PROMPT_V3].includes(normalized.promptTemplate)) {
+        if ([LEGACY_RUN_PROMPT, LEGACY_RUN_PROMPT_V2, LEGACY_RUN_PROMPT_V3, LEGACY_RUN_PROMPT_V4].includes(normalized.promptTemplate)) {
             normalized.promptTemplate = DEFAULT_RUN_PROMPT;
         }
+        // 旧默认超时 1800 秒会误杀超过 30 分钟的正常运行，统一迁移到新的默认值。
+        if (Number(normalized.timeoutSeconds) === LEGACY_TIMEOUT_SECONDS) normalized.timeoutSeconds = DEFAULT_TIMEOUT_SECONDS;
         return normalized;
     }
 
@@ -594,8 +636,34 @@ function createApp(options = {}) {
         };
     }
 
+    const REQUIREMENT_MODES = ["manual", "agent"];
+    const GENERATION_STATES = ["none", "pending", "generated", "failed"];
+
+    // requirementMode 是 sourceMode 的派生视图：template → manual，agent → agent，其余为空串。
+    function normalizeRequirementMode(task) {
+        const explicit = String(task?.requirementMode || "").trim().toLowerCase();
+        if (REQUIREMENT_MODES.includes(explicit)) return explicit;
+        const sourceMode = String(task?.sourceMode || "").trim().toLowerCase();
+        if (sourceMode === "template") return "manual";
+        if (sourceMode === "agent") return "agent";
+        return "";
+    }
+
+    // generationState：none（manual / existing / upload）、pending（agent 尚未生成）、generated、failed。
+    // 旧数据没有该字段时，agent 任务在创建时已同步生成过，视为 generated，避免阻塞启动。
+    function normalizeGenerationState(task, requirementMode) {
+        const explicit = String(task?.generationState || "").trim().toLowerCase();
+        if (GENERATION_STATES.includes(explicit)) return explicit;
+        if (requirementMode === "agent") {
+            return task?.loop?.placeholderHash ? "pending" : "generated";
+        }
+        return "none";
+    }
+
     function normalizeTask(task) {
         const directory = path.resolve(task?.directory || rootDir);
+        const requirementMode = normalizeRequirementMode(task);
+        const generationState = normalizeGenerationState(task, requirementMode);
         const runProfileIds = normalizeProfileIdList(
             task?.runProfileIds?.length ? task.runProfileIds : [task?.runProfileId, task?.decomposeProfileId],
         );
@@ -682,6 +750,8 @@ function createApp(options = {}) {
         return {
             ...task,
             directory,
+            requirementMode,
+            generationState,
             logFile: normalizedLogFile,
             logEventsFile: normalizedLogEventsFile,
             logRuns,
@@ -771,15 +841,43 @@ function createApp(options = {}) {
         }
         normalized.events = Array.isArray(normalized.events) ? normalized.events : [];
         normalized.pingRecords = Array.isArray(normalized.pingRecords) ? normalized.pingRecords : [];
+        const knownProfileIds = new Set(normalized.profiles.map((profile) => profile.id));
+        // 自动 Ping 名单是唯一真相；旧版状态没有 profileIds 时按 Profile 上的 pingEnabled 迁移，
+        // 保持既有行为，之后 Profile 的 pingEnabled 只是名单的派生视图。
+        const legacyPingSettings = !Array.isArray(normalized.pingSettings?.profileIds);
+        const pingProfileIds = normalizeProfileIdList(legacyPingSettings
+            ? normalized.profiles
+                .filter((profile) => profile.pingEnabled !== false && isPingEligibleProfile(profile))
+                .map((profile) => profile.id)
+            : normalized.pingSettings.profileIds)
+            .filter((id) => knownProfileIds.has(id));
         normalized.pingSettings = {
             enabled: normalized.pingSettings?.enabled !== false,
+            profileIds: pingProfileIds,
         };
+        for (const profile of normalized.profiles) {
+            profile.pingEnabled = pingProfileIds.includes(profile.id);
+        }
         normalized.updatedAt = normalized.updatedAt || nowISO();
         return normalized;
     }
 
+    function setAutoPingProfiles(state, profileIds) {
+        const knownProfileIds = new Set(state.profiles.map((profile) => profile.id));
+        const ids = normalizeProfileIdList(profileIds).filter((id) => knownProfileIds.has(id));
+        state.pingSettings = {
+            ...(state.pingSettings || {}),
+            enabled: state.pingSettings?.enabled !== false,
+            profileIds: ids,
+        };
+        for (const profile of state.profiles) {
+            profile.pingEnabled = ids.includes(profile.id);
+        }
+        return ids;
+    }
+
     function loadState(readOnly = false) {
-        if (!fs.existsSync(stateFile)) return initialState();
+        if (!fs.existsSync(stateFile)) return normalizeState(initialState());
         try {
             const stat = fs.statSync(stateFile);
             const signature = `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
@@ -790,7 +888,8 @@ function createApp(options = {}) {
         } catch (error) {
             const backup = `${stateFile}.${Date.now()}.broken`;
             fs.copyFileSync(stateFile, backup);
-            return initialState();
+            stateLog.error("state.json 损坏，已备份并回退到初始状态", { stateFile, backup, error });
+            return normalizeState(initialState());
         }
     }
 
@@ -798,14 +897,28 @@ function createApp(options = {}) {
         fs.mkdirSync(dataDir, { recursive: true });
         state.updatedAt = nowISO();
         const tmp = `${stateFile}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+        const content = JSON.stringify(state, null, 2);
+        fs.writeFileSync(tmp, content);
         fs.renameSync(tmp, stateFile);
         stateReadCache = null;
+        stateLog.debug("state.json 已写入", {
+            bytes: Buffer.byteLength(content),
+            tasks: state.tasks?.length ?? 0,
+            profiles: state.profiles?.length ?? 0,
+            events: state.events?.length ?? 0,
+        });
     }
 
-    if (!fs.existsSync(stateFile)) saveState(initialState());
+    if (!fs.existsSync(stateFile)) saveState(normalizeState(initialState()));
 
     function addEvent(state, type, taskId, message) {
+        const task = taskId ? state.tasks?.find((item) => item.id === taskId) : null;
+        taskLog.log(["failed", "error"].includes(String(type)) ? "error" : "info", message, {
+            event: type,
+            taskId: taskId || undefined,
+            title: task?.title || undefined,
+            status: task?.status || undefined,
+        });
         state.events.unshift({
             id: makeId("event"),
             type,
@@ -1208,6 +1321,7 @@ function createApp(options = {}) {
             apiTokenPreview: maskToken(apiToken),
             envPreview: maskEnvText(profile.envText || ""),
             envKeys: Object.keys(parseEnvText(profile.envText || "")),
+            pingEligible: isPingEligibleProfile(profile),
         };
     }
 
@@ -1242,9 +1356,12 @@ function createApp(options = {}) {
                 logSize: safeStat(taskRunLogPath(task, run, false))?.size || 0,
                 eventLogSize: safeStat(taskRunLogPath(task, run, true))?.size || 0,
             }));
+            const cycles = Array.isArray(task.cycles) ? task.cycles : [];
             return {
                 ...task,
                 ...(compact ? { loop: undefined, appendHistory: undefined } : {}),
+                cycles: compact ? cycles.slice(-200) : cycles,
+                stats: summarizeTaskCycles(cycles),
                 canDelete: !taskIsBusy(task),
                 projectName: project?.name || "",
                 projectDirectory: project?.directory || "",
@@ -1583,6 +1700,7 @@ function createApp(options = {}) {
         task.status = STATUS.notStarted;
         task.loop = {
             ...(task.loop || {}),
+            failureStreak: 0,
             stallCount: 0,
             lastOutput: "",
             lastHash: fileHash(filePath),
@@ -1857,8 +1975,13 @@ function createApp(options = {}) {
         });
     }
 
+    // 需求来源语义：manual = 直接输入任务列表（落到 sourceMode "template"），
+    // agent = 原始需求待大模型生成（落到 sourceMode "agent"）。existing / upload 不受影响。
     function normalizeTaskSourceMode(value, body = {}) {
         if (body.loadExisting === true) return "existing";
+        const requirementMode = String(body.requirementMode || "").trim().toLowerCase();
+        if (requirementMode === "manual") return "template";
+        if (requirementMode === "agent") return "agent";
         const mode = String(value || "").trim().toLowerCase();
         if (["agent", "existing", "upload", "template"].includes(mode)) return mode;
         return "agent";
@@ -2151,6 +2274,21 @@ function createApp(options = {}) {
             profile: profileLogContext(options.profile),
             metadata: options.metadata || {},
         });
+        if (["stdout", "stderr"].includes(String(type))) {
+            if (agentLog.enabled("debug")) {
+                agentLog.debug(summarizeTerminalLogText(text), { taskId: task.id, runId, stream: type, chars: String(text ?? "").length });
+            }
+        } else {
+            agentLog.log(["error", "process_error"].includes(String(type)) ? "error" : "info", summarizeTerminalLogText(text), {
+                taskId: task.id,
+                runId,
+                type,
+                profile: options.profile?.name || undefined,
+                ...(options.metadata?.pid ? { pid: options.metadata.pid } : {}),
+                ...(options.metadata?.exitCode !== undefined && options.metadata?.exitCode !== null ? { exitCode: options.metadata.exitCode } : {}),
+                ...(options.metadata?.durationMs !== undefined ? { durationMs: options.metadata.durationMs } : {}),
+            });
+        }
         const persistRun = shouldPersistRunLog(options, runId);
         const run = persistRun
             ? ensureTaskRunLog(task, runId, {
@@ -2580,6 +2718,7 @@ function createApp(options = {}) {
             const script = delegate ? [delegate, resolvedCommand] : [resolvedCommand];
             const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ...script, ...spawnSpec.args];
             return {
+                ...spawnSpec,
                 command,
                 args,
                 summary: [command, ...args].map(quoteCommandArg).join(" ").trim(),
@@ -2591,6 +2730,7 @@ function createApp(options = {}) {
             const line = [resolvedCommand, ...spawnSpec.args].map(quoteCmdArgument).join(" ");
             const args = ["/d", "/s", "/c", line];
             return {
+                ...spawnSpec,
                 command,
                 args,
                 summary: [command, ...args].map(quoteCommandArg).join(" ").trim(),
@@ -2599,6 +2739,7 @@ function createApp(options = {}) {
         }
 
         return {
+            ...spawnSpec,
             command: resolvedCommand,
             args: spawnSpec.args,
             summary: [resolvedCommand, ...spawnSpec.args].map(quoteCommandArg).join(" ").trim(),
@@ -2730,12 +2871,15 @@ function createApp(options = {}) {
         return `Prompt 开始\n${prompt}\nPrompt 结束`;
     }
 
-    function buildPrompt(profile, task, overridePrompt = "") {
+    function buildPrompt(profile, task, overridePrompt = "", runToken = "") {
         if (overridePrompt) return overridePrompt;
-        const template = normalizeTaskType(task.taskType) === "text"
+        const isText = normalizeTaskType(task.taskType) === "text";
+        const template = isText
             ? profile.promptTemplate || DEFAULT_RUN_PROMPT
             : profile.mediaPromptTemplate || DEFAULT_MEDIA_RUN_PROMPT;
-        return fillTemplate(template, taskTemplateContext(task, profile));
+        const prompt = fillTemplate(template, { ...taskTemplateContext(task, profile), runToken });
+        // 文本任务以任务文件中的本轮凭据判定成败，自定义模板缺少占位符时补上说明。
+        return isText && runToken ? ensureRunTokenInstruction(prompt, runToken, task.targetFileName) : prompt;
     }
 
     function isCodexCommand(profile) {
@@ -2773,6 +2917,55 @@ function createApp(options = {}) {
             command: stripCommandQuotes(profile.command),
             args: renderedArgs,
             summary: [stripCommandQuotes(profile.command), ...renderedArgs].map(quoteCommandArg).join(" ").trim(),
+        };
+    }
+
+    function buildTaskSpawn(profile, prompt, task = {}) {
+        const spawnSpec = buildSpawn(profile, prompt, task);
+        if (!isClaudeCommand(profile)) return { ...spawnSpec, structuredOutput: false };
+        const args = [...spawnSpec.args];
+        const hasOutputFormat = args.some((arg, index) => arg.startsWith("--output-format=")
+            || (arg === "--output-format" && args[index + 1]));
+        if (hasOutputFormat) return { ...spawnSpec, structuredOutput: false };
+        args.unshift("--output-format", "stream-json");
+        if (!args.includes("--verbose")) args.unshift("--verbose");
+        return {
+            ...spawnSpec,
+            args,
+            summary: [spawnSpec.command, ...args].map(quoteCommandArg).join(" ").trim(),
+            structuredOutput: true,
+        };
+    }
+
+    // 结构化输出按行渲染成可读文本后再写日志；非结构化输出原样透传。
+    function createTaskOutputHandler(task, { runId, profile, phase = "run", structuredOutput = false, legacyPrefix = "" }) {
+        const renderer = structuredOutput ? createStreamJsonRenderer() : null;
+        let rendered = "";
+        const emit = (text, stream) => {
+            if (!text) return;
+            rendered += text.endsWith("\n") ? text : `${text}\n`;
+            appendTaskLogEvent(task, stream === "error" ? "error" : stream, text, {
+                runId,
+                phase,
+                profile,
+                stream,
+                legacyText: formatOutputChunk(`${legacyPrefix}${stream}`, text),
+            });
+        };
+        return {
+            onOutput(text, stream) {
+                if (renderer && stream === "stdout") {
+                    emit(renderer.push(text), stream);
+                    return;
+                }
+                emit(text, stream);
+            },
+            flush() {
+                if (renderer) emit(renderer.flush(), "stdout");
+            },
+            output() {
+                return rendered;
+            },
         };
     }
 
@@ -2835,7 +3028,7 @@ function createApp(options = {}) {
             };
             const env = environmentForProfile(profile, task);
             const actualSpawnSpec = prepareSpawnSpecForPlatform(spawnSpec || buildSpawn(profile, prompt, task), env, task.directory);
-            const timeoutMs = Math.max(1, Number(profile.timeoutSeconds || 1800)) * 1000;
+            const timeoutMs = Math.max(1, Number(profile.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS)) * 1000;
             const startedAt = Date.now();
             const processStartedAt = nowISO();
             let child;
@@ -2858,6 +3051,7 @@ function createApp(options = {}) {
                     stdout: "",
                     stderr: message,
                     commandSummary: actualSpawnSpec.summary,
+                    startedAt: processStartedAt,
                     durationMs: Date.now() - startedAt,
                     firstOutputAt: null,
                     firstOutputLatencyMs: null,
@@ -2956,6 +3150,7 @@ function createApp(options = {}) {
                     stdout,
                     stderr,
                     commandSummary: actualSpawnSpec.summary,
+                    startedAt: processStartedAt,
                     durationMs,
                     firstOutputAt,
                     firstOutputLatencyMs,
@@ -2969,9 +3164,9 @@ function createApp(options = {}) {
             const timer = setTimeout(() => {
                 child.kill("SIGTERM");
                 setTimeout(() => child.kill("SIGKILL"), 3000).unref();
-                output += `\n[timeout] command exceeded ${profile.timeoutSeconds || 1800}s`;
-                emitLifecycle("timeout", `Agent 超时：超过 ${profile.timeoutSeconds || 1800}s，发送 SIGTERM`, {
-                    timeoutSeconds: profile.timeoutSeconds || 1800,
+                output += `\n[timeout] command exceeded ${profile.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS}s`;
+                emitLifecycle("timeout", `Agent 超时：超过 ${profile.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS}s，发送 SIGTERM`, {
+                    timeoutSeconds: profile.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS,
                 });
                 settle({ exitCode: 124, signal: "TIMEOUT", timedOut: true });
             }, timeoutMs);
@@ -3034,9 +3229,15 @@ function createApp(options = {}) {
         });
     }
 
-    function isPingProfile(profile) {
+    function isPingEligibleProfile(profile) {
         const agentType = String(profile?.agentType || "").trim().toLowerCase();
-        return profile?.enabled !== false && profile?.pingEnabled !== false && ["claude", "claudecode", "codex"].includes(agentType);
+        return PING_AGENT_TYPES.includes(agentType);
+    }
+
+    // 自动 Ping 只覆盖 pingSettings.profileIds 中勾选的 Profile；未指定的一律不 Ping。
+    function isPingProfile(profile, state) {
+        const selected = new Set(state?.pingSettings?.profileIds || []);
+        return profile?.enabled !== false && selected.has(profile?.id) && isPingEligibleProfile(profile);
     }
 
     function lastPingRecordForProfile(records, profileId) {
@@ -3105,7 +3306,7 @@ function createApp(options = {}) {
             const failureReason = success
                 ? ""
                 : result.timedOut
-                    ? `超时：超过 ${profile.timeoutSeconds || 1800} 秒`
+                    ? `超时：超过 ${profile.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS} 秒`
                     : structuredFailureReason || outputReason || (result.signal ? `进程被信号 ${result.signal} 终止` : `进程退出码 ${result.exitCode ?? "-"}`);
             const firstOutputLatencyMs = firstPingResponseLatency(stdoutChunks, spawnSpec.structuredOutput)
                 ?? result.firstOutputLatencyMs
@@ -3182,11 +3383,25 @@ function createApp(options = {}) {
             }
             const now = new Date();
             const profiles = state.profiles
-                .filter(isPingProfile)
+                .filter((profile) => isPingProfile(profile, state))
                 .filter((profile) => runOptions.dueOnly !== true || isProfileDueForPing(profile, state.pingRecords, now));
             const records = [];
+            pingLog.log(runOptions.manual === true ? "info" : "debug", "Ping 轮次开始", {
+                manual: runOptions.manual === true,
+                dueOnly: runOptions.dueOnly === true,
+                profiles: profiles.map((profile) => profile.name),
+            });
             for (const profile of profiles) {
-                records.push(await pingProfile(profile));
+                const record = await pingProfile(profile);
+                pingLog.log(record.success ? "info" : "warn", `Ping ${record.success ? "成功" : "失败"}`, {
+                    profile: profile.name,
+                    profileId: profile.id,
+                    exitCode: record.exitCode,
+                    durationMs: record.durationMs,
+                    firstOutputLatencyMs: record.firstOutputLatencyMs,
+                    error: record.error || undefined,
+                });
+                records.push(record);
             }
             if (records.length === 0) return records;
             state = loadState();
@@ -3210,6 +3425,13 @@ function createApp(options = {}) {
             // A direct profile test is explicit user intent, so it remains
             // available even when scheduled/global Ping is disabled.
             const record = await pingProfile(profile, { source: "manual" });
+            pingLog.log(record.success ? "info" : "warn", `手动 Ping ${record.success ? "成功" : "失败"}`, {
+                profile: profile.name,
+                profileId: profile.id,
+                exitCode: record.exitCode,
+                durationMs: record.durationMs,
+                error: record.error || undefined,
+            });
             const state = loadState();
             state.pingRecords = [record, ...(state.pingRecords || [])].slice(0, 5000);
             addEvent(
@@ -3228,8 +3450,10 @@ function createApp(options = {}) {
     function startPingScheduler() {
         if (options.disablePingScheduler === true) return;
         const intervalMs = Math.max(1000, Number(options.pingSchedulerTickMs || PING_SCHEDULER_TICK_MS));
+        pingLog.info("Ping 调度器已启动", { tickMs: intervalMs });
         pingTimer = setInterval(() => {
             runPingRound({ dueOnly: true }).catch((error) => {
+                pingLog.error("定时 Ping 轮次失败", { error });
                 const state = loadState();
                 addEvent(state, "ping", null, `Ping 失败：${error.message}`);
                 saveState(state);
@@ -3266,7 +3490,7 @@ function createApp(options = {}) {
         const prompt = buildTaskGenerationPrompt(task);
         let spawnSpec = null;
         try {
-            spawnSpec = prepareSpawnSpecForPlatform(buildSpawn(profile, prompt, task), environmentForProfile(profile, task), task.directory);
+            spawnSpec = prepareSpawnSpecForPlatform(buildTaskSpawn(profile, prompt, task), environmentForProfile(profile, task), task.directory);
         } catch (error) {
             task.status = STATUS.failed;
             task.lastOutput = error.message;
@@ -3326,6 +3550,13 @@ function createApp(options = {}) {
         });
         saveState(state);
 
+        const outputHandler = createTaskOutputHandler(task, {
+            runId,
+            profile,
+            phase: "generate",
+            structuredOutput: spawnSpec.structuredOutput === true,
+            legacyPrefix: "generate ",
+        });
         const result = await runProfileCommand({
             profile,
             task,
@@ -3338,14 +3569,10 @@ function createApp(options = {}) {
                 metadata,
                 legacyText: `generate ${text}`,
             }),
-            onOutput: (text, stream) => appendTaskLogEvent(task, stream === "error" ? "error" : stream, text, {
-                runId,
-                phase: "generate",
-                profile,
-                stream,
-                legacyText: formatOutputChunk(`generate ${stream}`, text),
-            }),
+            onOutput: outputHandler.onOutput,
         });
+        outputHandler.flush();
+        if (spawnSpec.structuredOutput) result.output = outputHandler.output();
 
         state = loadState();
         task = findTask(state, taskId);
@@ -3376,9 +3603,10 @@ function createApp(options = {}) {
         task.lastOutputChunks = result.outputChunks;
         task.lastStdoutBytes = result.stdoutBytes;
         task.lastStderrBytes = result.stderrBytes;
+        task.lastAgentEndedAt = nowISO();
         task.decomposeProfileId = profile.id;
         task.fileMtime = stat?.mtime?.toISOString() || null;
-        task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
+        task.loop = { ...(task.loop || {}), failureStreak: 0, stallCount: 0, lastOutput: "", lastHash: afterHash };
         task.updatedAt = nowISO();
 
         if (failed) {
@@ -3447,6 +3675,9 @@ function createApp(options = {}) {
         }, delayMs);
         runner.timer.unref();
     }
+
+    // 循环节奏：默认取 LOOP_TIMING，测试可通过 options.loopTiming 缩短等待。
+    const loopTiming = Object.freeze({ ...LOOP_TIMING, ...(options.loopTiming || {}) });
 
     function availabilityCheckIntervalMs() {
         const configured = Number(options.availabilityCheckIntervalMs);
@@ -4043,6 +4274,20 @@ function createApp(options = {}) {
         }
         const runId = runner.runId || makeId("run");
         runner.runId = runId;
+        // 两次 Agent 请求之间至少间隔 minRunIntervalMs，手动重启或重启服务后恢复的任务同样受限。
+        const sinceLastAgentMs = task.lastAgentEndedAt ? Date.now() - new Date(task.lastAgentEndedAt).getTime() : Number.POSITIVE_INFINITY;
+        if (Number.isFinite(sinceLastAgentMs) && sinceLastAgentMs >= 0 && sinceLastAgentMs < loopTiming.minRunIntervalMs) {
+            const delayMs = loopTiming.minRunIntervalMs - sinceLastAgentMs;
+            task.nextRunAt = new Date(Date.now() + delayMs).toISOString();
+            task.updatedAt = nowISO();
+            appendTaskLogEvent(task, "rate_limit_wait", `距上次 Agent 结束不足 ${formatDelay(loopTiming.minRunIntervalMs)}，${formatDelay(delayMs)}后再启动`, {
+                runId,
+                metadata: { delayMs, minRunIntervalMs: loopTiming.minRunIntervalMs, lastAgentEndedAt: task.lastAgentEndedAt },
+            });
+            saveState(state);
+            scheduleNext(taskId, delayMs);
+            return;
+        }
         if (runner.profileSelectionRequired === true) {
             const selected = await selectAvailableProfileForRun(taskId);
             if (!selected) return;
@@ -4077,11 +4322,13 @@ function createApp(options = {}) {
         }
         const beforeHash = fileHash(task.filePath);
         const beforeArtifacts = artifactSnapshot(task);
+        const isTextTask = normalizeTaskType(task.taskType) === "text";
+        const runToken = isTextTask ? createRunToken() : "";
         let prompt = "";
         let spawnSpec = null;
         try {
-            prompt = buildPrompt(profile, task);
-            spawnSpec = prepareSpawnSpecForPlatform(buildSpawn(profile, prompt, task), environmentForProfile(profile, task), task.directory);
+            prompt = buildPrompt(profile, task, "", runToken);
+            spawnSpec = prepareSpawnSpecForPlatform(buildTaskSpawn(profile, prompt, task), environmentForProfile(profile, task), task.directory);
         } catch (error) {
             task.status = STATUS.failed;
             task.lastOutput = error.message;
@@ -4100,6 +4347,7 @@ function createApp(options = {}) {
         }
         task.lastPrompt = prompt;
         task.lastCommand = spawnSpec.summary;
+        task.lastRunToken = runToken;
         task.lastProfileId = profile.id;
         task.lastProfileName = profile.name;
         task.lastProfileAgentType = profile.agentType;
@@ -4114,8 +4362,16 @@ function createApp(options = {}) {
             metadata: {
                 directory: task.directory,
                 retryCount: task.retryCount || 0,
+                failureStreak: task.loop?.failureStreak || 0,
             },
         });
+        if (runToken) {
+            appendTaskLogEvent(task, "run_token", `本轮执行凭据：${runToken}（Agent 成功后须写入 ${task.targetFileName}，否则本轮按失败处理）`, {
+                runId,
+                profile,
+                metadata: { runToken },
+            });
+        }
         appendTaskLogEvent(task, "profile_config", profileConfigDescription(profile), {
             runId,
             profile,
@@ -4133,6 +4389,11 @@ function createApp(options = {}) {
         });
         saveState(state);
 
+        const outputHandler = createTaskOutputHandler(task, {
+            runId,
+            profile,
+            structuredOutput: spawnSpec.structuredOutput === true,
+        });
         const result = await runProfileCommand({
             profile,
             task,
@@ -4143,13 +4404,11 @@ function createApp(options = {}) {
                 profile,
                 metadata,
             }),
-            onOutput: (text, stream) => appendTaskLogEvent(task, stream === "error" ? "error" : stream, text, {
-                runId,
-                profile,
-                stream,
-                legacyText: formatOutputChunk(stream, text),
-            }),
+            onOutput: outputHandler.onOutput,
         });
+        outputHandler.flush();
+        const rawOutput = result.output || "";
+        if (spawnSpec.structuredOutput) result.output = outputHandler.output();
 
         state = loadState();
         task = findTask(state, taskId);
@@ -4160,6 +4419,7 @@ function createApp(options = {}) {
 
         task.lastExitCode = result.exitCode;
         task.lastOutput = result.output.slice(-4000);
+        task.lastAgentEndedAt = nowISO();
         task.lastCommand = result.commandSummary;
         task.lastOutputAt = result.lastOutputAt || null;
         task.lastRunDurationMs = result.durationMs;
@@ -4171,8 +4431,67 @@ function createApp(options = {}) {
 
         const output = result.output || "";
         const afterHash = fileHash(task.filePath);
-        const taskFileAllDone = normalizeTaskType(task.taskType) === "text" && taskFileHasAllDoneMarker(task.filePath);
+        const taskFileContent = isTextTask ? readTaskFileText(task.filePath) : "";
+        const taskFileAllDone = isTextTask && isAllDoneOutput(taskFileContent);
+        const runTokenWritten = isTextTask && taskFileHasRunToken(taskFileContent, runToken);
         const generatedArtifacts = changedArtifacts(beforeArtifacts, task);
+        const mediaSucceeded = !isTextTask && result.exitCode === 0 && generatedArtifacts.length > 0;
+        const cycleSucceeded = isTextTask ? (taskFileAllDone || runTokenWritten) : mediaSucceeded;
+        const rateLimited = /429/i.test(rawOutput) || /429/i.test(output);
+        const fileChanged = isTextTask && afterHash !== beforeHash;
+        const reason = cycleSucceeded
+            ? (taskFileAllDone ? "all_done" : "run_token_written")
+            : !isTextTask
+                ? "artifact_missing"
+                : rateLimited
+                    ? "429"
+                    : fileChanged
+                        ? "run_token_missing"
+                        : "task_file_unchanged";
+        // 每轮统计：token 用量来自结构化输出（Claude stream-json / Codex --json），费用按 Fable 5.1 费率估算。
+        const usage = extractUsageFromOutput(rawOutput);
+        appendTaskCycle(task, {
+            runId,
+            cycle: (task.cycles?.length || 0) + 1,
+            startedAt: result.startedAt || task.lastRunAt || nowISO(),
+            endedAt: task.lastAgentEndedAt,
+            durationMs: result.durationMs,
+            success: cycleSucceeded,
+            reason,
+            exitCode: result.exitCode ?? null,
+            timedOut: result.timedOut === true,
+            stoppedByUser: runner.stopped === true,
+            profileId: profile.id,
+            profileName: profile.name,
+            modelName: profile.modelName || "",
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheCreationTokens: usage.cacheCreationTokens,
+            cacheReadTokens: usage.cacheReadTokens,
+            usageFound: usage.found,
+            reportedCostUsd: usage.reportedCostUsd,
+            costUsd: estimateCycleCostUsd(usage),
+        });
+        const cycleStats = summarizeTaskCycles(task.cycles);
+        appendTaskLogEvent(task, "cycle_stats", [
+            `第 ${task.cycles.length} 轮${cycleSucceeded ? "成功" : "失败"}：tokens in=${usage.inputTokens} out=${usage.outputTokens} cacheWrite=${usage.cacheCreationTokens} cacheRead=${usage.cacheReadTokens}${usage.found ? "" : "（未从输出中解析到 usage）"}`,
+            `本轮费用≈$${estimateCycleCostUsd(usage).toFixed(4)}，累计 ${cycleStats.cycles} 轮（成功 ${cycleStats.successes} / 失败 ${cycleStats.failures}）累计费用≈$${cycleStats.costUsd.toFixed(4)}`,
+        ].join("\n"), {
+            runId,
+            profile,
+            metadata: {
+                cycle: task.cycles.length,
+                success: cycleSucceeded,
+                reason,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+                cacheCreationTokens: usage.cacheCreationTokens,
+                cacheReadTokens: usage.cacheReadTokens,
+                costUsd: estimateCycleCostUsd(usage),
+                totalCostUsd: cycleStats.costUsd,
+                averageIntervalMs: cycleStats.averageIntervalMs,
+            },
+        });
 
         if (runner.stopped) {
             task.status = STATUS.stopped;
@@ -4190,45 +4509,11 @@ function createApp(options = {}) {
             return;
         }
 
-        // A persisted completion marker must stop the loop even if the command
-        // also reports a rate limit or exits unsuccessfully after writing it.
-        if (/429/i.test(output) && !taskFileAllDone) {
-            task.status = STATUS.retryWait;
-            task.retryCount = (task.retryCount || 0) + 1;
-            const switched = rotateProfile(state, task);
-            if (switched) runner.profileSelectionRequired = true;
-            task.nextRunAt = new Date(Date.now() + 300000).toISOString();
-            const note = switched ? `检测到 429，切换 Profile：${switched.profileName}，5 分钟后重试` : "检测到 429，5 分钟后重试";
-            addEvent(state, "retry", taskId, note);
-            if (switched) {
-                appendTaskLogEvent(task, "profile_switched", `切换 Profile：${switched.previousProfileName} → ${switched.profileName}`, {
-                    runId,
-                    profile: switched.profile,
-                    metadata: {
-                        reason: "429",
-                        previousProfileId: switched.previousProfileId,
-                        previousProfileName: switched.previousProfileName,
-                        profileId: switched.profileId,
-                        profileName: switched.profileName,
-                    },
-                });
-            }
-            appendTaskLogEvent(task, "retry_wait", note, {
-                runId,
-                profile: switched?.profile || profile,
-                metadata: { reason: "429", delayMs: 300000, retryCount: task.retryCount },
-            });
-            updateTaskRunLog(task, runId, { status: STATUS.retryWait, endedAt: null });
-            saveState(state);
-            scheduleNext(taskId, 300000);
-            return;
-        }
-
-        if (normalizeTaskType(task.taskType) !== "text" && result.exitCode === 0 && generatedArtifacts.length > 0) {
+        if (mediaSucceeded) {
             task.status = STATUS.allDone;
             task.nextRunAt = null;
             task.lastArtifactPaths = generatedArtifacts.map((artifact) => artifact.relativePath);
-            task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
+            task.loop = { ...(task.loop || {}), failureStreak: 0, stallCount: 0, lastOutput: "", lastHash: afterHash };
             addEvent(state, "all_done", taskId, `已生成 ${generatedArtifacts.length} 个${task.taskType}产物`);
             appendTaskLogEvent(task, "task_all_done", `媒体产物生成完成：${generatedArtifacts.map((artifact) => artifact.relativePath).join(", ")}`, {
                 runId,
@@ -4242,16 +4527,17 @@ function createApp(options = {}) {
             return;
         }
 
-        if (normalizeTaskType(task.taskType) === "text" && (taskFileAllDone || isAllDoneOutput(output))) {
+        // 任务文件是唯一凭据：结束标志与本轮凭据都只从文件中读取，不再解析 Agent 的回复文本。
+        if (taskFileAllDone) {
             task.status = STATUS.allDone;
             task.nextRunAt = null;
-            task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: "", lastHash: afterHash };
+            task.loop = { ...(task.loop || {}), failureStreak: 0, stallCount: 0, lastOutput: "", lastHash: afterHash };
             addEvent(state, "all_done", taskId, "目标文件中任务全部完成");
-            appendTaskLogEvent(task, "task_all_done", "全部完成，停止循环", {
+            appendTaskLogEvent(task, "task_all_done", "任务文件已写入结束标志，停止循环", {
                 runId,
                 profile,
                 runStatus: STATUS.allDone,
-                metadata: { completionSource: taskFileAllDone ? "task_file" : "output" },
+                metadata: { completionSource: "task_file", runTokenWritten },
             });
             updateTaskRunLog(task, runId, { status: STATUS.allDone, endedAt: nowISO() });
             saveState(state);
@@ -4259,48 +4545,51 @@ function createApp(options = {}) {
             return;
         }
 
-        if (normalizeTaskType(task.taskType) === "text" && output.includes("任务完成")) {
+        if (runTokenWritten) {
+            const delayMs = loopTiming.minRunIntervalMs;
             task.status = STATUS.completed;
-            task.nextRunAt = new Date(Date.now() + 10000).toISOString();
-            task.loop = { ...(task.loop || {}), stallCount: 0, lastOutput: output, lastHash: afterHash };
-            addEvent(state, "completed", taskId, "单轮任务完成，10 秒后继续");
-            appendTaskLogEvent(task, "task_completed", "任务完成，10 秒后继续下一轮", {
+            task.nextRunAt = new Date(Date.now() + delayMs).toISOString();
+            task.loop = { ...(task.loop || {}), failureStreak: 0, stallCount: 0, lastOutput: output, lastHash: afterHash };
+            addEvent(state, "completed", taskId, `本轮任务完成（任务文件已写入凭据），${formatDelay(delayMs)}后继续`);
+            appendTaskLogEvent(task, "task_completed", `任务文件已写入本轮凭据 ${runToken}，${formatDelay(delayMs)}后继续下一轮`, {
                 runId,
                 profile,
                 runStatus: STATUS.completed,
-                metadata: { delayMs: 10000 },
+                metadata: { delayMs, runToken, fileChanged: afterHash !== beforeHash },
             });
             updateTaskRunLog(task, runId, { status: STATUS.completed, endedAt: null });
             saveState(state);
-            scheduleNext(taskId, 10000);
+            scheduleNext(taskId, delayMs);
             return;
         }
 
+        // 本轮失败：文件没有凭据（或媒体任务没有产物）。按失败次数指数退避，达到上限后停止，避免无效请求耗光额度。
         const previousLoop = task.loop || {};
-        const sameOutput = output === previousLoop.lastOutput;
-        const unchangedResult = normalizeTaskType(task.taskType) === "text"
-            ? afterHash === beforeHash
-            : generatedArtifacts.length === 0;
-        const stallCount = sameOutput && unchangedResult ? (previousLoop.stallCount || 1) + 1 : 1;
-
+        const failureStreak = Math.max(0, Number(previousLoop.failureStreak) || 0) + 1;
+        const reasonText = {
+            artifact_missing: "未检测到新媒体产物",
+            429: "检测到 429 限流",
+            run_token_missing: "任务文件已改动但未写入本轮凭据",
+            task_file_unchanged: "任务文件未改动",
+        }[reason];
         task.loop = {
+            ...previousLoop,
+            failureStreak,
+            stallCount: failureStreak,
             lastOutput: output,
             lastHash: afterHash,
-            stallCount,
         };
 
-        if (stallCount >= 3) {
+        if (failureStreak >= loopTiming.maxConsecutiveFailures) {
             task.status = STATUS.stopped;
             task.nextRunAt = null;
-            const stallMessage = normalizeTaskType(task.taskType) === "text"
-                ? "连续 3 次输出相同且任务文件无改动，停止循环"
-                : "连续 3 次输出相同且未生成新媒体产物，停止循环";
+            const stallMessage = `连续 ${failureStreak} 轮失败（${reasonText}），停止循环`;
             addEvent(state, "stopped", taskId, stallMessage);
             appendTaskLogEvent(task, "task_stopped", stallMessage, {
                 runId,
                 profile,
                 runStatus: STATUS.stopped,
-                metadata: { reason: "stalled", stallCount },
+                metadata: { reason: "stalled", failureReason: reason, failureStreak, runToken },
             });
             updateTaskRunLog(task, runId, { status: STATUS.stopped, endedAt: nowISO() });
             saveState(state);
@@ -4308,23 +4597,22 @@ function createApp(options = {}) {
             return;
         }
 
+        const delayMs = Math.max(loopTiming.minRunIntervalMs, failureBackoffMs(failureStreak, loopTiming));
         task.status = STATUS.retryWait;
         task.retryCount = (task.retryCount || 0) + 1;
         const switched = rotateProfile(state, task);
         if (switched) runner.profileSelectionRequired = true;
-        task.nextRunAt = new Date(Date.now() + 60000).toISOString();
-        const missingArtifact = normalizeTaskType(task.taskType) !== "text" && generatedArtifacts.length === 0;
-        const retryReason = missingArtifact ? "未检测到新媒体产物" : "其他输出";
+        task.nextRunAt = new Date(Date.now() + delayMs).toISOString();
         const retryNote = switched
-            ? `${retryReason}，切换 Profile：${switched.profileName}，1 分钟后重试`
-            : `${retryReason}，1 分钟后重试`;
+            ? `${reasonText}，切换 Profile：${switched.profileName}，${formatDelay(delayMs)}后重试`
+            : `${reasonText}，${formatDelay(delayMs)}后重试`;
         addEvent(state, "retry", taskId, retryNote);
         if (switched) {
             appendTaskLogEvent(task, "profile_switched", `切换 Profile：${switched.previousProfileName} → ${switched.profileName}`, {
                 runId,
                 profile: switched.profile,
                 metadata: {
-                    reason: retryReason,
+                    reason,
                     previousProfileId: switched.previousProfileId,
                     previousProfileName: switched.previousProfileName,
                     profileId: switched.profileId,
@@ -4332,19 +4620,35 @@ function createApp(options = {}) {
                 },
             });
         }
-        appendTaskLogEvent(task, "retry_wait", `${retryNote}。停滞计数：${stallCount}/3`, {
+        appendTaskLogEvent(task, "retry_wait", `${retryNote}。连续失败：${failureStreak}/${loopTiming.maxConsecutiveFailures}`, {
             runId,
             profile: switched?.profile || profile,
             metadata: {
-                reason: retryReason,
-                delayMs: 60000,
+                reason,
+                delayMs,
                 retryCount: task.retryCount,
-                stallCount,
+                failureStreak,
+                runToken,
             },
         });
         updateTaskRunLog(task, runId, { status: STATUS.retryWait, endedAt: null });
         saveState(state);
-        scheduleNext(taskId, 60000);
+        scheduleNext(taskId, delayMs);
+    }
+
+    function readTaskFileText(filePath) {
+        try {
+            return safeStat(filePath)?.isFile() ? fs.readFileSync(filePath, "utf8") : "";
+        } catch {
+            return "";
+        }
+    }
+
+    function formatDelay(delayMs) {
+        const seconds = Math.round(delayMs / 1000);
+        if (seconds < 60) return `${seconds} 秒`;
+        const minutes = Math.round(seconds / 60);
+        return minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`;
     }
 
     async function readJson(request) {
@@ -4444,11 +4748,22 @@ function createApp(options = {}) {
         if (method === "POST" && pathname === "/api/pings/settings") {
             const body = await readJson(request);
             const state = loadState();
-            state.pingSettings = {
-                ...(state.pingSettings || {}),
-                enabled: body.enabled !== false,
-            };
-            addEvent(state, "ping", null, state.pingSettings.enabled ? "Ping enabled" : "Ping disabled");
+            const messages = [];
+            if (body.enabled !== undefined) {
+                const enabled = body.enabled !== false;
+                if (enabled !== (state.pingSettings?.enabled !== false)) messages.push(enabled ? "Ping enabled" : "Ping disabled");
+                state.pingSettings = { ...(state.pingSettings || {}), enabled };
+            }
+            if (body.profileIds !== undefined) {
+                if (!Array.isArray(body.profileIds)) {
+                    sendJson(response, 400, { error: "profileIds 必须是 Profile ID 数组" });
+                    return;
+                }
+                const ids = setAutoPingProfiles(state, body.profileIds);
+                const names = ids.map((id) => state.profiles.find((profile) => profile.id === id)?.name || id);
+                messages.push(`自动 Ping Profile：${names.length ? names.join("、") : "无"}`);
+            }
+            for (const message of messages) addEvent(state, "ping", null, message);
             saveState(state);
             sendJson(response, 200, { ok: true, pingSettings: state.pingSettings });
             return;
@@ -4490,12 +4805,13 @@ function createApp(options = {}) {
                 envText: String(body.envText ?? existing?.envText ?? ""),
                 promptTemplate: String(body.promptTemplate || existing?.promptTemplate || DEFAULT_RUN_PROMPT),
                 mediaPromptTemplate: String(body.mediaPromptTemplate ?? existing?.mediaPromptTemplate ?? ""),
-                timeoutSeconds: Math.max(1, Number(body.timeoutSeconds || existing?.timeoutSeconds || 1800)),
+                timeoutSeconds: Math.max(1, Number(body.timeoutSeconds || existing?.timeoutSeconds || DEFAULT_TIMEOUT_SECONDS)),
                 baseUrl: String(body.baseUrl ?? existing?.baseUrl ?? "").trim(),
                 apiToken,
                 modelName: String(body.modelName ?? existing?.modelName ?? "").trim(),
                 pingIntervalMinutes: Math.max(1, Number(body.pingIntervalMinutes || existing?.pingIntervalMinutes || 60)),
-                pingEnabled: body.pingEnabled !== false,
+                // 自动 Ping 需显式加入名单：未传 pingEnabled 时，已有 Profile 保持原状，新 Profile 不参与。
+                pingEnabled: body.pingEnabled !== undefined ? body.pingEnabled === true : existing?.pingEnabled === true,
                 enabled: body.enabled !== false,
                 nonInteractive: body.nonInteractive !== false,
                 defaultDirectory: String(body.defaultDirectory ?? existing?.defaultDirectory ?? "").trim(),
@@ -4521,6 +4837,9 @@ function createApp(options = {}) {
             } else {
                 state.profiles.push(profile);
             }
+            const autoPingIds = (state.pingSettings?.profileIds || []).filter((id) => id !== profile.id);
+            if (profile.pingEnabled) autoPingIds.push(profile.id);
+            setAutoPingProfiles(state, autoPingIds);
             addEvent(state, "profile", null, `保存 Profile：${profile.name}`);
             saveState(state);
             sendJson(response, 200, { ok: true, profile: profileForClient(profile) });
@@ -4532,6 +4851,7 @@ function createApp(options = {}) {
             const state = loadState();
             const id = decodeURIComponent(deleteProfileMatch[1]);
             state.profiles = state.profiles.filter((profile) => profile.id !== id);
+            setAutoPingProfiles(state, state.pingSettings?.profileIds || []);
             addEvent(state, "profile", null, `删除 Profile：${id}`);
             saveState(state);
             sendJson(response, 200, { ok: true });
@@ -4763,7 +5083,9 @@ function createApp(options = {}) {
                     referenceFiles,
                 }), "utf8");
             } else if (sourceMode === "agent") {
-                fs.writeFileSync(filePath, "", "utf8");
+                // 创建任务不调用大模型：先写入占位内容（标题 + 原始需求），
+                // 由运行界面的「生成目标文件」触发 runTaskFileGeneration()。
+                fs.writeFileSync(filePath, generatePlaceholderTaskMarkdown({ title, requirement }), "utf8");
             }
 
             const logTitle = (safeTaskFileName(title).replace(/\.md$/i, "").slice(0, 120) || "task");
@@ -4774,6 +5096,8 @@ function createApp(options = {}) {
                 requirement,
                 taskType,
                 sourceMode,
+                requirementMode: normalizeRequirementMode({ sourceMode }),
+                generationState: sourceMode === "agent" ? "pending" : "none",
                 targetFileName,
                 filePath,
                 directory,
@@ -4804,13 +5128,21 @@ function createApp(options = {}) {
                 logFile,
                 logEventsFile: taskLogEventsFileName({ id: taskId, logFile }),
                 logRuns: [],
-                loop: { stallCount: 0, lastOutput: "", lastHash: fileHash(filePath) },
+                cycles: [],
+                loop: {
+                    failureStreak: 0,
+                    stallCount: 0,
+                    lastOutput: "",
+                    lastHash: fileHash(filePath),
+                    // 占位内容哈希：目标文件仍等于它时，表示用户尚未生成也未手动编辑。
+                    ...(sourceMode === "agent" ? { placeholderHash: fileHash(filePath) } : {}),
+                },
                 createdAt: nowISO(),
                 updatedAt: nowISO(),
             };
             state.tasks.unshift(task);
             const createMessages = {
-                agent: `创建任务并准备 Agent 生成：${task.title}`,
+                agent: `创建任务（待生成目标文件）：${task.title}`,
                 existing: `载入任务文件：${task.title}`,
                 upload: `导入任务文件：${task.title}`,
                 template: `创建任务：${task.title}`,
@@ -4823,28 +5155,141 @@ function createApp(options = {}) {
                 metadata: { filePath, sourceMode },
             });
 
-            if (sourceMode === "agent") {
-                const generation = await runTaskFileGeneration(task.id, generationProfile.id);
-                sendJson(response, 200, {
-                    ok: generation.ok,
-                    task: generation.task || task,
-                    generation: {
-                        ok: generation.ok,
-                        failed: generation.failed,
-                        exitCode: generation.result.exitCode,
-                        fileChanged: generation.fileChanged,
-                        output: generation.result.output,
-                    },
-                });
-                return;
-            }
-
             sendJson(response, 200, { ok: true, task });
             return;
         }
 
         if (method === "POST" && pathname === "/api/tasks/deduplicate") {
             sendJson(response, 200, deduplicateTasks(loadState()));
+            return;
+        }
+
+        // 任务编辑页自动保存：只更新元数据，不改动目标文件路径、工作目录、任务类型与来源。
+        const taskUpdateMatch = pathname.match(/^\/api\/tasks\/([^/]+)$/);
+        if ((method === "PATCH" || method === "PUT") && taskUpdateMatch) {
+            const body = await readJson(request);
+            const state = loadState();
+            const task = findTask(state, decodePathSegment(taskUpdateMatch[1], "任务 ID"));
+            if (!task) {
+                sendJson(response, 404, { error: "任务不存在" });
+                return;
+            }
+            if (task.archived) {
+                sendJson(response, 409, { error: "归档任务为只读，不能编辑" });
+                return;
+            }
+            if (taskIsBusy(task)) {
+                sendJson(response, 409, { error: "任务正在运行、排队、预约或等待重试，请先停止任务后再编辑" });
+                return;
+            }
+            const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+            const changes = [];
+            if (has("title")) {
+                const title = String(body.title || "").trim();
+                if (!title) {
+                    sendJson(response, 400, { error: "标题不能为空" });
+                    return;
+                }
+                if (title !== task.title) changes.push("title");
+                task.title = title;
+            }
+            if (has("requirement")) {
+                const requirement = String(body.requirement || "").trim();
+                if (requirement !== (task.requirement || "")) changes.push("requirement");
+                task.requirement = requirement;
+            }
+            if (has("projectId")) {
+                const projectId = String(body.projectId || "").trim();
+                const project = projectId ? findProject(state, projectId) : null;
+                if (projectId && !project) {
+                    sendJson(response, 400, { error: "请选择有效项目" });
+                    return;
+                }
+                if (project?.directory && path.resolve(project.directory) !== path.resolve(task.directory)) {
+                    sendJson(response, 400, { error: "所选项目绑定了其他工作目录，不能移动任务" });
+                    return;
+                }
+                if (projectId && projectId !== task.projectId) changes.push("projectId");
+                if (projectId) task.projectId = projectId;
+            }
+            const taskType = normalizeTaskType(task.taskType);
+            if (has("decomposeProfileId")) {
+                const profileId = String(body.decomposeProfileId || "").trim();
+                if (profileId && !findProfile(state, profileId)) {
+                    sendJson(response, 400, { error: "生成 Profile 不存在" });
+                    return;
+                }
+                if (profileId !== (task.decomposeProfileId || "")) changes.push("decomposeProfileId");
+                task.decomposeProfileId = profileId;
+            }
+            if (has("runProfileIds")) {
+                const requested = normalizeProfileIdList(body.runProfileIds);
+                const usable = selectUsableProfileIds(state, requested, taskType);
+                if (requested.length > 0 && usable.length === 0) {
+                    sendJson(response, 400, { error: `请选择支持 ${taskType} 输出的执行 Profile` });
+                    return;
+                }
+                if (JSON.stringify(usable) !== JSON.stringify(task.runProfileIds || [])) changes.push("runProfileIds");
+                task.runProfileIds = usable;
+                task.runProfileId = usable[0] || "";
+            }
+            if (taskType !== "text") {
+                if (has("artifactDirectoryName")) {
+                    const artifact = resolveArtifactDirectory(task.directory, body.artifactDirectoryName, task.id);
+                    if (artifact.name !== task.artifactDirectoryName) changes.push("artifactDirectoryName");
+                    task.artifactDirectoryName = artifact.name;
+                    task.artifactDirectory = artifact.path;
+                }
+                if (has("outputFileName") || has("outputFormat")) {
+                    const requestedFormat = normalizeMediaFormat(taskType, has("outputFormat") ? body.outputFormat : task.outputFormat);
+                    const outputFileName = safeOutputFileName(has("outputFileName") ? body.outputFileName : task.outputFileName, taskType, requestedFormat);
+                    const outputFormat = path.extname(outputFileName).slice(1).toLowerCase() || requestedFormat;
+                    if (outputFileName !== task.outputFileName || outputFormat !== task.outputFormat) changes.push("output");
+                    task.outputFileName = outputFileName;
+                    task.outputFormat = outputFormat;
+                }
+                if (has("aspectRatio")) {
+                    const aspectRatio = String(body.aspectRatio || "").trim();
+                    if (aspectRatio !== (task.aspectRatio || "")) changes.push("aspectRatio");
+                    task.aspectRatio = aspectRatio;
+                }
+                if (has("resolution")) {
+                    const resolution = String(body.resolution || "").trim();
+                    if (resolution !== (task.resolution || "")) changes.push("resolution");
+                    task.resolution = resolution;
+                }
+                if (taskType === "video" && has("durationSeconds")) {
+                    const durationSeconds = normalizeDurationSeconds(body.durationSeconds);
+                    if (durationSeconds !== task.durationSeconds) changes.push("durationSeconds");
+                    task.durationSeconds = durationSeconds;
+                }
+                if (has("referenceFiles")) {
+                    const referenceFiles = resolveReferenceFiles(task.directory, body.referenceFiles);
+                    if (JSON.stringify(referenceFiles) !== JSON.stringify(task.referenceFiles || [])) changes.push("referenceFiles");
+                    task.referenceFiles = referenceFiles;
+                }
+            }
+            if (changes.length === 0) {
+                sendJson(response, 200, { ok: true, task, changed: [] });
+                return;
+            }
+            // Agent 生成模式下目标文件仍是占位内容时，同步重写占位文件，让后续生成使用最新标题与需求。
+            let placeholderRewritten = false;
+            if (task.sourceMode === "agent" && task.loop?.placeholderHash && task.loop.placeholderHash === fileHash(task.filePath)
+                && (changes.includes("title") || changes.includes("requirement"))) {
+                fs.writeFileSync(task.filePath, generatePlaceholderTaskMarkdown({ title: task.title, requirement: task.requirement }), "utf8");
+                task.loop = { ...task.loop, placeholderHash: fileHash(task.filePath), lastHash: fileHash(task.filePath) };
+                task.fileMtime = safeStat(task.filePath)?.mtime?.toISOString() || null;
+                placeholderRewritten = true;
+            }
+            task.updatedAt = nowISO();
+            addEvent(state, "task", task.id, `编辑任务：${task.title}（${changes.join(", ")}）`);
+            saveState(state);
+            appendTaskLogEvent(task, "task_updated", `编辑任务：${changes.join(", ")}`, {
+                phase: "setup",
+                metadata: { changed: changes, placeholderRewritten },
+            });
+            sendJson(response, 200, { ok: true, task, changed: changes, placeholderRewritten });
             return;
         }
 
@@ -5136,7 +5581,37 @@ function createApp(options = {}) {
         sendJson(response, 404, { error: "API 不存在" });
     }
 
+    // 记录每个 HTTP 请求：GET 轮询很频繁，只在 debug 级别输出；写操作按 info，
+    // 4xx 记 warn、5xx 记 error。通过包装 writeHead / end 拿到最终状态码与耗时。
+    function instrumentHttpResponse(request, response) {
+        const startedAt = Date.now();
+        const method = request.method || "GET";
+        const target = request.url || "/";
+        const originalWriteHead = response.writeHead;
+        const originalEnd = response.end;
+        let statusCode = null;
+        let logged = false;
+        response.writeHead = function writeHead(code, ...rest) {
+            statusCode = code;
+            return originalWriteHead.call(this, code, ...rest);
+        };
+        response.end = function end(...args) {
+            if (!logged) {
+                logged = true;
+                const finalStatus = Number(statusCode ?? this.statusCode ?? 200);
+                const level = finalStatus >= 500 ? "error" : finalStatus >= 400 ? "warn" : method === "GET" ? "debug" : "info";
+                httpLog.log(level, `${method} ${target}`, {
+                    status: finalStatus,
+                    durationMs: Date.now() - startedAt,
+                    remote: request.socket?.remoteAddress || undefined,
+                });
+            }
+            return originalEnd.apply(this, args);
+        };
+    }
+
     const server = http.createServer(async (request, response) => {
+        instrumentHttpResponse(request, response);
         try {
             const url = new URL(request.url || "/", "http://localhost");
             if (url.pathname.startsWith("/api/")) {
@@ -5145,8 +5620,16 @@ function createApp(options = {}) {
             }
             serveStatic(request, response, url.pathname);
         } catch (error) {
+            httpLog.error(`${request.method || "GET"} ${request.url || "/"} 处理失败`, { status: error.statusCode || 500, error });
             sendJson(response, error.statusCode || 500, { error: error.message || "服务器错误" });
         }
+    });
+    server.on("listening", () => {
+        const address = server.address();
+        logger.info("HTTP 服务已监听", typeof address === "object" && address ? { host: address.address, port: address.port } : { address });
+    });
+    server.on("error", (error) => {
+        logger.error("HTTP 服务错误", { error, code: error?.code });
     });
 
     server.inject = async ({ method = "GET", path: requestPath = "/", body = null, headers = {} } = {}) => {
@@ -5177,6 +5660,7 @@ function createApp(options = {}) {
                     });
                 },
             };
+            instrumentHttpResponse(request, response);
             Promise.resolve()
                 .then(async () => {
                     const url = new URL(requestPath, "http://localhost");
@@ -5187,6 +5671,7 @@ function createApp(options = {}) {
                     }
                 })
                 .catch((error) => {
+                    httpLog.error(`${method} ${requestPath} 处理失败`, { status: error.statusCode || 500, error });
                     sendJson(response, error.statusCode || 500, { error: error.message || "服务器错误" });
                 });
         });
@@ -5194,6 +5679,7 @@ function createApp(options = {}) {
 
     server.closeRunners = () => {
         runnersClosing = true;
+        logger.info("正在关闭：停止 Ping 定时器与所有 Agent 子进程", { activeRunners: runners.size, activeProcesses: taskProcesses.size });
         if (pingTimer) {
             clearInterval(pingTimer);
             pingTimer = null;
@@ -5220,8 +5706,9 @@ function createApp(options = {}) {
                 });
                 updateTaskRunLog(task, runner.runId, { status: STATUS.stopped, endedAt: nowISO() });
                 saveState(state);
-            } catch {
+            } catch (error) {
                 // Shutdown should continue even if a damaged log/state file cannot be updated.
+                logger.warn("关闭时更新任务状态失败", { taskId, error });
             }
         }
         runners.clear();
@@ -5239,14 +5726,20 @@ if (require.main === module) {
     const server = createApp();
     server.listen(config.port, config.host, () => {
         console.log(formatStartupMessage(config));
+        console.log(`Terminal log level: ${config.logLevel} (override with LOG_LEVEL=debug|info|warn|error|silent)`);
     });
-    process.on("SIGINT", () => {
+    const shutdown = (signal) => {
+        console.log(`Received ${signal}, shutting down...`);
         server.closeRunners();
         server.close(() => process.exit(0));
+    };
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("uncaughtException", (error) => {
+        console.error(`[${nowISO()}] [ERROR] [server] uncaughtException ${error && error.stack ? error.stack : error}`);
     });
-    process.on("SIGTERM", () => {
-        server.closeRunners();
-        server.close(() => process.exit(0));
+    process.on("unhandledRejection", (reason) => {
+        console.error(`[${nowISO()}] [ERROR] [server] unhandledRejection ${reason && reason.stack ? reason.stack : reason}`);
     });
 }
 

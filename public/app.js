@@ -17,9 +17,9 @@ const MEDIA_FORMAT_OPTIONS = {
 };
 const TERMINAL_EVENT_TYPES = new Set(["stdout", "stderr", "error"]);
 const COMMAND_EVENT_TYPES = new Set(["command", "prompt", "profile_config"]);
-const WARNING_EVENT_TYPES = new Set(["retry_wait", "profile_switched", "timeout", "no_output", "availability_wait"]);
+const WARNING_EVENT_TYPES = new Set(["retry_wait", "profile_switched", "timeout", "no_output", "availability_wait", "rate_limit_wait"]);
 const ERROR_EVENT_TYPES = new Set(["stderr", "error", "process_error", "task_failed", "generation_failed"]);
-const RESULT_EVENT_TYPES = new Set(["task_completed", "task_all_done", "generation_completed"]);
+const RESULT_EVENT_TYPES = new Set(["task_completed", "task_all_done", "generation_completed", "cycle_stats"]);
 const STOP_EVENT_TYPES = new Set(["task_stopped", "user_stopped"]);
 const LOG_METADATA_KEYS = [
     "pid",
@@ -34,9 +34,21 @@ const LOG_METADATA_KEYS = [
     "intervalMinutes",
     "nextCheckAt",
     "stallCount",
+    "failureStreak",
+    "failureReason",
+    "runToken",
     "reason",
     "directory",
     "cwd",
+    "cycle",
+    "success",
+    "inputTokens",
+    "outputTokens",
+    "cacheCreationTokens",
+    "cacheReadTokens",
+    "costUsd",
+    "totalCostUsd",
+    "averageIntervalMs",
 ];
 const MAX_LEGACY_LOG_RENDER_CHARS = 256 * 1024;
 const LOG_PAGE_SIZE = 200;
@@ -53,6 +65,8 @@ const state = {
     refreshRequestId: 0,
     creatingTask: false,
     deduplicatingTasks: false,
+    // 任务页右侧编辑器：taskId 为空表示「创建任务」模式，否则编辑该任务并自动保存。
+    taskEditor: { taskId: "", timer: null, saving: false, dirty: false, lastSavedAt: null, error: "" },
     deletingTaskIds: new Set(),
     responseEtags: new Map(),
     pollTimer: null,
@@ -60,6 +74,7 @@ const state = {
     pollFailures: 0,
     dashboardHighlightTimer: null,
     activeView: "dashboard",
+    runtimeTabsSignature: "",
     log: {
         taskId: "",
         runId: "",
@@ -166,7 +181,7 @@ function logEventKind(event) {
     if (WARNING_EVENT_TYPES.has(type)) return "warning";
     if (COMMAND_EVENT_TYPES.has(type)) return "input";
     if (type === "stdout" || stream === "stdout") return "agent";
-    if (["task_created", "task_file_saved", "task_items_appended", "task_queued", "task_archived"].includes(type)) return "setup";
+    if (["task_created", "task_updated", "task_file_saved", "task_items_appended", "task_queued", "task_archived"].includes(type)) return "setup";
     if (["agent_selected", "generation_started", "process_started", "first_output", "process_exit", "task_started", "task_scheduled", "availability_check", "profile_available"].includes(type)) return "stage";
     return "system";
 }
@@ -800,7 +815,7 @@ function renderTasks() {
             const status = task.archived ? statusLabel(task.status) : taskDisplayStatus(task);
             const queueMeta = task.queuePosition ? `<span>${escapeHtml(t("runtime.queuePosition", { position: task.queuePosition }))}</span>` : "";
             return `
-                <article class="tree-task ${task.archived ? "tree-task-archived" : ""} clickable-task" data-open-task="${escapeHtml(task.id)}" data-runtime-state="${escapeHtml(runtimeState)}" tabindex="0" role="button" aria-label="${escapeHtml(t("dashboard.openTask", { name: task.title }))}">
+                <article class="tree-task ${task.archived ? "tree-task-archived" : ""} ${task.id === state.taskEditor.taskId ? "tree-task-selected" : ""} clickable-task" data-open-task="${escapeHtml(task.id)}" aria-current="${task.id === state.taskEditor.taskId ? "true" : "false"}" data-runtime-state="${escapeHtml(runtimeState)}" tabindex="0" role="button" aria-label="${escapeHtml(t("dashboard.openTask", { name: task.title }))}">
                     <div class="tree-task-main">
                         <span class="tree-branch">--</span>
                         <div>
@@ -975,6 +990,27 @@ function renderPingRecord(record, openRecordIds) {
     </details>`;
 }
 
+function renderPingProfilePicker() {
+    const listNode = $("#pingProfileList");
+    const summaryNode = $("#pingProfileSummary");
+    if (!listNode) return;
+    const selectedIds = new Set(state.data?.pingSettings?.profileIds || []);
+    const candidates = (state.data?.profiles || []).filter((profile) => profile.pingEligible === true);
+    if (summaryNode) {
+        summaryNode.textContent = t("ping.profiles.summary", {
+            selected: candidates.filter((profile) => selectedIds.has(profile.id)).length,
+            total: candidates.length,
+        });
+    }
+    listNode.innerHTML = candidates.map((profile) => `
+        <label class="checkline">
+            <input type="checkbox" name="pingProfileIds" value="${escapeHtml(profile.id)}"${selectedIds.has(profile.id) ? " checked" : ""}>
+            <span>${escapeHtml(profile.name)}</span>
+            <span class="hint">${escapeHtml(profile.agentType)} · ${escapeHtml(t("ping.profiles.interval", { minutes: profile.pingIntervalMinutes || 60 }))}${profile.enabled === false ? ` ${escapeHtml(t("ping.profiles.disabled"))}` : ""}</span>
+        </label>
+    `).join("") || `<div class="empty">${escapeHtml(t("ping.profiles.empty"))}</div>`;
+}
+
 function renderPings() {
     const records = state.data?.pingRecords || [];
     const days = state.data?.pingDays || [];
@@ -986,6 +1022,7 @@ function renderPings() {
     const pingToggle = $("#pingEnabled");
     if (runButton) runButton.disabled = state.data?.pingRunning === true || !pingEnabled;
     if (pingToggle) pingToggle.checked = pingEnabled;
+    renderPingProfilePicker();
     const baseSummary = records.length
         ? `${i18n.count("ping.records", records.length)} | ${t("ping.latest", { value: records[0].minute || formatTime(records[0].createdAt) })}`
         : i18n.count("ping.records", 0);
@@ -1025,6 +1062,7 @@ function renderSelectors() {
     if (!state.selectedTaskId && firstTask) state.selectedTaskId = firstTask.id;
     const selectedTask = getSelectedTask();
     const taskFormType = $("#taskForm")?.elements.taskType?.value || "text";
+    const editingTask = state.taskEditor.taskId ? (state.data?.tasks || []).find((task) => task.id === state.taskEditor.taskId) : null;
 
     $$("#taskForm select[name='directory']").forEach((select) => {
         const selected = select.value || state.data?.directories?.[0] || "";
@@ -1032,7 +1070,7 @@ function renderSelectors() {
     });
     const taskProject = $("#taskProject");
     if (taskProject) {
-        const selectedProject = taskProject.value || selectedTask?.projectId || state.data?.projects?.[0]?.id || "";
+        const selectedProject = taskProject.value || (editingTask || selectedTask)?.projectId || state.data?.projects?.[0]?.id || "";
         taskProject.innerHTML = projectOptions(selectedProject);
         taskProject.value = selectedProject;
     }
@@ -1106,6 +1144,13 @@ function taskCanDelete(task) {
         && !["queued", "running", "scheduled", "retry_wait"].includes(String(task.status || "")));
 }
 
+// 运行页 tab 只列出「已启动」的任务：循环活跃，或处于排队 / 预约 / 等待重试。
+function taskIsStarted(task) {
+    if (!task || task.archived) return false;
+    if (task.loopActive || task.isRunning || task.isAgentRunning) return true;
+    return ["queued", "running", "scheduled", "retry_wait"].includes(String(task.status || ""));
+}
+
 function renderRuntimeContext(task) {
     const subtitle = $("#runtimeTaskSubtitle");
     const badge = $("#runtimeStatusBadge");
@@ -1167,9 +1212,212 @@ function renderRuntimeContext(task) {
     }
 }
 
+// ---- 运行统计：token / 轮次 / 间隔 / 费用 与时间轴曲线 ----
+// 图表为内联 SVG，无依赖。配色经 dataviz 校验：输入 #2b5fa3、输出 #c47a13；成功 / 失败沿用状态色并配图标与文字。
+const STATS_SERIES_COLORS = { input: "#2b5fa3", output: "#c47a13", cost: "#0f7d5c", success: "#0f7d5c", failure: "#ba2d2d" };
+
+function formatTokens(value) {
+    const count = Number(value) || 0;
+    if (count >= 1e6) return `${(count / 1e6).toFixed(2)}M`;
+    if (count >= 1e3) return `${(count / 1e3).toFixed(1)}K`;
+    return String(count);
+}
+
+function formatUsd(value) {
+    const amount = Number(value) || 0;
+    return amount >= 1 ? `$${amount.toFixed(2)}` : `$${amount.toFixed(4)}`;
+}
+
+function formatDurationMs(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "-";
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
+}
+
+function formatClock(value) {
+    try {
+        return new Intl.DateTimeFormat(i18n.getLocale(), { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+    } catch {
+        return "";
+    }
+}
+
+function statsTimeAxis(cycles) {
+    const starts = cycles.map((cycle) => new Date(cycle.startedAt).getTime()).filter(Number.isFinite);
+    const ends = cycles.map((cycle) => new Date(cycle.endedAt || cycle.startedAt).getTime()).filter(Number.isFinite);
+    const min = Math.min(...starts);
+    const max = Math.max(...ends, ...starts);
+    return { min, max: max > min ? max : min + 60000 };
+}
+
+function svgPath(points) {
+    return points.map((point, index) => `${index === 0 ? "M" : "L"}${point[0].toFixed(1)} ${point[1].toFixed(1)}`).join(" ");
+}
+
+// 折线图：series = [{ key, label, color, points: [[timeMs, value]] }]，单一 y 轴。
+function renderStatsLineChart({ title, series, axis, formatValue, unit = "" }) {
+    const width = 520;
+    const height = 170;
+    const pad = { top: 18, right: 14, bottom: 26, left: 54 };
+    const plotW = width - pad.left - pad.right;
+    const plotH = height - pad.top - pad.bottom;
+    const maxValue = Math.max(1e-9, ...series.flatMap((item) => item.points.map((point) => point[1])));
+    const x = (time) => pad.left + ((time - axis.min) / (axis.max - axis.min)) * plotW;
+    const y = (value) => pad.top + plotH - (value / maxValue) * plotH;
+    const gridLines = [0, 0.5, 1].map((ratio) => {
+        const value = maxValue * ratio;
+        return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${y(value).toFixed(1)}" y2="${y(value).toFixed(1)}" class="stats-grid"></line>
+            <text x="${pad.left - 6}" y="${(y(value) + 4).toFixed(1)}" class="stats-axis-label" text-anchor="end">${escapeHtml(formatValue(value))}</text>`;
+    }).join("");
+    const ticks = [axis.min, (axis.min + axis.max) / 2, axis.max].map((time, index) => `
+        <text x="${x(time).toFixed(1)}" y="${height - 8}" class="stats-axis-label" text-anchor="${index === 0 ? "start" : index === 2 ? "end" : "middle"}">${escapeHtml(formatClock(time))}</text>`).join("");
+    const lines = series.map((item) => {
+        const last = item.points[item.points.length - 1];
+        return `
+        <path d="${svgPath(item.points.map((point) => [x(point[0]), y(point[1])]))}" fill="none" stroke="${item.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></path>
+        ${item.points.map((point) => `<circle cx="${x(point[0]).toFixed(1)}" cy="${y(point[1]).toFixed(1)}" r="3" fill="${item.color}" stroke="var(--panel)" stroke-width="2"><title>${escapeHtml(`${item.label} · ${formatClock(point[0])} · ${formatValue(point[1])}${unit}`)}</title></circle>`).join("")}
+        ${last ? `<text x="${Math.min(x(last[0]) + 6, width - pad.right).toFixed(1)}" y="${(y(last[1]) - 6).toFixed(1)}" class="stats-series-label" text-anchor="end">${escapeHtml(`${item.label} ${formatValue(last[1])}${unit}`)}</text>` : ""}`;
+    }).join("");
+    const legend = series.length > 1
+        ? `<div class="stats-legend">${series.map((item) => `<span><i style="background:${item.color}"></i>${escapeHtml(item.label)}</span>`).join("")}</div>`
+        : "";
+    return `
+        <figure class="stats-chart">
+            <figcaption>${escapeHtml(title)}</figcaption>
+            <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}" preserveAspectRatio="none">
+                ${gridLines}${ticks}${lines}
+            </svg>
+            ${legend}
+        </figure>`;
+}
+
+// 每轮结果图：按时间轴放置每轮的耗时柱，成功为绿柱加 ✓，失败为红柱加 ✕。
+function renderStatsCycleChart({ title, cycles, axis }) {
+    const width = 520;
+    const height = 150;
+    const pad = { top: 18, right: 14, bottom: 26, left: 54 };
+    const plotW = width - pad.left - pad.right;
+    const plotH = height - pad.top - pad.bottom;
+    const maxDuration = Math.max(1000, ...cycles.map((cycle) => Number(cycle.durationMs) || 0));
+    const x = (time) => pad.left + ((time - axis.min) / (axis.max - axis.min)) * plotW;
+    const barWidth = Math.max(4, Math.min(14, plotW / Math.max(1, cycles.length) - 2));
+    const bars = cycles.map((cycle) => {
+        const start = new Date(cycle.startedAt).getTime();
+        const duration = Number(cycle.durationMs) || 0;
+        const barHeight = Math.max(3, (duration / maxDuration) * plotH);
+        const left = Math.min(x(start), width - pad.right - barWidth);
+        const top = pad.top + plotH - barHeight;
+        const color = cycle.success ? STATS_SERIES_COLORS.success : STATS_SERIES_COLORS.failure;
+        const label = `${t("stats.cycle", { index: cycle.cycle })} · ${cycle.success ? t("stats.success") : t("stats.failure")} · ${formatDurationMs(duration)} · ${t("stats.reason")}: ${cycle.reason || "-"} · in ${formatTokens(cycle.inputTokens)} / out ${formatTokens(cycle.outputTokens)} · ${formatUsd(cycle.costUsd)}`;
+        return `
+        <g>
+            <rect x="${left.toFixed(1)}" y="${top.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${color}"><title>${escapeHtml(label)}</title></rect>
+            <text x="${(left + barWidth / 2).toFixed(1)}" y="${Math.max(12, top - 4).toFixed(1)}" class="stats-mark" text-anchor="middle" fill="${color}">${cycle.success ? "✓" : "✕"}</text>
+        </g>`;
+    }).join("");
+    const gridLines = [0, 1].map((ratio) => {
+        const value = maxDuration * ratio;
+        const yPos = pad.top + plotH - ratio * plotH;
+        return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yPos.toFixed(1)}" y2="${yPos.toFixed(1)}" class="stats-grid"></line>
+            <text x="${pad.left - 6}" y="${(yPos + 4).toFixed(1)}" class="stats-axis-label" text-anchor="end">${escapeHtml(formatDurationMs(value))}</text>`;
+    }).join("");
+    const ticks = [axis.min, (axis.min + axis.max) / 2, axis.max].map((time, index) => `
+        <text x="${x(time).toFixed(1)}" y="${height - 8}" class="stats-axis-label" text-anchor="${index === 0 ? "start" : index === 2 ? "end" : "middle"}">${escapeHtml(formatClock(time))}</text>`).join("");
+    return `
+        <figure class="stats-chart">
+            <figcaption>${escapeHtml(title)}</figcaption>
+            <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}" preserveAspectRatio="none">
+                ${gridLines}${ticks}${bars}
+            </svg>
+            <div class="stats-legend">
+                <span><i style="background:${STATS_SERIES_COLORS.success}"></i>✓ ${escapeHtml(t("stats.success"))}</span>
+                <span><i style="background:${STATS_SERIES_COLORS.failure}"></i>✕ ${escapeHtml(t("stats.failure"))}</span>
+            </div>
+        </figure>`;
+}
+
+function renderTaskStats(task, { heading = "" } = {}) {
+    const stats = task?.stats;
+    const cycles = Array.isArray(task?.cycles) ? task.cycles.filter((cycle) => cycle && cycle.startedAt) : [];
+    if (!task || !stats || !stats.cycles) {
+        return `<div class="stats-empty">${escapeHtml(t("stats.empty"))}</div>`;
+    }
+    const tiles = [
+        [t("stats.cycles"), `${stats.cycles}`, t("stats.cyclesCaption", { success: stats.successes, failure: stats.failures })],
+        [t("stats.inputTokens"), formatTokens(stats.inputTokens), t("stats.cacheCaption", { write: formatTokens(stats.cacheCreationTokens), read: formatTokens(stats.cacheReadTokens) })],
+        [t("stats.outputTokens"), formatTokens(stats.outputTokens), t("stats.totalTokens", { total: formatTokens(stats.totalTokens) })],
+        [t("stats.averageInterval"), stats.averageIntervalMs === null ? "-" : formatDurationMs(stats.averageIntervalMs), t("stats.averageDuration", { value: formatDurationMs(stats.averageDurationMs) })],
+        [t("stats.elapsed"), formatDurationMs(stats.elapsedMs), t("stats.elapsedCaption", { start: formatTime(stats.firstStartedAt), end: formatTime(stats.lastEndedAt) })],
+        [t("stats.cost"), formatUsd(stats.costUsd), t("stats.costCaption", { model: stats.pricing?.model || "claude-fable-5-1" })],
+    ].map(([label, value, caption]) => `
+        <div class="stats-tile">
+            <span>${escapeHtml(label)}</span>
+            <b>${escapeHtml(value)}</b>
+            <span>${escapeHtml(caption)}</span>
+        </div>`).join("");
+    let charts = "";
+    if (cycles.length) {
+        const axis = statsTimeAxis(cycles);
+        let cost = 0;
+        let input = 0;
+        let output = 0;
+        const costPoints = [];
+        const inputPoints = [];
+        const outputPoints = [];
+        for (const cycle of cycles) {
+            const time = new Date(cycle.endedAt || cycle.startedAt).getTime();
+            cost += Number(cycle.costUsd) || 0;
+            input += Number(cycle.inputTokens) || 0;
+            output += Number(cycle.outputTokens) || 0;
+            costPoints.push([time, cost]);
+            inputPoints.push([time, input]);
+            outputPoints.push([time, output]);
+        }
+        charts = `
+            <div class="stats-charts">
+                ${renderStatsLineChart({ title: t("stats.chart.cost"), axis, formatValue: formatUsd, series: [{ key: "cost", label: t("stats.cost"), color: STATS_SERIES_COLORS.cost, points: costPoints }] })}
+                ${renderStatsLineChart({ title: t("stats.chart.tokens"), axis, formatValue: formatTokens, series: [
+                    { key: "input", label: t("stats.inputTokens"), color: STATS_SERIES_COLORS.input, points: inputPoints },
+                    { key: "output", label: t("stats.outputTokens"), color: STATS_SERIES_COLORS.output, points: outputPoints },
+                ] })}
+                ${renderStatsCycleChart({ title: t("stats.chart.cycles"), cycles, axis })}
+            </div>`;
+    }
+    const unparsed = cycles.filter((cycle) => cycle.usageFound === false).length;
+    const note = unparsed ? `<p class="stats-note">${escapeHtml(t("stats.unparsedNote", { count: unparsed }))}</p>` : "";
+    return `
+        ${heading ? `<div class="stats-head"><strong>${escapeHtml(heading)}</strong><span class="hint">${escapeHtml(t("stats.pricingHint"))}</span></div>` : ""}
+        <div class="stats-tiles">${tiles}</div>
+        ${charts}
+        ${note}`;
+}
+
+// 总览：列出当前活动任务（Agent 运行中 / 循环等待中）的统计；没有活动任务时展示最近一次运行的任务。
+function renderDashboardStats() {
+    const node = $("#dashboardStats");
+    if (!node) return;
+    const tasks = (state.data?.tasks || []).filter((task) => !task.archived);
+    const active = tasks.filter((task) => task.isRunning || ["running", "retry_wait", "completed"].includes(String(task.status || "")) && task.loopActive);
+    const shown = active.length ? active : tasks.filter((task) => task.stats?.cycles).sort((a, b) => String(b.lastRunAt || "").localeCompare(String(a.lastRunAt || ""))).slice(0, 1);
+    if (!shown.length) {
+        node.innerHTML = `<div class="stats-empty">${escapeHtml(t("stats.noActiveTask"))}</div>`;
+        return;
+    }
+    node.innerHTML = shown.map((task) => `
+        <section class="stats-block" data-open-task="${escapeHtml(task.id)}">
+            ${renderTaskStats(task, { heading: `${task.title} · ${taskDisplayStatus(task)}` })}
+        </section>`).join("");
+}
+
 function renderRunDetail() {
     const task = getSelectedTask();
     renderRuntimeContext(task);
+    if ($("#runtimeStats")) $("#runtimeStats").innerHTML = renderTaskStats(task);
     if (!task) {
         $("#runDetail").innerHTML = `<div class="empty">${escapeHtml(t("empty.noTaskSelected"))}</div>`;
         return;
@@ -1248,13 +1496,57 @@ function renderRunDetail() {
     `).join("") + artifactSection;
 }
 
+function renderRuntimeTabs() {
+    const bar = $("#runtimeTabsBar");
+    const node = $("#runtimeTabs");
+    if (!bar || !node) return;
+    const tasks = (state.data?.tasks || []).filter(taskIsStarted);
+    bar.hidden = tasks.length === 0;
+    const signature = `${state.selectedTaskId}#${tasks
+        .map((task) => `${task.id}:${taskRuntimeState(task)}:${taskDisplayStatus(task)}`)
+        .join("|")}`;
+    if (signature === state.runtimeTabsSignature) return;
+    state.runtimeTabsSignature = signature;
+    node.innerHTML = tasks.map((task) => {
+        const active = task.id === state.selectedTaskId;
+        return `
+        <button class="runtime-tab${active ? " active" : ""}" type="button" role="tab" data-runtime-tab="${escapeHtml(task.id)}" data-runtime-state="${escapeHtml(taskRuntimeState(task))}" aria-selected="${active ? "true" : "false"}" aria-label="${escapeHtml(t("runtime.tabsSwitch", { name: task.title }))}">
+            <span class="runtime-tab-title">${escapeHtml(task.title)}</span>
+            <span class="runtime-tab-state">${escapeHtml(taskDisplayStatus(task))}</span>
+        </button>`;
+    }).join("");
+}
+
+// tab 点击与「任务」下拉框共用同一套切换动作，保证控制面板、目标文件与日志同步。
+async function selectRuntimeTask(taskId) {
+    const task = (state.data?.tasks || []).find((item) => item.id === taskId);
+    if (!task) return;
+    state.selectedTaskId = taskId;
+    const runProfileIds = taskProfileIds(task);
+    if ($("#runTask")) $("#runTask").value = taskId;
+    $("#runProfiles").innerHTML = profileOptions(runProfileIds.length ? runProfileIds : [state.selectedProfileId].filter(Boolean), task.taskType || "text");
+    $("#decomposeProfile").innerHTML = profileOptions(task.decomposeProfileId || state.selectedProfileId, "text");
+    syncTaskScheduleControls(task, true);
+    renderRunDetail();
+    renderRuntimeTabs();
+    $("#appendTaskFeedback").textContent = "";
+    try {
+        await loadFile(taskId);
+        await loadLog(taskId, { forceFollow: true });
+    } catch (error) {
+        toast(error.message);
+    }
+}
+
 function renderAll() {
     renderMetrics();
+    renderDashboardStats();
     renderTasks();
     renderEvents();
     renderProfiles();
     if (state.activeView === "pings") renderPings();
     renderSelectors();
+    renderRuntimeTabs();
     renderProjects();
     renderDirectories();
     if (state.activeView === "runtime") renderRunDetail();
@@ -1284,6 +1576,7 @@ async function refresh({ replacementTaskId = "" } = {}) {
         $("#runProfiles").innerHTML = "";
         await loadLog("");
     }
+    if (state.taskEditor?.taskId) syncTaskEditorWithState();
     renderAll();
     if (selectionRemoved && state.selectedTaskId) {
         await loadFile(state.selectedTaskId);
@@ -1333,10 +1626,10 @@ function resetProfileForm(profile = null) {
     form.elements.envText.value = profile?.envText || "";
     form.elements.promptTemplate.value = profile?.promptTemplate || "";
     form.elements.mediaPromptTemplate.value = profile?.mediaPromptTemplate || "";
-    form.elements.timeoutSeconds.value = profile?.timeoutSeconds || 1800;
+    form.elements.timeoutSeconds.value = profile?.timeoutSeconds || 7200;
     form.elements.enabled.checked = profile?.enabled !== false;
     form.elements.nonInteractive.checked = profile?.nonInteractive !== false;
-    form.elements.pingEnabled.checked = profile?.pingEnabled !== false;
+    form.elements.pingEnabled.checked = profile?.pingEnabled === true;
     setCheckedValues(form, "inputModalities", profile?.inputModalities || ["text"]);
     setCheckedValues(form, "outputModalities", profile?.outputModalities || ["text"]);
     const pingButton = $("#pingProfile");
@@ -1401,6 +1694,211 @@ function syncTaskType() {
     runSelect.innerHTML = profileOptions(selected, taskType);
 }
 
+const TASK_EDITOR_LOCKED_FIELDS = ["taskType", "targetFileName", "directory", "sourceMode", "sourceFile", "overwrite"];
+const TASK_EDITOR_AUTOSAVE_DELAY_MS = 600;
+
+function taskEditorCanEdit(task) {
+    return Boolean(task && !task.archived && taskCanDelete(task));
+}
+
+function setTaskEditorStatus(text = "", kind = "") {
+    const node = $("#taskEditorStatus");
+    if (!node) return;
+    node.textContent = text;
+    node.className = `hint task-editor-status${kind ? ` is-${kind}` : ""}`;
+}
+
+function renderTaskEditorStatus() {
+    const editor = state.taskEditor;
+    const task = editor.taskId ? (state.data?.tasks || []).find((item) => item.id === editor.taskId) : null;
+    if (!task) {
+        setTaskEditorStatus(t("task.editor.creating"));
+        return;
+    }
+    if (task.archived) return setTaskEditorStatus(t("task.editor.readonlyArchived"));
+    if (!taskEditorCanEdit(task)) return setTaskEditorStatus(t("task.editor.readonlyBusy"));
+    if (editor.error) return setTaskEditorStatus(t("task.editor.saveFailed", { error: editor.error }), "error");
+    if (editor.saving || editor.dirty) return setTaskEditorStatus(t("task.editor.saving"), "saving");
+    if (editor.lastSavedAt) return setTaskEditorStatus(t("task.editor.saved", { time: formatTime(editor.lastSavedAt) }));
+    setTaskEditorStatus(t("task.editor.autosave"));
+}
+
+function setTaskEditorLocked(form, locked) {
+    for (const name of TASK_EDITOR_LOCKED_FIELDS) {
+        const field = form.elements[name];
+        if (!field) continue;
+        if (field.tagName === "SELECT" || field.type === "checkbox" || field.type === "file") field.disabled = locked;
+        else field.readOnly = locked;
+    }
+}
+
+function setTaskEditorReadonly(form, readonly) {
+    for (const field of Array.from(form.elements)) {
+        if (!field.name || TASK_EDITOR_LOCKED_FIELDS.includes(field.name) || field.name === "taskId") continue;
+        if (field.tagName === "SELECT") field.disabled = readonly;
+        else if (field.tagName === "INPUT" || field.tagName === "TEXTAREA") field.readOnly = readonly;
+    }
+}
+
+function fillTaskEditor(task) {
+    const form = $("#taskForm");
+    form.elements.title.value = task.title || "";
+    form.elements.taskType.value = task.taskType || "text";
+    form.elements.targetFileName.value = task.targetFileName || "";
+    form.elements.projectId.innerHTML = projectOptions(task.projectId || "");
+    form.elements.projectId.value = task.projectId || "";
+    form.elements.directory.innerHTML = directoryOptions(task.directory || "");
+    form.elements.directory.value = task.directory || "";
+    form.elements.sourceMode.value = task.sourceMode === "template" ? "existing" : (task.sourceMode || "agent");
+    form.elements.decomposeProfileId.innerHTML = profileOptions(task.decomposeProfileId || "", "text");
+    form.elements.runProfileIds.innerHTML = profileOptions(taskProfileIds(task), task.taskType || "text");
+    form.elements.requirement.value = task.requirement || "";
+    form.elements.artifactDirectoryName.value = task.artifactDirectoryName || "";
+    form.elements.outputFileName.value = task.outputFileName || "";
+    form.elements.aspectRatio.value = task.aspectRatio || "";
+    form.elements.resolution.value = task.resolution || "";
+    form.elements.durationSeconds.value = task.durationSeconds || 5;
+    form.elements.referenceFiles.value = Array.isArray(task.referenceFiles) ? task.referenceFiles.join("\n") : "";
+    form.dataset.taskType = task.taskType || "text";
+    syncTaskType();
+    if (task.outputFormat) form.elements.outputFormat.value = task.outputFormat;
+    syncTaskSourceMode();
+}
+
+function openTaskEditor(taskId) {
+    const task = (state.data?.tasks || []).find((item) => item.id === taskId);
+    const form = $("#taskForm");
+    if (!task || !form) return false;
+    flushTaskAutosave();
+    state.taskEditor = { taskId, timer: null, saving: false, dirty: false, lastSavedAt: null, error: "" };
+    state.selectedTaskId = taskId;
+    form.dataset.mode = "edit";
+    form.elements.taskId.value = taskId;
+    fillTaskEditor(task);
+    setTaskEditorLocked(form, true);
+    setTaskEditorReadonly(form, !taskEditorCanEdit(task));
+    const title = $("#taskEditorTitle");
+    title.dataset.i18n = "task.edit";
+    title.textContent = t("task.editor.selected", { name: task.title });
+    const notice = $("#taskEditorNotice");
+    notice.hidden = false;
+    notice.textContent = t("task.editor.lockedFields");
+    $("#taskOpenRuntime").hidden = false;
+    renderTaskEditorStatus();
+    renderTasks();
+    return true;
+}
+
+function resetTaskEditor() {
+    const form = $("#taskForm");
+    if (!form) return;
+    flushTaskAutosave();
+    state.taskEditor = { taskId: "", timer: null, saving: false, dirty: false, lastSavedAt: null, error: "" };
+    form.dataset.mode = "create";
+    form.reset();
+    form.elements.taskId.value = "";
+    setTaskEditorLocked(form, false);
+    setTaskEditorReadonly(form, false);
+    const title = $("#taskEditorTitle");
+    title.dataset.i18n = "task.create";
+    title.textContent = t("task.create");
+    $("#taskEditorNotice").hidden = true;
+    $("#taskOpenRuntime").hidden = true;
+    renderSelectors();
+    syncTaskType();
+    syncTaskSourceMode();
+    renderTaskEditorStatus();
+    renderTasks();
+}
+
+function taskEditorPayload(form) {
+    const taskType = form.dataset.taskType || form.elements.taskType.value || "text";
+    const payload = {
+        title: form.elements.title.value,
+        requirement: form.elements.requirement.value,
+        projectId: form.elements.projectId.value || "",
+        decomposeProfileId: form.elements.decomposeProfileId.value || "",
+        runProfileIds: selectedValues(form.elements.runProfileIds),
+    };
+    if (taskType !== "text") {
+        Object.assign(payload, {
+            artifactDirectoryName: form.elements.artifactDirectoryName.value,
+            outputFileName: form.elements.outputFileName.value,
+            outputFormat: form.elements.outputFormat.value,
+            aspectRatio: form.elements.aspectRatio.value,
+            resolution: form.elements.resolution.value,
+            durationSeconds: form.elements.durationSeconds.value,
+            referenceFiles: form.elements.referenceFiles.value,
+        });
+    }
+    return payload;
+}
+
+function scheduleTaskAutosave() {
+    const editor = state.taskEditor;
+    if (!editor.taskId) return;
+    editor.dirty = true;
+    editor.error = "";
+    clearTimeout(editor.timer);
+    editor.timer = setTimeout(() => {
+        editor.timer = null;
+        saveTaskEditor().catch(() => {});
+    }, TASK_EDITOR_AUTOSAVE_DELAY_MS);
+    renderTaskEditorStatus();
+}
+
+function flushTaskAutosave() {
+    const editor = state.taskEditor;
+    if (!editor.taskId || !editor.timer) return;
+    clearTimeout(editor.timer);
+    editor.timer = null;
+    saveTaskEditor().catch(() => {});
+}
+
+async function saveTaskEditor() {
+    const editor = state.taskEditor;
+    const form = $("#taskForm");
+    const taskId = editor.taskId;
+    if (!taskId || !form || form.dataset.mode !== "edit") return;
+    if (editor.saving) {
+        editor.dirty = true;
+        return;
+    }
+    editor.saving = true;
+    editor.dirty = false;
+    renderTaskEditorStatus();
+    try {
+        const result = await api(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "PATCH", body: taskEditorPayload(form) });
+        if (state.taskEditor.taskId !== taskId) return;
+        editor.lastSavedAt = new Date().toISOString();
+        editor.error = "";
+        if (result.changed?.length) {
+            $("#taskEditorTitle").textContent = t("task.editor.selected", { name: result.task.title });
+            await refresh();
+        }
+    } catch (error) {
+        if (state.taskEditor.taskId === taskId) editor.error = error.message;
+    } finally {
+        if (state.taskEditor.taskId === taskId) {
+            editor.saving = false;
+            renderTaskEditorStatus();
+            if (editor.dirty) scheduleTaskAutosave();
+        }
+    }
+}
+
+// 轮询刷新后：被删除的任务退出编辑；运行状态变化时切换只读。
+function syncTaskEditorWithState() {
+    const taskId = state.taskEditor.taskId;
+    const editingTask = (state.data?.tasks || []).find((task) => task.id === taskId);
+    if (!editingTask) {
+        resetTaskEditor();
+        return;
+    }
+    setTaskEditorReadonly($("#taskForm"), !taskEditorCanEdit(editingTask));
+    renderTaskEditorStatus();
+}
+
 function applySelectedTaskFile(file) {
     if (!file) return;
     const form = $("#taskForm");
@@ -1433,6 +1931,7 @@ async function deleteTask(taskId) {
     if (!taskCanDelete(task)) return toast(t("task.deleteBusy"));
     if (!window.confirm(t("task.deleteConfirm", { name: task.title }))) return;
     state.deletingTaskIds.add(taskId);
+    if (state.taskEditor.taskId === taskId) resetTaskEditor();
     renderTasks();
     renderRunDetail();
     try {
@@ -1676,6 +2175,7 @@ async function openTaskPage(taskId) {
     state.selectedTaskId = taskId;
     renderSelectors();
     renderRunDetail();
+    renderRuntimeTabs();
     switchView("runtime");
     await loadFile(taskId);
     await loadLog(taskId, { runId: "", forceFollow: true });
@@ -1710,6 +2210,12 @@ function applyLanguage(language = "") {
     syncTaskSourceMode();
     syncTaskType();
     syncScheduleMode();
+    if (state.taskEditor.taskId) {
+        const editingTask = (state.data?.tasks || []).find((task) => task.id === state.taskEditor.taskId);
+        if (editingTask) $("#taskEditorTitle").textContent = t("task.editor.selected", { name: editingTask.title });
+        $("#taskEditorNotice").textContent = t("task.editor.lockedFields");
+    }
+    renderTaskEditorStatus();
     const profileId = $("#profileForm").elements.id.value;
     const profile = (state.data?.profiles || []).find((item) => item.id === profileId) || null;
     updateTokenPlaceholder(profile);
@@ -1783,7 +2289,7 @@ function bindEvents() {
         if (body.outputModalities.length === 0) return toast(t("toast.outputModalityRequired"));
         body.enabled = form.elements.enabled.checked;
         body.nonInteractive = form.elements.nonInteractive.checked;
-        body.timeoutSeconds = Number(body.timeoutSeconds || 1800);
+        body.timeoutSeconds = Number(body.timeoutSeconds || 7200);
         body.pingEnabled = form.elements.pingEnabled.checked;
         body.pingIntervalMinutes = Number(body.pingIntervalMinutes || 60);
         const result = await api("/api/profiles", { method: "POST", body });
@@ -1847,8 +2353,36 @@ function bindEvents() {
     $("#taskForm input[name='sourceFile']").addEventListener("change", (event) => {
         applySelectedTaskFile(event.target.files?.[0]);
     });
+    $("#taskForm").addEventListener("input", (event) => {
+        if ($("#taskForm").dataset.mode !== "edit") return;
+        if (TASK_EDITOR_LOCKED_FIELDS.includes(event.target?.name)) return;
+        scheduleTaskAutosave();
+    });
+    $("#taskForm").addEventListener("change", (event) => {
+        if ($("#taskForm").dataset.mode !== "edit") return;
+        if (TASK_EDITOR_LOCKED_FIELDS.includes(event.target?.name)) return;
+        scheduleTaskAutosave();
+    });
+    $("#newTaskButton").addEventListener("click", () => {
+        resetTaskEditor();
+        $("#taskForm").elements.title.focus();
+    });
+    $("#taskOpenRuntime").addEventListener("click", async () => {
+        const taskId = state.taskEditor.taskId;
+        if (!taskId) return;
+        flushTaskAutosave();
+        try {
+            await openTaskPage(taskId);
+        } catch (error) {
+            toast(error.message);
+        }
+    });
     $("#taskForm").addEventListener("submit", async (event) => {
         event.preventDefault();
+        if ($("#taskForm").dataset.mode === "edit") {
+            flushTaskAutosave();
+            return;
+        }
         if (state.creatingTask) return;
         state.creatingTask = true;
         const submitButton = $("#taskSubmitButton");
@@ -1875,7 +2409,7 @@ function bindEvents() {
             state.selectedTaskId = result.task.id;
             await refresh();
             await loadFile(result.task.id);
-            switchView("editor");
+            openTaskEditor(result.task.id);
             if (result.deduplicated) {
                 toast(t("toast.taskReused"));
             } else if (result.generation?.failed) {
@@ -1947,7 +2481,20 @@ function bindEvents() {
         const taskId = historyId || openId || editId;
         if (!taskId) return;
         try {
-            await openTaskPage(taskId);
+            if (historyId) {
+                await openTaskPage(taskId);
+                return;
+            }
+            openTaskEditor(taskId);
+        } catch (error) {
+            toast(error.message);
+        }
+    });
+    $("#dashboardStats")?.addEventListener("click", async (event) => {
+        const target = event.target.closest?.("[data-open-task]");
+        if (!target) return;
+        try {
+            await openTaskPage(target.dataset.openTask);
         } catch (error) {
             toast(error.message);
         }
@@ -1992,20 +2539,13 @@ function bindEvents() {
     });
 
     $("#runTask").addEventListener("change", async (event) => {
-        state.selectedTaskId = event.target.value;
-        const task = (state.data?.tasks || []).find((item) => item.id === state.selectedTaskId);
-        const runProfileIds = taskProfileIds(task);
-        $("#runProfiles").innerHTML = profileOptions(runProfileIds.length ? runProfileIds : [state.selectedProfileId].filter(Boolean), task?.taskType || "text");
-        $("#decomposeProfile").innerHTML = profileOptions(task?.decomposeProfileId || state.selectedProfileId, "text");
-        syncTaskScheduleControls(task, true);
-        renderRunDetail();
-        $("#appendTaskFeedback").textContent = "";
-        try {
-            await loadFile(state.selectedTaskId);
-            await loadLog(state.selectedTaskId, { forceFollow: true });
-        } catch (error) {
-            toast(error.message);
-        }
+        await selectRuntimeTask(event.target.value);
+    });
+    $("#runtimeTabs").addEventListener("click", async (event) => {
+        const button = event.target.closest?.("[data-runtime-tab]");
+        const taskId = button?.dataset?.runtimeTab || "";
+        if (!taskId || taskId === state.selectedTaskId) return;
+        await selectRuntimeTask(taskId);
     });
     $("#logRunSelect").addEventListener("change", async (event) => {
         const taskId = $("#runTask").value || state.selectedTaskId;
@@ -2208,6 +2748,19 @@ function bindEvents() {
         toast(event.target.checked ? t("toast.pingEnabled") : t("toast.pingDisabled"));
     });
 
+    $("#pingProfileList").addEventListener("change", async (event) => {
+        if (!(event.target instanceof HTMLInputElement) || event.target.name !== "pingProfileIds") return;
+        const profileIds = $$("#pingProfileList input[name='pingProfileIds']:checked").map((node) => node.value);
+        try {
+            await api("/api/pings/settings", { method: "POST", body: { profileIds } });
+            await refresh();
+            toast(t("toast.pingProfilesSaved", { count: profileIds.length }));
+        } catch (error) {
+            renderPingProfilePicker();
+            toast(error.message);
+        }
+    });
+
     $("#runPing").addEventListener("click", async () => {
         const button = $("#runPing");
         button.disabled = true;
@@ -2341,6 +2894,7 @@ async function boot() {
     const firstProfile = state.data?.profiles?.[0];
     resetProfileForm(firstProfile || null);
     syncTaskType();
+    renderTaskEditorStatus();
     const firstTask = state.data?.tasks?.[0];
     if (firstTask) {
         await loadFile(firstTask.id);

@@ -39,6 +39,13 @@
         <main class="workspace">
             <section id="dashboard" class="view active">
                 <div class="metrics" id="metrics"></div>
+                <section class="panel dashboard-stats-panel">
+                    <div class="panel-head">
+                        <h2 data-i18n="stats.heading">运行统计</h2>
+                        <span class="hint" data-i18n="stats.pricingHint">费用按 Claude Fable 5.1 费率估算</span>
+                    </div>
+                    <div id="dashboardStats" class="stats-panel-body"></div>
+                </section>
                 <div class="split">
                     <section class="panel">
                         <div class="panel-head">
@@ -106,7 +113,7 @@
                             </label>
                             <label>
                                 <span data-i18n="profile.timeout">超时秒数</span>
-                                <input name="timeoutSeconds" type="number" min="1" step="1" value="1800">
+                                <input name="timeoutSeconds" type="number" min="1" step="1" value="7200">
                             </label>
                             <label>
                                 <span data-i18n="profile.model">模型名称</span>
@@ -176,8 +183,8 @@
                                 <span data-i18n="profile.nonInteractive">非交互模式</span>
                             </label>
                             <label class="checkline">
-                                <input name="pingEnabled" type="checkbox" checked>
-                                <span data-i18n="profile.pingEnabled">启用定时测试</span>
+                                <input name="pingEnabled" type="checkbox">
+                                <span data-i18n="profile.pingEnabled">加入自动 Ping（仅 Claude Code / Codex）</span>
                             </label>
                             <div class="form-actions full">
                                 <button type="submit" data-i18n="profile.save">保存 Profile</button>
@@ -192,13 +199,36 @@
             </section>
 
             <section id="tasks" class="view">
-                <div class="split wide-right">
-                    <section class="panel">
-                        <div class="panel-head">
-                            <h2 data-i18n="task.create">创建任务</h2>
-                            <span class="hint" data-i18n="task.markdownTarget">Markdown 目标文件</span>
+                <div class="split task-workbench">
+                    <section class="panel task-tree-panel">
+                        <div class="panel-head task-list-head">
+                            <h2 data-i18n="task.tree">项目任务树</h2>
+                            <div class="task-actions">
+                                <span id="taskCount" class="hint">0 个任务</span>
+                                <button class="ghost" type="button" id="newTaskButton" data-i18n="task.new">新建任务</button>
+                                <button class="ghost" type="button" id="deduplicateTasks" data-i18n="task.deduplicate">一键去重</button>
+                            </div>
                         </div>
-                        <form id="taskForm" class="form-grid single">
+                        <p class="task-cleanup-hint" data-i18n="task.cleanupHint">按目标文件路径去重，保留已归档任务；删除仅移除记录，文件和日志保留。</p>
+                        <form id="projectForm" class="project-form">
+                            <input type="hidden" name="id">
+                            <input name="name" required data-i18n-placeholder="project.namePlaceholder" placeholder="项目名称">
+                            <select name="directory" data-project-directory>
+                                <option value="" data-i18n="project.unbound">不绑定目录</option>
+                            </select>
+                            <button type="submit" id="projectSubmit" data-i18n="project.create">创建项目</button>
+                        </form>
+                        <div id="projectList" class="project-list"></div>
+                        <div id="taskList" class="task-list project-task-tree"></div>
+                    </section>
+                    <section class="panel task-editor-panel">
+                        <div class="panel-head task-editor-head">
+                            <h2 id="taskEditorTitle" data-i18n="task.create">创建任务</h2>
+                            <span id="taskEditorStatus" class="hint task-editor-status" aria-live="polite"></span>
+                        </div>
+                        <div id="taskEditorNotice" class="task-editor-notice" hidden></div>
+                        <form id="taskForm" class="form-grid single" data-mode="create">
+                            <input type="hidden" name="taskId">
                             <label>
                                 <span data-i18n="task.title">标题</span>
                                 <input name="title" required data-i18n-placeholder="task.titlePlaceholder" placeholder="P3-真实笔顺评分">
@@ -293,28 +323,11 @@
                                 <input name="overwrite" type="checkbox">
                                 <span data-i18n="task.overwrite">覆盖同名文件</span>
                             </label>
-                            <button type="submit" id="taskSubmitButton" data-i18n="task.submit.generate">调用 Agent 生成</button>
-                        </form>
-                    </section>
-                    <section class="panel">
-                        <div class="panel-head task-list-head">
-                            <h2 data-i18n="task.tree">项目任务树</h2>
-                            <div class="task-actions">
-                                <span id="taskCount" class="hint">0 个任务</span>
-                                <button class="ghost" type="button" id="deduplicateTasks" data-i18n="task.deduplicate">一键去重</button>
+                            <div class="task-editor-actions full">
+                                <button type="submit" id="taskSubmitButton" data-i18n="task.submit.generate">调用 Agent 生成</button>
+                                <button type="button" class="ghost" id="taskOpenRuntime" data-i18n="task.openRuntime" hidden>打开运行页</button>
                             </div>
-                        </div>
-                        <p class="task-cleanup-hint" data-i18n="task.cleanupHint">按目标文件路径去重，保留已归档任务；删除仅移除记录，文件和日志保留。</p>
-                        <form id="projectForm" class="project-form">
-                            <input type="hidden" name="id">
-                            <input name="name" required data-i18n-placeholder="project.namePlaceholder" placeholder="项目名称">
-                            <select name="directory" data-project-directory>
-                                <option value="" data-i18n="project.unbound">不绑定目录</option>
-                            </select>
-                            <button type="submit" id="projectSubmit" data-i18n="project.create">创建项目</button>
                         </form>
-                        <div id="projectList" class="project-list"></div>
-                        <div id="taskList" class="task-list project-task-tree"></div>
                     </section>
                 </div>
             </section>
@@ -337,6 +350,10 @@
             </section>
 
             <section id="runtime" class="view">
+                <div id="runtimeTabsBar" class="runtime-tabs-bar" hidden>
+                    <span class="runtime-tabs-label" data-i18n="runtime.tabsLabel">已启动的任务</span>
+                    <nav id="runtimeTabs" class="runtime-tabs" role="tablist" aria-label="已启动的任务" data-i18n-aria-label="runtime.tabsLabel"></nav>
+                </div>
                 <div class="runtime-shell">
                     <section class="panel runtime-control-panel">
                         <div class="panel-head runtime-panel-head">
@@ -377,6 +394,13 @@
                                 <button class="ghost" type="button" id="decomposeTask" data-i18n="runtime.generate">生成目标文件</button>
                                 <button class="danger" type="button" id="stopTask" data-i18n="runtime.stop">停止</button>
                             </div>
+                            <section class="runtime-stats-section" aria-labelledby="runtimeStatsHeading">
+                                <div class="stats-head">
+                                    <strong id="runtimeStatsHeading" data-i18n="stats.heading">运行统计</strong>
+                                    <span class="hint" data-i18n="stats.pricingHint">费用按 Claude Fable 5.1 费率估算</span>
+                                </div>
+                                <div id="runtimeStats" class="stats-panel-body"></div>
+                            </section>
                             <div id="runDetail" class="run-detail"></div>
 
                             <section id="runtimeFileSection" class="runtime-file-section" aria-labelledby="runtimeFileHeading">
@@ -450,13 +474,20 @@
                     <div class="panel-head">
                         <div>
                             <h2 data-i18n="ping.heading">LLM Ping</h2>
-                            <p class="pathline" data-i18n="ping.description">启用后，系统会用一个随机简单问题测试 Claude Code 和 Codex Profile。</p>
+                            <p class="pathline" data-i18n="ping.description">启用后，系统只会用一个随机简单问题定时测试下方勾选的 Claude Code / Codex Profile，未勾选的不做自动 Ping。</p>
                         </div>
                         <div class="inline-actions">
                             <label class="checkline ping-toggle"><input id="pingEnabled" type="checkbox" checked><span data-i18n="ping.enable">启用 Ping</span></label>
                             <span id="pingSummary" class="hint">0 records</span>
                             <button type="button" id="runPing" data-i18n="ping.now">立即 Ping</button>
                         </div>
+                    </div>
+                    <div class="ping-profile-picker">
+                        <div class="ping-profile-picker-head">
+                            <span data-i18n="ping.profiles.heading">自动 Ping 的 Profile</span>
+                            <span id="pingProfileSummary" class="hint"></span>
+                        </div>
+                        <div id="pingProfileList" class="ping-profile-list" role="group" aria-label="自动 Ping 的 Profile" data-i18n-aria-label="ping.profiles.heading"></div>
                     </div>
                     <div id="pingDays" class="ping-days"></div>
                 </section>

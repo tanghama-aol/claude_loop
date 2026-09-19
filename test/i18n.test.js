@@ -20,7 +20,12 @@ test("translate interpolates values and falls back to the translation key", () =
     assert.equal(translate("zh-CN", "toast.pingComplete", { success: 2, total: 3 }), "Ping 完成：2/3 成功");
     assert.equal(translate("zh-CN", "ping.column.firstOutput"), "首字时延");
     assert.equal(translate("en", "ping.column.outputTokens"), "output tokens");
+    assert.equal(translate("zh-CN", "ping.profiles.summary", { selected: 1, total: 3 }), "已勾选 1/3");
+    assert.equal(translate("en", "ping.profiles.summary", { selected: 1, total: 3 }), "1/3 selected");
     assert.equal(translate("zh-CN", "dashboard.openProject", { name: "示例项目" }), "进入项目：示例项目");
+    assert.equal(translate("zh-CN", "runtime.tabsLabel"), "已启动的任务");
+    assert.equal(translate("en", "runtime.tabsLabel"), "Started tasks");
+    assert.equal(translate("en", "runtime.tabsSwitch", { name: "P3" }), "Switch to task: P3");
     assert.equal(translate("en", "dashboard.openCard", { name: "Profiles" }), "Open Profiles");
     assert.equal(translate("en", "missing.key"), "missing.key");
 });

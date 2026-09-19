@@ -321,6 +321,79 @@ label {
     grid-template-columns: minmax(340px, 0.85fr) minmax(420px, 1.15fr);
 }
 
+/* 任务页：左侧项目任务树，右侧任务编辑器 */
+.split.task-workbench {
+    grid-template-columns: minmax(320px, 0.9fr) minmax(420px, 1.1fr);
+}
+
+.task-tree-panel {
+    position: sticky;
+    top: 12px;
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
+}
+
+.task-tree-panel .project-task-tree {
+    overflow: auto;
+    flex: 1;
+    min-height: 0;
+}
+
+.tree-task.tree-task-selected {
+    border-left-color: var(--green);
+    background: #f1f8f3;
+    box-shadow: inset 0 0 0 1px rgba(15, 125, 92, 0.35);
+}
+
+.task-editor-head {
+    flex-wrap: wrap;
+}
+
+.task-editor-status {
+    text-align: right;
+}
+
+.task-editor-status.is-saving {
+    color: var(--amber);
+}
+
+.task-editor-status.is-error {
+    color: var(--red);
+}
+
+.task-editor-notice {
+    margin: 12px 14px 0;
+    border: 1px dashed var(--line);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.task-editor-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+#taskForm[data-mode="edit"] .task-create-only,
+#taskForm[data-mode="edit"] .task-overwrite-field,
+#taskForm[data-mode="edit"] .task-upload-field,
+#taskForm[data-mode="edit"] #taskSourceHelp,
+#taskForm[data-mode="edit"] #taskSubmitButton {
+    display: none;
+}
+
+#taskForm[data-mode="edit"] input:read-only,
+#taskForm[data-mode="edit"] select:disabled,
+#taskForm[data-mode="edit"] textarea:read-only {
+    background: var(--steel);
+    color: var(--muted);
+    cursor: not-allowed;
+}
+
 .panel {
     min-width: 0;
     border: 1px solid var(--line-strong);
@@ -438,6 +511,16 @@ label {
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
+}
+
+/* 左栏较窄时，路径列必须允许收缩换行，否则会压到右侧按钮下面 */
+.project-card > div:first-child,
+.project-tree-head > div:first-child {
+    min-width: 0;
+}
+
+.project-card .meta span {
+    overflow-wrap: anywhere;
 }
 
 .dashboard-project-link,
@@ -823,6 +906,101 @@ textarea.secret.revealed {
     font-family: var(--mono);
     font-size: 13px;
     line-height: 1.6;
+}
+
+.runtime-tabs-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 9px 12px;
+    background: rgba(255, 252, 242, 0.9);
+}
+
+.runtime-tabs-bar[hidden] {
+    display: none;
+}
+
+.runtime-tabs-label {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.runtime-tabs {
+    display: flex;
+    flex: 1 1 auto;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 3px;
+}
+
+.runtime-tab {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+    max-width: min(320px, 46vw);
+    min-height: 38px;
+    border: 1px solid var(--line);
+    border-bottom: 3px solid var(--line);
+    border-radius: 8px 8px 2px 2px;
+    padding: 5px 12px 4px;
+    color: var(--ink);
+    background: rgba(255, 254, 250, 0.55);
+    text-align: left;
+}
+
+.runtime-tab:hover {
+    background: #fffefa;
+    box-shadow: 0 6px 16px rgba(23, 23, 19, 0.1);
+}
+
+.runtime-tab.active {
+    border-color: var(--line-strong);
+    border-bottom-color: var(--green);
+    background: #fffdf7;
+    box-shadow: 0 8px 20px rgba(23, 23, 19, 0.14);
+}
+
+.runtime-tab-title {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.runtime-tab-state {
+    flex: 0 0 auto;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    padding: 1px 7px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.runtime-tab[data-runtime-state="agent_running"] .runtime-tab-state {
+    color: var(--green-dark);
+}
+
+.runtime-tab[data-runtime-state="idle_waiting"] .runtime-tab-state {
+    color: var(--amber);
+}
+
+.runtime-tab[data-runtime-state="queue_waiting"] .runtime-tab-state {
+    color: var(--blue);
 }
 
 .runtime-shell {
@@ -1534,6 +1712,162 @@ textarea.secret.revealed {
     margin-top: 10px;
 }
 
+/* 运行统计：磁贴 + 内联 SVG 曲线 */
+.dashboard-stats-panel {
+    margin-bottom: 16px;
+}
+
+.stats-panel-body {
+    display: grid;
+    gap: 14px;
+    padding: 14px;
+}
+
+.runtime-stats-section {
+    margin-top: 12px;
+    border-top: 2px solid var(--line-strong);
+    padding-top: 12px;
+}
+
+.runtime-stats-section .stats-panel-body {
+    padding: 10px 0 0;
+}
+
+.stats-block {
+    display: grid;
+    gap: 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+    background: #fffefa;
+    cursor: pointer;
+}
+
+.stats-block:hover {
+    border-color: var(--green);
+}
+
+.stats-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.stats-head strong {
+    font-family: var(--mono);
+    font-size: 12px;
+    text-transform: uppercase;
+}
+
+.stats-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+}
+
+.stats-tile {
+    display: grid;
+    gap: 4px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: var(--panel);
+}
+
+.stats-tile span {
+    color: var(--muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.stats-tile b {
+    font-family: var(--mono);
+    font-size: 22px;
+    line-height: 1.1;
+}
+
+.stats-charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 12px;
+}
+
+.stats-chart {
+    margin: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px 8px;
+    background: var(--panel);
+}
+
+.stats-chart figcaption {
+    margin-bottom: 6px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.stats-chart svg {
+    display: block;
+    width: 100%;
+    height: 170px;
+}
+
+.stats-grid {
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+}
+
+.stats-axis-label {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+}
+
+.stats-series-label {
+    fill: var(--ink);
+    font-family: var(--mono);
+    font-size: 10px;
+}
+
+.stats-mark {
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.stats-legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.stats-legend i {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 5px;
+    border-radius: 2px;
+    vertical-align: -1px;
+}
+
+.stats-empty,
+.stats-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.stats-empty {
+    padding: 10px 0;
+}
+
 .artifact-section {
     display: grid;
     gap: 9px;
@@ -1635,6 +1969,41 @@ textarea.secret.revealed {
     color: var(--ink);
     font-family: var(--mono);
     font-size: 12px;
+}
+
+.ping-profile-picker {
+    display: grid;
+    gap: 8px;
+    padding: 12px 14px 0;
+}
+
+.ping-profile-picker-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.ping-profile-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+}
+
+.ping-profile-list .checkline {
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.ping-profile-list .checkline .hint {
+    font-weight: 400;
+}
+
+.ping-profile-list .empty {
+    padding: 0;
 }
 
 .ping-date {
@@ -1960,8 +2329,14 @@ textarea.secret.revealed {
     .split,
     .split.wide-left,
     .split.wide-right,
+    .split.task-workbench,
     .metrics {
         grid-template-columns: 1fr;
+    }
+
+    .task-tree-panel {
+        position: static;
+        max-height: none;
     }
 }
 
@@ -2013,6 +2388,20 @@ textarea.secret.revealed {
     .tree-task .task-actions {
         max-width: none;
         justify-content: start;
+    }
+
+    .runtime-tabs-bar {
+        align-items: start;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .runtime-tabs {
+        width: 100%;
+    }
+
+    .runtime-tab {
+        max-width: 74vw;
     }
 
     .inline-actions {

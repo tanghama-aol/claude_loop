@@ -9,11 +9,25 @@ const {
     DEFAULT_GENERATE_PROMPT,
     DEFAULT_PROFILE_DIRECTORY,
     DEFAULT_RUN_PROMPT,
+    DEFAULT_TIMEOUT_SECONDS,
+    FABLE_5_PRICING,
+    LOOP_TIMING,
+    MAX_TASK_CYCLES,
+    RUN_TOKEN_PATTERN,
+    appendTaskCycle,
     appendTaskItemsToMarkdown,
     configEnvForProfile,
     createTaskLogEvent,
+    createTerminalLogger,
     createDefaultProfiles,
+    createRunToken,
+    createStreamJsonRenderer,
+    ensureRunTokenInstruction,
+    estimateCycleCostUsd,
+    extractUsageFromOutput,
+    failureBackoffMs,
     fillTemplate,
+    formatTerminalLogLine,
     generateTaskMarkdown,
     isAllDoneOutput,
     maskEnvText,
@@ -25,7 +39,11 @@ const {
     parseEnvText,
     parseTaskLogEvents,
     providerForAgentType,
+    renderStreamJsonLine,
+    resolveTerminalLogLevel,
     safeTaskFileName,
+    summarizeTaskCycles,
+    taskFileHasRunToken,
 } = require("../lib/core");
 
 test("parseArgs handles quoted prompt placeholders", () => {
@@ -288,4 +306,164 @@ test("default profiles use a project-relative working directory", () => {
         assert.equal(profile.defaultDirectory, DEFAULT_PROFILE_DIRECTORY);
         assert.equal(path.isAbsolute(profile.defaultDirectory), false);
     }
+});
+
+test("resolveTerminalLogLevel falls back to info for unknown values", () => {
+    assert.equal(resolveTerminalLogLevel(undefined), "info");
+    assert.equal(resolveTerminalLogLevel(" DEBUG "), "debug");
+    assert.equal(resolveTerminalLogLevel("verbose"), "info");
+    assert.equal(resolveTerminalLogLevel("nope", "silent"), "silent");
+});
+
+test("formatTerminalLogLine renders timestamp, level, scope and key=value fields", () => {
+    const line = formatTerminalLogLine({
+        level: "warn",
+        scope: "server:task",
+        message: "  任务开始 ",
+        timestamp: "2026-09-19T00:00:00.000Z",
+        fields: { taskId: "task_1", exitCode: 0, skipped: undefined, empty: null, text: "a b\nc", err: new Error("boom"), list: [1, 2] },
+    });
+    assert.equal(
+        line,
+        "[2026-09-19T00:00:00.000Z] [WARN ] [server:task] 任务开始 taskId=task_1 exitCode=0 empty=- text=\"a b c\" err=boom list=[1,2]",
+    );
+});
+
+test("createTerminalLogger filters by level, routes streams and derives child scopes", () => {
+    const lines = [];
+    const logger = createTerminalLogger({
+        level: "info",
+        writer: (line, entry) => lines.push({ line, entry }),
+        clock: () => "2026-09-19T00:00:00.000Z",
+    });
+    assert.equal(logger.debug("hidden"), false);
+    assert.equal(logger.info("shown", { a: 1 }), true);
+    assert.equal(logger.child("http").error("failed", { status: 500 }), true);
+    assert.equal(logger.enabled("debug"), false);
+    assert.equal(logger.enabled("warn"), true);
+    assert.deepEqual(lines.map((item) => item.line), [
+        "[2026-09-19T00:00:00.000Z] [INFO ] [server] shown a=1",
+        "[2026-09-19T00:00:00.000Z] [ERROR] [server:http] failed status=500",
+    ]);
+    assert.equal(lines[1].entry.scope, "server:http");
+
+    const silent = createTerminalLogger({ level: "silent", writer: (line) => lines.push({ line }) });
+    assert.equal(silent.error("never"), false);
+    assert.equal(lines.length, 2);
+
+    const debug = createTerminalLogger({ level: "debug", writer: (line) => lines.push({ line }) });
+    assert.equal(debug.debug("visible"), true);
+    assert.equal(lines.length, 3);
+});
+
+test("run tokens are unique, embedded in the default prompt, and detected only from the task file", () => {
+    const token = createRunToken();
+    assert.match(token, /^任务\+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.notEqual(token, createRunToken());
+    assert.deepEqual(token.match(RUN_TOKEN_PATTERN), [token]);
+
+    const prompt = fillTemplate(DEFAULT_RUN_PROMPT, { targetFile: "任务.md", runToken: token });
+    assert.ok(prompt.includes(`"${token}：<本轮结果描述>"`), "default prompt must tell the agent to write the token");
+    assert.match(prompt, /不读取回复文本/);
+    assert.equal(ensureRunTokenInstruction(prompt, token, "任务.md"), prompt, "prompts that already carry the token are untouched");
+
+    const custom = ensureRunTokenInstruction("自定义模板：处理 {targetFile}", token, "任务.md");
+    assert.match(custom, /^自定义模板：处理 \{targetFile\}\n\n本轮执行凭据规则：/);
+    assert.ok(custom.includes(token));
+    assert.match(custom, /任务\.md/);
+    assert.equal(ensureRunTokenInstruction("no token", "", "x.md"), "no token");
+
+    assert.equal(taskFileHasRunToken(`- [x] 1. 步骤\n  ${token}：已验证\n`, token), true);
+    assert.equal(taskFileHasRunToken("- [x] 1. 步骤\n任务完成\n", token), false, "output-style text never counts");
+    assert.equal(taskFileHasRunToken(`${token}`, ""), false);
+});
+
+test("loop timing enforces a two-minute floor, exponential backoff, and a two-hour timeout default", () => {
+    assert.equal(DEFAULT_TIMEOUT_SECONDS, 7200);
+    assert.ok(createDefaultProfiles().every((profile) => profile.timeoutSeconds === 7200));
+    assert.equal(LOOP_TIMING.minRunIntervalMs, 120000);
+    assert.equal(failureBackoffMs(0), 120000);
+    assert.equal(failureBackoffMs(1), 120000);
+    assert.equal(failureBackoffMs(2), 240000);
+    assert.equal(failureBackoffMs(3), 480000);
+    assert.equal(failureBackoffMs(6), 3600000, "backoff is capped at one hour");
+    assert.equal(failureBackoffMs(20), 3600000);
+    assert.equal(failureBackoffMs(3, { failureBackoffBaseMs: 10, failureBackoffMaxMs: 25 }), 25);
+});
+
+test("stream-json renderer turns Claude events into readable lines and survives split chunks", () => {
+    assert.equal(renderStreamJsonLine(JSON.stringify({ type: "system", subtype: "init", model: "claude", session_id: "s1", tools: ["Bash", "Read"] })), "[system] init model=claude session=s1 tools=2");
+    assert.equal(renderStreamJsonLine(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta" } })), null);
+    assert.equal(renderStreamJsonLine("plain text line"), "plain text line");
+    assert.equal(renderStreamJsonLine(""), null);
+    assert.equal(renderStreamJsonLine(JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "先看任务文件" }, { type: "tool_use", name: "Bash", input: { command: "cat task.md" } }] },
+    })), "先看任务文件\n[tool_use] Bash {\"command\":\"cat task.md\"}");
+    assert.equal(renderStreamJsonLine(JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", is_error: true, content: [{ type: "text", text: "boom" }] }] },
+    })), "[tool_error] boom");
+    assert.equal(renderStreamJsonLine(JSON.stringify({
+        type: "result", subtype: "success", num_turns: 3, duration_ms: 1200, total_cost_usd: 0.1234, usage: { input_tokens: 10, output_tokens: 4 }, result: "done",
+    })), "[result] success turns=3 duration=1200ms cost=$0.1234 tokens=in:10 out:4\ndone");
+
+    const renderer = createStreamJsonRenderer();
+    const first = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } });
+    const second = JSON.stringify({ type: "result", subtype: "success", result: "bye" });
+    const combined = `${first}\n${second}`;
+    const cut = first.length + 5;
+    assert.equal(renderer.push(combined.slice(0, cut)), "hello");
+    assert.equal(renderer.push(combined.slice(cut)), "");
+    assert.equal(renderer.flush(), "[result] success\nbye");
+    assert.equal(renderer.flush(), "");
+});
+
+test("usage extraction reads structured output and cost follows Fable 5.1 rates", () => {
+    const claude = [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 3, output_tokens: 1 } } }),
+        "not json",
+        JSON.stringify({ type: "result", subtype: "success", total_cost_usd: 0.42, usage: { input_tokens: 1000, output_tokens: 200, cache_creation_input_tokens: 4000, cache_read_input_tokens: 80000 } }),
+    ].join("\n");
+    const usage = extractUsageFromOutput(claude);
+    assert.deepEqual(usage, { inputTokens: 1000, outputTokens: 200, cacheCreationTokens: 4000, cacheReadTokens: 80000, reportedCostUsd: 0.42, found: true });
+    assert.equal(FABLE_5_PRICING.inputPerMillion, 10);
+    assert.equal(FABLE_5_PRICING.outputPerMillion, 50);
+    assert.equal(FABLE_5_PRICING.cacheWritePerMillion, 12.5);
+    assert.equal(FABLE_5_PRICING.cacheReadPerMillion, 0.25);
+    // 1000*10 + 200*50 + 4000*12.5 + 80000*0.25 = 10000+10000+50000+20000 = 90000 / 1e6
+    assert.equal(estimateCycleCostUsd(usage), 0.09);
+
+    const codex = JSON.stringify({ type: "turn.completed", usage: { input_tokens: 31, cached_input_tokens: 5, output_tokens: 4 } });
+    assert.deepEqual(extractUsageFromOutput(codex), { inputTokens: 31, outputTokens: 4, cacheCreationTokens: 0, cacheReadTokens: 5, reportedCostUsd: null, found: true });
+    assert.equal(extractUsageFromOutput("plain text only").found, false);
+    assert.equal(estimateCycleCostUsd(extractUsageFromOutput("plain text only")), 0);
+});
+
+test("cycle summaries count outcomes, tokens, cost, elapsed time, and average call interval", () => {
+    const task = { cycles: [] };
+    appendTaskCycle(task, { startedAt: "2026-09-20T10:00:00Z", endedAt: "2026-09-20T10:05:00Z", durationMs: 300000, success: true, inputTokens: 100, outputTokens: 50, costUsd: 0.0035 });
+    appendTaskCycle(task, { startedAt: "2026-09-20T10:07:00Z", endedAt: "2026-09-20T10:08:00Z", durationMs: 60000, success: false, inputTokens: 10, outputTokens: 5, costUsd: 0.00035 });
+    appendTaskCycle(task, { startedAt: "2026-09-20T10:11:00Z", endedAt: "2026-09-20T10:12:00Z", durationMs: 60000, success: true, inputTokens: 20, outputTokens: 10, cacheReadTokens: 1000, costUsd: 0.00095 });
+    const summary = summarizeTaskCycles(task.cycles);
+    assert.equal(summary.cycles, 3);
+    assert.equal(summary.successes, 2);
+    assert.equal(summary.failures, 1);
+    assert.equal(summary.inputTokens, 130);
+    assert.equal(summary.outputTokens, 65);
+    assert.equal(summary.cacheReadTokens, 1000);
+    assert.equal(summary.totalTokens, 1195);
+    assert.equal(summary.costUsd, 0.0048);
+    assert.equal(summary.elapsedMs, 12 * 60000);
+    assert.equal(summary.averageIntervalMs, (7 + 4) / 2 * 60000, "interval is measured between consecutive agent starts");
+    assert.equal(summary.averageDurationMs, 140000);
+    assert.equal(summary.firstStartedAt, "2026-09-20T10:00:00Z");
+    assert.equal(summary.lastEndedAt, "2026-09-20T10:12:00Z");
+    assert.equal(summarizeTaskCycles([]).averageIntervalMs, null);
+
+    const bounded = { cycles: [] };
+    for (let index = 0; index < MAX_TASK_CYCLES + 5; index += 1) appendTaskCycle(bounded, { startedAt: new Date(index * 1000).toISOString(), success: true });
+    assert.equal(bounded.cycles.length, MAX_TASK_CYCLES);
+    assert.equal(bounded.cycles[0].startedAt, new Date(5000).toISOString(), "oldest cycles are dropped first");
 });

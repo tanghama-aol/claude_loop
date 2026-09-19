@@ -52,6 +52,20 @@ test("legacy log rendering is bounded and boot does not eagerly load task logs",
     assert.match(appSource.slice(switchStart, switchEnd), /view !== "runtime"\) cancelLogRequest\(\)/);
 });
 
+test("ping view lets the user pick which Profiles are pinged automatically", () => {
+    assert.match(indexSource, /id="pingProfileList"/);
+    assert.match(indexSource, /id="pingProfileSummary"/);
+    const start = appSource.indexOf("function renderPingProfilePicker");
+    const end = appSource.indexOf("\nfunction renderPings", start);
+    assert.ok(start >= 0 && end > start, "ping profile picker renderer must remain present");
+    const renderer = appSource.slice(start, end);
+    assert.match(renderer, /pingEligible === true/);
+    assert.match(renderer, /pingSettings\?\.profileIds/);
+    assert.match(renderer, /escapeHtml\(profile\.name\)/);
+    assert.match(appSource, /body: \{ profileIds \}/);
+    assert.match(appSource, /form\.elements\.pingEnabled\.checked = profile\?\.pingEnabled === true/);
+});
+
 test("profile editor exposes an individual connection test", () => {
     assert.match(indexSource, /id="pingProfile"/);
     assert.match(indexSource, /id="profilePingStatus"/);
@@ -76,6 +90,91 @@ test("ping ledger shows latency and token metrics with safe expandable success d
     assert.match(renderer, /record\.failureReason/);
     assert.match(renderer, /escapeHtml\(inputText\)/);
     assert.match(renderer, /escapeHtml\(outputText\)/);
+});
+
+test("runtime view lists started tasks as switchable tabs", () => {
+    assert.match(indexSource, /id="runtimeTabsBar"/);
+    assert.match(indexSource, /id="runtimeTabs"[^>]*role="tablist"/);
+
+    const escapeStart = appSource.indexOf("function escapeHtml");
+    const escapeEnd = appSource.indexOf("\nfunction formatTime", escapeStart);
+    const startedStart = appSource.indexOf("function taskIsStarted(");
+    const startedEnd = appSource.indexOf("\nfunction renderRuntimeContext", startedStart);
+    const renderStart = appSource.indexOf("function renderRuntimeTabs(");
+    const renderEnd = appSource.indexOf("\nasync function selectRuntimeTask(", renderStart);
+    assert.ok(startedStart >= 0 && startedEnd > startedStart, "started-task filter must remain present");
+    assert.ok(renderStart >= 0 && renderEnd > renderStart, "runtime tab renderer must remain present");
+
+    const bar = { hidden: true };
+    const tabs = { innerHTML: "" };
+    const nodes = new Map([["#runtimeTabsBar", bar], ["#runtimeTabs", tabs]]);
+    const context = {
+        state: {
+            selectedTaskId: "task-live",
+            runtimeTabsSignature: "",
+            data: {
+                tasks: [
+                    { id: "task-live", title: "运行中的任务", isRunning: true, runtimeState: "agent_running" },
+                    { id: "task-queued", title: "排队任务", status: "queued", runtimeState: "queue_waiting" },
+                    { id: "task-scheduled", title: "预约任务", status: "scheduled", runtimeState: "loop_not_started" },
+                    { id: "task-idle", title: "空闲等待", isRunning: true, loopActive: true, runtimeState: "idle_waiting" },
+                    { id: "task-done", title: "已完成", status: "completed", runtimeState: "loop_not_started" },
+                    { id: "task-archived", title: "已归档", archived: true, isRunning: true, runtimeState: "agent_running" },
+                    { id: "task-hostile", title: "<img src=x onerror=alert(1)>", status: "running" },
+                ],
+            },
+        },
+        $: (selector) => nodes.get(selector),
+        taskRuntimeState: (task) => task.runtimeState || "loop_not_started",
+        taskDisplayStatus: (task) => task.runtimeState || task.status,
+        t: (key, params = {}) => `${key}:${params.name || ""}`,
+    };
+    vm.runInNewContext(`${appSource.slice(escapeStart, escapeEnd)}\n${appSource.slice(startedStart, startedEnd)}\n${appSource.slice(renderStart, renderEnd)}\nthis.taskIsStarted = taskIsStarted; this.renderRuntimeTabs = renderRuntimeTabs;`, context);
+
+    assert.equal(context.taskIsStarted(null), false);
+    assert.equal(context.taskIsStarted({ id: "done", status: "completed" }), false);
+    assert.equal(context.taskIsStarted({ id: "archived", archived: true, isRunning: true }), false);
+    assert.equal(context.taskIsStarted({ id: "queued", status: "queued" }), true);
+    assert.equal(context.taskIsStarted({ id: "loop", isRunning: true }), true);
+
+    context.renderRuntimeTabs();
+    assert.equal(bar.hidden, false);
+    const markup = tabs.innerHTML;
+    for (const id of ["task-live", "task-queued", "task-scheduled", "task-idle", "task-hostile"]) {
+        assert.match(markup, new RegExp(`data-runtime-tab="${id}"`));
+    }
+    for (const id of ["task-done", "task-archived"]) {
+        assert.doesNotMatch(markup, new RegExp(`data-runtime-tab="${id}"`));
+    }
+    assert.match(markup, /data-runtime-tab="task-live"[^>]*aria-selected="true"/);
+    assert.match(markup, /data-runtime-tab="task-queued"[^>]*aria-selected="false"/);
+    assert.match(markup, /data-runtime-state="queue_waiting"/);
+    assert.match(markup, /runtime\.tabsSwitch:运行中的任务/);
+    assert.doesNotMatch(markup, /<img src=x onerror/);
+    assert.match(markup, /&lt;img src=x onerror=alert\(1\)&gt;/);
+
+    // Polling must not rebuild the tab strip (and steal focus) while nothing changed.
+    tabs.innerHTML = "sentinel";
+    context.renderRuntimeTabs();
+    assert.equal(tabs.innerHTML, "sentinel");
+
+    context.state.selectedTaskId = "task-queued";
+    context.renderRuntimeTabs();
+    assert.match(tabs.innerHTML, /data-runtime-tab="task-queued"[^>]*aria-selected="true"/);
+
+    context.state.data.tasks = [{ id: "task-done", status: "completed" }];
+    context.state.selectedTaskId = "";
+    context.renderRuntimeTabs();
+    assert.equal(bar.hidden, true);
+
+    assert.match(appSource, /#runtimeTabs"\)\.addEventListener\("click"/);
+    assert.match(appSource, /\[data-runtime-tab\]/);
+    assert.match(appSource, /await selectRuntimeTask\(event\.target\.value\)/);
+    // renderSelectors() picks the fallback task, so the tabs must be rebuilt after it
+    // or the first paint highlights no tab.
+    const renderAllStart = appSource.indexOf("function renderAll()");
+    const renderAllEnd = appSource.indexOf("\nasync function refresh(", renderAllStart);
+    assert.match(appSource.slice(renderAllStart, renderAllEnd), /renderSelectors\(\);[\s\S]*renderRuntimeTabs\(\);/);
 });
 
 test("runtime exposes fixed-time and Profile-availability scheduling", () => {
@@ -278,4 +377,55 @@ test("polling never overlaps requests and pauses while the page is hidden", asyn
     resolveRefresh();
     await pending;
     assert.equal(context.state.pollInFlight, false);
+});
+
+test("task page pairs the project tree with an auto-saving task editor", () => {
+    assert.match(indexSource, /class="split task-workbench"/);
+    assert.match(indexSource, /class="panel task-tree-panel"[\s\S]*id="taskList"[\s\S]*class="panel task-editor-panel"/, "the tree must come before the editor");
+    assert.match(indexSource, /id="taskForm" class="form-grid single" data-mode="create"/);
+    assert.match(indexSource, /<input type="hidden" name="taskId">/);
+    assert.match(indexSource, /id="taskEditorStatus"[^>]*aria-live="polite"/);
+    assert.match(indexSource, /id="newTaskButton"/);
+    assert.match(indexSource, /id="taskOpenRuntime"/);
+    assert.match(appSource, /function openTaskEditor\(taskId\)/);
+    assert.match(appSource, /function resetTaskEditor\(\)/);
+    assert.match(appSource, /function scheduleTaskAutosave\(\)/);
+    assert.match(appSource, /method: "PATCH", body: taskEditorPayload\(form\)/);
+    assert.match(appSource, /tree-task-selected/);
+
+    // 编辑态提交的字段：锁定字段绝不进入自动保存的请求体。
+    const payloadStart = appSource.indexOf("function taskEditorPayload(form)");
+    const payloadEnd = appSource.indexOf("\nfunction scheduleTaskAutosave", payloadStart);
+    assert.ok(payloadStart >= 0 && payloadEnd > payloadStart);
+    const context = { selectedValues: (select) => select.selected };
+    vm.runInNewContext(`${appSource.slice(payloadStart, payloadEnd)}\nthis.taskEditorPayload = taskEditorPayload;`, context);
+    const field = (value) => ({ value });
+    const form = {
+        dataset: { taskType: "video" },
+        elements: {
+            taskType: field("video"),
+            title: field(" 标题 "),
+            requirement: field("需求"),
+            projectId: field("proj"),
+            decomposeProfileId: field("gen"),
+            runProfileIds: { selected: ["p1", "p2"] },
+            artifactDirectoryName: field("renders"),
+            outputFileName: field("clip.mp4"),
+            outputFormat: field("mp4"),
+            aspectRatio: field("16:9"),
+            resolution: field("1920x1080"),
+            durationSeconds: field("8"),
+            referenceFiles: field("a.png"),
+            targetFileName: field("locked.md"),
+            directory: field("D:/locked"),
+        },
+    };
+    const payload = context.taskEditorPayload(form);
+    assert.deepEqual(Object.keys(payload).sort(), [
+        "artifactDirectoryName", "aspectRatio", "decomposeProfileId", "durationSeconds", "outputFileName",
+        "outputFormat", "projectId", "referenceFiles", "requirement", "resolution", "runProfileIds", "title",
+    ]);
+    assert.deepEqual(payload.runProfileIds, ["p1", "p2"]);
+    form.dataset.taskType = "text";
+    assert.deepEqual(Object.keys(context.taskEditorPayload(form)).sort(), ["decomposeProfileId", "projectId", "requirement", "runProfileIds", "title"]);
 });

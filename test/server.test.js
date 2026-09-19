@@ -21,6 +21,7 @@ const {
     LEGACY_RUN_PROMPT,
     LEGACY_RUN_PROMPT_V2,
     LEGACY_RUN_PROMPT_V3,
+    createTerminalLogger,
 } = require("../lib/core");
 
 async function request(server, pathName, options = {}) {
@@ -50,14 +51,17 @@ test("server defaults to all interfaces while preserving explicit HOST and PORT"
     assert.deepEqual(resolveServerConfig({}), {
         host: DEFAULT_HOST,
         port: DEFAULT_PORT,
+        logLevel: "info",
     });
-    assert.deepEqual(resolveServerConfig({ HOST: " 127.0.0.1 ", PORT: "3100" }), {
+    assert.deepEqual(resolveServerConfig({ HOST: " 127.0.0.1 ", PORT: "3100", LOG_LEVEL: "DEBUG" }), {
         host: "127.0.0.1",
         port: 3100,
+        logLevel: "debug",
     });
-    assert.deepEqual(resolveServerConfig({ HOST: "", PORT: "0" }), {
+    assert.deepEqual(resolveServerConfig({ HOST: "", PORT: "0", LOG_LEVEL: "verbose" }), {
         host: DEFAULT_HOST,
         port: 0,
+        logLevel: "info",
     });
 
     const startup = formatStartupMessage({ host: DEFAULT_HOST, port: DEFAULT_PORT });
@@ -71,6 +75,11 @@ function writeAgentScript(directory, name, content) {
     fs.writeFileSync(filePath, [
         "const fs = require(\"node:fs\");",
         "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
+        "// 任务文件是唯一凭据：假 Agent 通过这两个助手把结束标志 / 本轮凭据写进任务文件。",
+        "const taskFilePath = () => process.env.AGENT_TASK_FILE || \"\";",
+        "const markTaskFileAllDone = () => { if (taskFilePath()) fs.appendFileSync(taskFilePath(), \"\\nGGGG全部完成GGGGGGGG全部完成GGGG\\n\", \"utf8\"); };",
+        "const runTokenFromPrompt = () => (process.argv.slice(2).join(\" \").match(/任务\\+[0-9a-f-]{36}/) || [\"\"])[0];",
+        "const writeRunToken = (note = \"done\") => { const token = runTokenFromPrompt(); if (token && taskFilePath()) fs.appendFileSync(taskFilePath(), `\\n${token}：${note}\\n`, \"utf8\"); return token; };",
         "",
         "(async () => {",
         content,
@@ -138,9 +147,16 @@ test("server creates task files and supports editing", async (t) => {
         },
     });
     assert.equal(created.ok, true);
-    assert.equal(created.generation.ok, true);
+    assert.equal(created.generation, undefined);
     assert.equal(created.task.status, "not_started");
+    assert.equal(created.task.generationState, "pending");
     assert.ok(fs.existsSync(path.join(tempRoot, "测试任务.md")));
+    assert.match(fs.readFileSync(path.join(tempRoot, "测试任务.md"), "utf8"), /尚未生成任务列表/);
+
+    const generation = await request(server, `/api/tasks/${created.task.id}/generate`, { method: "POST" });
+    assert.equal(generation.ok, true);
+    assert.equal(generation.fileChanged, true);
+    assert.equal(generation.task.status, "not_started");
 
     const publicTask = (await request(server, "/api/state")).tasks.find((item) => item.id === created.task.id);
     assert.equal(publicTask.runtimeState, RUNTIME_STATE.loopNotStarted);
@@ -374,7 +390,9 @@ test("server resolves Windows PowerShell command shims", { skip: process.platfor
     // The all-done marker has to appear twice back to back on one line, as the run prompt demands.
     fs.writeFileSync(path.join(tempRoot, "fake-codex.ps1"), [
         "$marker = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(\"5YWo6YOo5a6M5oiQ\"))",
-        "Write-Output ('GGGG' + $marker + 'GGGG' + 'GGGG' + $marker + 'GGGG')",
+        "$line = 'GGGG' + $marker + 'GGGG' + 'GGGG' + $marker + 'GGGG'",
+        "[System.IO.File]::AppendAllText($env:AGENT_TASK_FILE, \"`n$line`n\", [System.Text.Encoding]::UTF8)",
+        "Write-Output $line",
     ].join("\r\n"), "utf8");
 
     const server = createApp({
@@ -524,6 +542,7 @@ test("server keeps a relative profile working directory relative to the project"
             args: script.args,
             defaultDirectory: "default_work_dir",
             timeoutSeconds: 5,
+            pingEnabled: true,
             enabled: true,
         },
     });
@@ -622,6 +641,162 @@ test("server migrates all legacy default prompts and preserves custom prompts", 
     assert.equal(state.profiles[4].promptTemplate, `${LEGACY_RUN_PROMPT_V3}\n保留用户的自定义计划规则。`);
 });
 
+test("server creating an agent task does not spawn the generation profile", async (t) => {
+    const { server, rootDir, statePath } = taskManagementFixture(t);
+    const script = writeAgentScript(rootDir, "generator.js", [
+        "fs.writeFileSync(\"generator-invoked.txt\", \"invoked\");",
+        "fs.writeFileSync(\"agent-task.md\", \"# generated\\n\\n- [ ] 1. 生成的任务项\\n\");",
+        "console.log(\"任务目标文件已生成\");",
+    ].join("\n"));
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "generator", command: script.command, args: script.args, timeoutSeconds: 2 },
+    });
+
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "agent-task",
+            directory: rootDir,
+            targetFileName: "agent-task.md",
+            requirementMode: "agent",
+            requirement: "实现登录页面\n补充登录接口测试",
+            decomposeProfileId: profile.profile.id,
+        },
+    });
+    assert.equal(created.ok, true);
+    assert.equal(created.generation, undefined);
+    assert.equal(created.task.sourceMode, "agent");
+    assert.equal(created.task.requirementMode, "agent");
+    assert.equal(created.task.generationState, "pending");
+    assert.equal(created.task.status, "not_started");
+    assert.equal(created.task.decomposeProfileId, profile.profile.id);
+    // 创建过程没有启动生成 Profile。
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(fs.existsSync(path.join(rootDir, "generator-invoked.txt")), false);
+
+    // 目标文件是占位内容：包含标题与原始需求、没有任务项与完成标记。
+    const content = fs.readFileSync(path.join(rootDir, "agent-task.md"), "utf8");
+    assert.match(content, /^# agent-task/);
+    assert.match(content, /实现登录页面/);
+    assert.match(content, /补充登录接口测试/);
+    assert.match(content, /尚未生成任务列表/);
+    assert.doesNotMatch(content, /- \[ \]/);
+    assert.equal(content.includes("GGGG"), false);
+    const file = await request(server, `/api/tasks/${created.task.id}/file`);
+    assert.equal(file.content, content);
+
+    // 占位哈希写入 loop.placeholderHash，且等于当前文件哈希；去掉显式字段后重新载入仍判定为 pending。
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const savedTask = saved.tasks.find((task) => task.id === created.task.id);
+    assert.ok(savedTask.loop.placeholderHash);
+    assert.equal(savedTask.loop.placeholderHash, savedTask.loop.lastHash);
+    const fullState = await request(server, "/api/state");
+    const publicTask = fullState.tasks.find((task) => task.id === created.task.id);
+    assert.equal(publicTask.generationState, "pending");
+    assert.equal(publicTask.loop.placeholderHash, savedTask.loop.placeholderHash);
+    assert.ok(fullState.events.some((event) => event.taskId === created.task.id && /待生成目标文件/.test(event.message)));
+    assert.equal(publicTask.logRuns.length, 0);
+
+    // 运行界面触发生成后才调用 Profile。
+    const generation = await request(server, `/api/tasks/${created.task.id}/generate`, { method: "POST" });
+    assert.equal(generation.ok, true);
+    assert.equal(generation.fileChanged, true);
+    assert.equal(fs.readFileSync(path.join(rootDir, "generator-invoked.txt"), "utf8"), "invoked");
+    assert.match(fs.readFileSync(path.join(rootDir, "agent-task.md"), "utf8"), /生成的任务项/);
+});
+
+test("server migrates legacy sourceMode into requirementMode", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const legacyTask = (id, sourceMode, extra = {}) => ({
+        id,
+        title: id,
+        requirement: "旧任务",
+        taskType: "text",
+        sourceMode,
+        targetFileName: `${id}.md`,
+        filePath: path.join(tempRoot, `${id}.md`),
+        directory: tempRoot,
+        runProfileIds: [],
+        status: "not_started",
+        logFile: `${id}.log`,
+        logRuns: [],
+        loop: { stallCount: 0, lastOutput: "", lastHash: "" },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        ...extra,
+    });
+    fs.writeFileSync(path.join(tempData, "state.json"), JSON.stringify({
+        version: 3,
+        directories: [tempRoot],
+        projects: [],
+        profiles: [],
+        tasks: [
+            legacyTask("task_template", "template"),
+            legacyTask("task_agent", "agent"),
+            legacyTask("task_existing", "existing"),
+            legacyTask("task_upload", "upload"),
+            legacyTask("task_pending", "agent", { loop: { stallCount: 0, lastOutput: "", lastHash: "abc", placeholderHash: "abc" } }),
+            legacyTask("task_explicit", "template", { requirementMode: "agent", generationState: "failed" }),
+            legacyTask("task_invalid", "agent", { requirementMode: "bogus", generationState: "bogus" }),
+        ],
+        events: [],
+        pingRecords: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    }), "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    const state = await request(server, "/api/state");
+    const byId = (id) => state.tasks.find((task) => task.id === id);
+    // 旧 template 任务 → manual，且不需要生成。
+    assert.equal(byId("task_template").sourceMode, "template");
+    assert.equal(byId("task_template").requirementMode, "manual");
+    assert.equal(byId("task_template").generationState, "none");
+    // 旧 agent 任务创建时已同步生成过，迁移后视为 generated，不阻塞启动。
+    assert.equal(byId("task_agent").requirementMode, "agent");
+    assert.equal(byId("task_agent").generationState, "generated");
+    // existing / upload 没有需求来源语义。
+    assert.equal(byId("task_existing").requirementMode, "");
+    assert.equal(byId("task_existing").generationState, "none");
+    assert.equal(byId("task_upload").requirementMode, "");
+    assert.equal(byId("task_upload").generationState, "none");
+    // 记录了占位哈希但缺少 generationState 的 agent 任务视为 pending。
+    assert.equal(byId("task_pending").generationState, "pending");
+    // 显式字段优先于 sourceMode 推导。
+    assert.equal(byId("task_explicit").requirementMode, "agent");
+    assert.equal(byId("task_explicit").generationState, "failed");
+    // 非法值回退到推导结果。
+    assert.equal(byId("task_invalid").requirementMode, "agent");
+    assert.equal(byId("task_invalid").generationState, "generated");
+
+    // requirementMode 可以在创建请求中直接指定，并映射到既有的 sourceMode。
+    const manual = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "手动任务",
+            requirement: "第一项\n第二项",
+            targetFileName: "manual.md",
+            directory: tempRoot,
+            requirementMode: "manual",
+        },
+    });
+    assert.equal(manual.task.sourceMode, "template");
+    assert.equal(manual.task.requirementMode, "manual");
+    assert.equal(manual.task.generationState, "none");
+    assert.match(fs.readFileSync(path.join(tempRoot, "manual.md"), "utf8"), /第一项/);
+});
+
 test("server closes agent stdin so commands do not wait for additional input", async (t) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
     const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
@@ -641,7 +816,7 @@ test("server closes agent stdin so commands do not wait for additional input", a
         "process.stdin.on(\"data\", (chunk) => { input += chunk; });",
         "await new Promise((resolve) => process.stdin.on(\"end\", resolve));",
         "console.log(input ? `stdin-open:${input.trim()}` : \"stdin-closed\");",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -849,7 +1024,7 @@ test("server exposes active agent process while a task is running", async (t) =>
     const script = writeAgentScript(tempRoot, "agent-sleep.sh", [
         "console.log(\"started\");",
         "await sleep(1000);",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -912,7 +1087,7 @@ test("server reports idle waiting while loop is between agent runs", async (t) =
         fs.rmSync(tempRoot, { recursive: true, force: true });
         fs.rmSync(tempData, { recursive: true, force: true });
     });
-    const script = writeAgentScript(tempRoot, "agent-once.sh", "console.log(\"任务完成\");");
+    const script = writeAgentScript(tempRoot, "agent-once.sh", "writeRunToken(\"first cycle\"); console.log(\"任务完成\");");
 
     const profile = await request(server, "/api/profiles", {
         method: "POST",
@@ -978,7 +1153,7 @@ test("server can schedule a task to start once in the future", async (t) => {
     const markerPath = path.join(tempRoot, "scheduled-marker.txt");
     const script = writeAgentScript(tempRoot, "agent-scheduled.sh", [
         `fs.writeFileSync(${JSON.stringify(markerPath)}, "started", "utf8");`,
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -1038,7 +1213,7 @@ test("server starts a task when its Profile becomes available", async (t) => {
         "    console.error(\"model unavailable\");",
         "    process.exit(2);",
         "}",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -1137,7 +1312,7 @@ test("server cancels a scheduled task when it is stopped", async (t) => {
     const markerPath = path.join(tempRoot, "cancelled-marker.txt");
     const script = writeAgentScript(tempRoot, "agent-cancelled.sh", [
         `fs.writeFileSync(${JSON.stringify(markerPath)}, "started", "utf8");`,
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -1205,7 +1380,7 @@ test("server exposes ordered structured task log events with raw output", async 
     const script = writeAgentScript(tempRoot, "agent-structured-log.sh", [
         "console.log(\"first line\\nsecond line\");",
         "console.error(\"warning one\\nwarning two\");",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const profile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1280,6 +1455,7 @@ test("server incrementally persists isolated run logs and reloads them after res
         dataDir: tempData,
         publicDir: path.join(__dirname, "..", "public"),
         disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 20 },
     });
     t.after(() => {
         server.closeRunners();
@@ -1294,7 +1470,7 @@ test("server incrementally persists isolated run logs and reloads them after res
         "console.log(`run-${count}-begin`);",
         "await sleep(350);",
         "console.error(`run-${count}-warning`);",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const profile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1352,6 +1528,7 @@ test("server incrementally persists isolated run logs and reloads them after res
         dataDir: tempData,
         publicDir: path.join(__dirname, "..", "public"),
         disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 20 },
     });
     const reloaded = await request(server, `/api/tasks/${created.task.id}/logs/${encodeURIComponent(firstStarted.runId)}`);
     assert.equal(reloaded.run.status, "all_done");
@@ -1410,13 +1587,13 @@ test("server completes a durable lifecycle with rich output and historical appen
         `    process.stdout.write(${JSON.stringify(richStdout)});`,
         `    process.stderr.write(${JSON.stringify(richStderr)});`,
         "    process.stdout.write(\"L\".repeat(16000));",
-        "    process.stdout.write(\"\\nGGGG全部完成GGGGGGGG全部完成GGGG\\n\");",
+        "    markTaskFileAllDone(); process.stdout.write(\"\\nGGGG全部完成GGGGGGGG全部完成GGGG\\n\");",
         "} else {",
         "    const current = fs.readFileSync(targetPath, \"utf8\");",
         "    const completed = current.replaceAll(\"- [ ]\", \"- [x]\").replace(\"状态：未开始\", \"状态：FINISHED\");",
         "    fs.writeFileSync(targetPath, completed, \"utf8\");",
         "    console.log(\"第二轮完成 ✓\");",
-        "    console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "    markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
         "}",
     ].join("\n"));
 
@@ -1425,6 +1602,7 @@ test("server completes a durable lifecycle with rich output and historical appen
         dataDir: tempData,
         publicDir: path.join(__dirname, "..", "public"),
         disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 20 },
     });
     t.after(() => {
         server.closeRunners();
@@ -1506,6 +1684,7 @@ test("server completes a durable lifecycle with rich output and historical appen
         dataDir: tempData,
         publicDir: path.join(__dirname, "..", "public"),
         disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 20 },
     });
     const reloadedLog = await request(server, `/api/tasks/${encodeURIComponent(taskId)}/logs/${encodeURIComponent(firstStarted.runId)}`);
     assert.equal(reloadedLog.run.status, "all_done");
@@ -1541,6 +1720,7 @@ test("server completes a durable lifecycle with rich output and historical appen
         dataDir: tempData,
         publicDir: path.join(__dirname, "..", "public"),
         disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 20 },
     });
     const beforeSecondRun = await request(server, "/api/state");
     const pendingTask = beforeSecondRun.tasks.find((task) => task.id === taskId);
@@ -1728,7 +1908,7 @@ test("server logs real prompt and rotates to next profile after failure", async 
         fs.rmSync(tempData, { recursive: true, force: true });
     });
     const failScript = writeAgentScript(tempRoot, "agent-429.sh", "console.log(\"429\");");
-    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");");
+    const nextScript = writeAgentScript(tempRoot, "agent-next.sh", "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");");
 
     const failProfile = await request(server, "/api/profiles", {
         method: "POST",
@@ -1804,7 +1984,7 @@ test("server selects the first available task Profile in configured order", asyn
         "    return;",
         "}",
         `fs.writeFileSync(${JSON.stringify(availableRun)}, "ran", "utf8");`,
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -1895,7 +2075,7 @@ test("server applies profile config directory to agent environment", async (t) =
     });
     const script = writeAgentScript(tempRoot, "agent-config.sh", [
         "console.log(process.env.CODEX_HOME || \"\");",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
 
     const profile = await request(server, "/api/profiles", {
@@ -2023,6 +2203,13 @@ test("server pings enabled claude and codex profiles and groups records by day",
         fs.rmSync(tempData, { recursive: true, force: true });
     });
 
+    // 旧版状态没有自动 Ping 名单：按 Profile 的 pingEnabled 迁移，且只纳入 Claude / Codex 类型。
+    const migrated = await request(server, "/api/state");
+    assert.deepEqual(migrated.pingSettings.profileIds, ["profile_claude_ping", "profile_codex_ping"]);
+    assert.equal(migrated.profiles.find((profile) => profile.id === "profile_gemini_ping").pingEnabled, false);
+    assert.equal(migrated.profiles.find((profile) => profile.id === "profile_gemini_ping").pingEligible, false);
+    assert.equal(migrated.profiles.find((profile) => profile.id === "profile_claude_ping").pingEligible, true);
+
     const result = await request(server, "/api/pings/run", { method: "POST" });
     assert.equal(result.ok, true);
     assert.equal(result.records.length, 2);
@@ -2111,6 +2298,111 @@ test("server can disable and re-enable the global ping feature", async (t) => {
     const result = await request(server, "/api/pings/run", { method: "POST" });
     assert.equal(result.records.length, 1);
     assert.equal(result.records[0].success, true);
+});
+
+test("server only auto-pings the Profiles listed in pingSettings.profileIds", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const script = writeAgentScript(tempRoot, "agent-ping-list.sh", "console.log(\"pong\");");
+    const makeProfile = (id, agentType) => ({
+        id,
+        name: id,
+        agentType,
+        command: script.command,
+        args: script.args,
+        envText: "",
+        promptTemplate: DEFAULT_RUN_PROMPT,
+        timeoutSeconds: 1,
+        enabled: true,
+        nonInteractive: true,
+        defaultDirectory: tempRoot,
+        configDirectory: "",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    });
+    fs.mkdirSync(tempData, { recursive: true });
+    fs.writeFileSync(path.join(tempData, "state.json"), JSON.stringify({
+        version: 3,
+        directories: [tempRoot],
+        profiles: [
+            makeProfile("profile_ping_a", "claude"),
+            makeProfile("profile_ping_b", "codex"),
+            makeProfile("profile_ping_gemini", "gemini"),
+        ],
+        tasks: [],
+        events: [],
+        pingRecords: [],
+        pingSettings: { enabled: true, profileIds: ["profile_ping_b", "profile_missing", "profile_ping_gemini"] },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    }), "utf8");
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        pingQuestionRandom: () => 0,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+
+    // 名单是唯一真相：未列出的 Profile 不自动 Ping；不存在的 ID 被清理；名单派生出 Profile 的 pingEnabled。
+    const initial = await request(server, "/api/state");
+    assert.deepEqual(initial.pingSettings.profileIds, ["profile_ping_b", "profile_ping_gemini"]);
+    assert.equal(initial.profiles.find((profile) => profile.id === "profile_ping_a").pingEnabled, false);
+    assert.equal(initial.profiles.find((profile) => profile.id === "profile_ping_b").pingEnabled, true);
+
+    const firstRound = await request(server, "/api/pings/run", { method: "POST" });
+    assert.deepEqual(firstRound.records.map((record) => record.profileId), ["profile_ping_b"]);
+
+    // 通过设置接口改名单：只保留已登记的 Profile ID，顺序按提交顺序。
+    const updated = await request(server, "/api/pings/settings", {
+        method: "POST",
+        body: { profileIds: ["profile_ping_a", "profile_unknown"] },
+    });
+    assert.deepEqual(updated.pingSettings.profileIds, ["profile_ping_a"]);
+    assert.equal(updated.pingSettings.enabled, true);
+    const secondRound = await request(server, "/api/pings/run", { method: "POST" });
+    assert.deepEqual(secondRound.records.map((record) => record.profileId), ["profile_ping_a"]);
+
+    await assert.rejects(
+        request(server, "/api/pings/settings", { method: "POST", body: { profileIds: "profile_ping_a" } }),
+        /profileIds/,
+    );
+
+    // 新建 Profile 默认不加入名单；编辑时勾选 pingEnabled 会加入，取消勾选会移除。
+    const created = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "ping-new", agentType: "codex", command: script.command, args: script.args, timeoutSeconds: 1 },
+    });
+    assert.equal(created.profile.pingEnabled, false);
+    let state = await request(server, "/api/state");
+    assert.deepEqual(state.pingSettings.profileIds, ["profile_ping_a"]);
+
+    await request(server, "/api/profiles", { method: "POST", body: { id: created.profile.id, pingEnabled: true } });
+    state = await request(server, "/api/state");
+    assert.deepEqual(state.pingSettings.profileIds, ["profile_ping_a", created.profile.id]);
+    // 未传 pingEnabled 的编辑保留原有名单状态。
+    await request(server, "/api/profiles", { method: "POST", body: { id: created.profile.id, name: "ping-new-renamed" } });
+    state = await request(server, "/api/state");
+    assert.deepEqual(state.pingSettings.profileIds, ["profile_ping_a", created.profile.id]);
+
+    await request(server, "/api/profiles", { method: "POST", body: { id: "profile_ping_a", pingEnabled: false } });
+    state = await request(server, "/api/state");
+    assert.deepEqual(state.pingSettings.profileIds, [created.profile.id]);
+    assert.equal(state.profiles.find((profile) => profile.id === "profile_ping_a").pingEnabled, false);
+
+    // 删除 Profile 时同步移出名单；手动测试连接不受名单限制。
+    await request(server, `/api/profiles/${created.profile.id}`, { method: "DELETE" });
+    state = await request(server, "/api/state");
+    assert.deepEqual(state.pingSettings.profileIds, []);
+    const manual = await request(server, "/api/profiles/profile_ping_a/ping", { method: "POST" });
+    assert.equal(manual.record.success, true);
+    const emptyRound = await request(server, "/api/pings/run", { method: "POST" });
+    assert.equal(emptyRound.records.length, 0);
 });
 
 test("server can test one Profile from the editor and persist the result", async (t) => {
@@ -2881,7 +3173,7 @@ test("server groups tasks by project, queues same-project runs, and archives tar
     const agent = writeAgentScript(tempRoot, "agent-project-queue.js", [
         `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
         "await sleep(100);",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -2986,7 +3278,7 @@ test("server serializes tasks from different projects that share one working dir
     const agent = writeAgentScript(tempRoot, "agent-directory-queue.js", [
         `fs.appendFileSync(${JSON.stringify(executionLog)}, String(process.env.AGENT_TASK_ID || "") + "\\n", "utf8");`,
         "await sleep(100);",
-        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+        "markTaskFileAllDone(); console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
     ].join("\n"));
     const server = createApp({
         rootDir: tempRoot,
@@ -3300,7 +3592,9 @@ test("server deduplicates during generation without starting another agent or de
         title: "generating", directory: rootDir, targetFileName: "generating.md", sourceMode: "agent",
         requirement: "generate", decomposeProfileId: profile.profile.id,
     };
-    const pending = request(server, "/api/tasks", { method: "POST", body });
+    const created = await request(server, "/api/tasks", { method: "POST", body });
+    assert.equal(fs.existsSync(path.join(rootDir, "invocations.txt")), false);
+    const pending = request(server, `/api/tasks/${created.task.id}/generate`, { method: "POST" });
     try {
         const running = await waitFor(async () => {
             const state = await request(server, "/api/state");
@@ -3450,4 +3744,495 @@ test("server provides compact conditional state and invalidates it after externa
     const deleted = await server.inject({ path: "/api/state?compact=1", headers: { "if-none-match": updated.headers.etag } });
     assert.equal(deleted.statusCode, 200);
     assert.deepEqual(deleted.json().tasks, []);
+});
+
+test("server prints detailed terminal logs for requests, tasks, agents and shutdown", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const lines = [];
+    const logger = createTerminalLogger({ level: "debug", writer: (line, entry) => lines.push({ line, entry }) });
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        logger,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const scopes = () => lines.map((item) => item.entry.scope);
+    const joined = () => lines.map((item) => item.line).join("\n");
+
+    assert.ok(lines.some((item) => item.entry.scope === "server" && item.entry.message === "服务初始化" && item.entry.fields.dataDir === tempData));
+
+    await request(server, "/api/state");
+    const getLog = lines.find((item) => item.entry.scope === "server:http" && item.entry.message === "GET /api/state");
+    assert.ok(getLog, "GET requests are logged at debug level");
+    assert.equal(getLog.entry.level, "debug");
+    assert.equal(getLog.entry.fields.status, 200);
+    assert.equal(typeof getLog.entry.fields.durationMs, "number");
+
+    const missing = await server.inject({ method: "GET", path: "/api/tasks/nope/logs" });
+    assert.ok(missing.statusCode >= 400);
+    assert.ok(lines.some((item) => item.entry.scope === "server:http" && item.entry.level === "warn" && item.entry.fields.status === missing.statusCode));
+
+    const agent = writeAgentScript(tempRoot, "agent-terminal-log.sh", [
+        "console.log(\"hello from agent\");",
+        "console.error(\"agent warning\");",
+    ].join("\n"));
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "terminal-log", agentType: "claude", command: agent.command, args: agent.args, timeoutSeconds: 5, enabled: true },
+    });
+    assert.ok(lines.some((item) => item.entry.scope === "server:http" && item.entry.level === "info" && item.entry.message === "POST /api/profiles"));
+    assert.ok(lines.some((item) => item.entry.scope === "server:state" && item.entry.message === "state.json 已写入" && item.entry.fields.profiles >= 1));
+
+    fs.writeFileSync(path.join(tempRoot, "terminal-log.md"), "- [ ] 任务\n", "utf8");
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: { title: "终端日志任务", directory: tempRoot, targetFileName: "terminal-log.md", sourceMode: "existing", runProfileIds: [profile.profile.id] },
+    });
+    const task = created.task;
+    await request(server, `/api/tasks/${task.id}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } });
+    await waitFor(() => lines.some((item) => item.entry.scope === "server:agent" && item.entry.fields.type === "process_exit"), { timeoutMs: 10000 });
+
+    assert.ok(lines.some((item) => item.entry.scope === "server:task" && item.entry.fields.taskId === task.id), "task events reach the terminal");
+    assert.ok(lines.some((item) => item.entry.scope === "server:agent" && item.entry.fields.type === "process_started" && item.entry.fields.taskId === task.id));
+    assert.ok(lines.some((item) => item.entry.scope === "server:agent" && item.entry.fields.stream === "stdout" && item.entry.message.includes("hello from agent")));
+    assert.ok(lines.some((item) => item.entry.scope === "server:agent" && item.entry.fields.stream === "stderr" && item.entry.message.includes("agent warning")));
+    assert.match(joined(), /\[server:agent\] .*exitCode=\d+/);
+
+    server.closeRunners();
+    assert.ok(lines.some((item) => item.entry.scope === "server" && item.entry.message.startsWith("正在关闭")));
+    assert.ok(scopes().every((scope) => scope.startsWith("server")));
+
+    // 默认级别（info）下 stdout/stderr 与 GET 轮询不再打印，但任务事件仍然可见。
+    const infoLines = [];
+    const quietServer = createApp({
+        rootDir: tempRoot,
+        dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-")),
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        logger: createTerminalLogger({ level: "info", writer: (line, entry) => infoLines.push(entry) }),
+    });
+    t.after(() => quietServer.closeRunners());
+    await request(quietServer, "/api/state");
+    assert.equal(infoLines.filter((entry) => entry.scope === "server:http").length, 0);
+    assert.ok(infoLines.some((entry) => entry.scope === "server" && entry.message === "服务初始化"));
+});
+
+test("server streams Claude stream-json events as readable log lines during a task run", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    // 命令名叫 claude 才会触发 stream-json 注入；PATH 中的 claude 垫片把参数转交给 node 执行脚本。
+    const fakeClaude = path.join(tempRoot, "claude.js");
+    fs.writeFileSync(fakeClaude, [
+        "const fs = require(\"node:fs\");",
+        "const args = process.argv.slice(2);",
+        "const formatIndex = args.indexOf(\"--output-format\");",
+        "if (args[formatIndex + 1] !== \"stream-json\" || !args.includes(\"--verbose\")) {",
+        "    console.error(\"missing stream-json flags: \" + args.join(\" \"));",
+        "    process.exit(2);",
+        "}",
+        "const prompt = args[args.indexOf(\"-p\") + 1] || \"\";",
+        "const token = (prompt.match(/任务\\+[0-9a-f-]{36}/) || [\"\"])[0];",
+        "const emit = (record) => process.stdout.write(JSON.stringify(record) + \"\\n\");",
+        "emit({ type: \"system\", subtype: \"init\", model: \"claude-test\", session_id: \"sess-1\", tools: [\"Bash\"] });",
+        "emit({ type: \"assistant\", message: { role: \"assistant\", content: [{ type: \"text\", text: \"读取任务文件\" }, { type: \"tool_use\", name: \"Read\", input: { file_path: process.env.AGENT_TASK_FILE } }] } });",
+        "emit({ type: \"user\", message: { role: \"user\", content: [{ type: \"tool_result\", content: \"file ok\" }] } });",
+        "fs.appendFileSync(process.env.AGENT_TASK_FILE, `\\n${token}：第一轮已完成\\n`, \"utf8\");",
+        "emit({ type: \"result\", subtype: \"success\", num_turns: 2, duration_ms: 42, total_cost_usd: 0.01, usage: { input_tokens: 12, output_tokens: 5 }, result: \"本轮结束\" });",
+    ].join("\n"), "utf8");
+    // 垫片必须用完整路径：Windows 解析器会优先在 node 所在目录寻找同名命令，那里可能装着真实的 claude。
+    const shimPath = path.join(tempRoot, process.platform === "win32" ? "claude.ps1" : "claude");
+    fs.writeFileSync(shimPath, process.platform === "win32"
+        ? `& ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeClaude)} @args\r\nexit $LASTEXITCODE\r\n`
+        : `#!/bin/sh\nexec "${process.execPath}" "${fakeClaude}" "$@"\n`, "utf8");
+    if (process.platform !== "win32") fs.chmodSync(shimPath, 0o755);
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: {
+            name: "claude-stream",
+            agentType: "claude",
+            command: shimPath,
+            args: "--dangerously-skip-permissions -p {prompt}",
+            enabled: true,
+        },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "stream-json 日志",
+            requirement: "实时查看 Claude 事件流",
+            targetFileName: "stream-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    const task = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "completed");
+    }, { timeoutMs: 5000 });
+    assert.match(task.lastCommand, /--verbose --output-format stream-json/);
+    assert.match(task.lastRunToken, /^任务\+/);
+    assert.match(task.lastOutput, /\[system\] init model=claude-test/);
+    assert.match(task.lastOutput, /\[tool_use\] Read/);
+    assert.match(task.lastOutput, /\[result\] success turns=2 .*tokens=in:12 out:5\n本轮结束/);
+    assert.doesNotMatch(task.lastOutput, /"type":"assistant"/, "raw JSON must not leak into the readable output");
+    assert.ok(new Date(task.nextRunAt).getTime() - Date.now() > 100000, "the next cycle waits at least two minutes");
+
+    const log = await request(server, `/api/tasks/${created.task.id}/log`);
+    const stdout = log.events.filter((event) => event.type === "stdout").map((event) => event.text).join("\n");
+    assert.match(stdout, /读取任务文件/);
+    assert.match(stdout, /\[tool_result\] file ok/);
+    assert.ok(log.events.some((event) => event.type === "run_token" && event.metadata.runToken === task.lastRunToken));
+    const completed = log.events.find((event) => event.type === "task_completed");
+    assert.equal(completed.metadata.runToken, task.lastRunToken);
+    assert.equal(completed.metadata.delayMs, 120000);
+
+    // 每轮统计：从 stream-json 的 result 事件取 usage，按 Fable 5.1 费率估算费用。
+    assert.equal(task.stats.cycles, 1);
+    assert.equal(task.stats.successes, 1);
+    assert.equal(task.stats.inputTokens, 12);
+    assert.equal(task.stats.outputTokens, 5);
+    assert.equal(task.stats.costUsd, (12 * 10 + 5 * 50) / 1e6);
+    assert.equal(task.stats.pricing.model, "claude-fable-5-1");
+    assert.equal(task.cycles.length, 1);
+    assert.equal(task.cycles[0].success, true);
+    assert.equal(task.cycles[0].reason, "run_token_written");
+    assert.equal(task.cycles[0].reportedCostUsd, 0.01);
+    assert.ok(task.cycles[0].startedAt && task.cycles[0].endedAt);
+    const cycleEvent = log.events.find((event) => event.type === "cycle_stats");
+    assert.equal(cycleEvent.metadata.cycle, 1);
+    assert.equal(cycleEvent.metadata.success, true);
+    assert.equal(cycleEvent.metadata.inputTokens, 12);
+});
+
+test("server treats a task file without the run token as a failed cycle and backs off exponentially", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const counterPath = path.join(tempRoot, "cycles.txt");
+    // 假 Agent 声称“任务完成”并改动任务文件，但从不写入本轮凭据：以前会被当成成功而每 10 秒重跑。
+    const script = writeAgentScript(tempRoot, "agent-no-token.js", [
+        `const count = fs.existsSync(${JSON.stringify(counterPath)}) ? Number(fs.readFileSync(${JSON.stringify(counterPath)}, "utf8")) + 1 : 1;`,
+        `fs.writeFileSync(${JSON.stringify(counterPath)}, String(count), "utf8");`,
+        "fs.appendFileSync(taskFilePath(), `\\n第 ${count} 轮改动\\n`, \"utf8\");",
+        "console.log(\"任务完成\");",
+        "console.log(\"GGGG全部完成GGGGGGGG全部完成GGGG\");",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 30, failureBackoffBaseMs: 30, failureBackoffMaxMs: 100, maxConsecutiveFailures: 3 },
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "no-token-agent", agentType: "codex", command: script.command, args: script.args, enabled: true },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "缺少凭据",
+            requirement: "输出不算数",
+            targetFileName: "no-token-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    const stopped = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "stopped");
+    }, { timeoutMs: 6000 });
+    assert.equal(fs.readFileSync(counterPath, "utf8"), "3", "the loop stops after the configured number of failed cycles");
+    assert.equal(stopped.nextRunAt, null);
+
+    const log = await request(server, `/api/tasks/${created.task.id}/log`);
+    assert.equal(log.events.some((event) => ["task_completed", "task_all_done"].includes(event.type)), false, "printed markers never count as success");
+    const retries = log.events.filter((event) => event.type === "retry_wait");
+    assert.deepEqual(retries.map((event) => event.metadata.reason), ["run_token_missing", "run_token_missing"]);
+    assert.deepEqual(retries.map((event) => event.metadata.delayMs), [30, 60], "each failure doubles the wait");
+    assert.deepEqual(retries.map((event) => event.metadata.failureStreak), [1, 2]);
+    const stopEvent = log.events.find((event) => event.type === "task_stopped");
+    assert.equal(stopEvent.metadata.reason, "stalled");
+    assert.equal(stopEvent.metadata.failureStreak, 3);
+    assert.equal(stopEvent.metadata.failureReason, "run_token_missing");
+    // 三轮都失败：非结构化输出解析不到 usage，费用记 0，平均间隔按相邻启动时刻计算。
+    assert.equal(stopped.stats.cycles, 3);
+    assert.equal(stopped.stats.successes, 0);
+    assert.equal(stopped.stats.failures, 3);
+    assert.equal(stopped.stats.costUsd, 0);
+    assert.ok(stopped.stats.averageIntervalMs >= 0);
+    assert.deepEqual(stopped.cycles.map((cycle) => cycle.reason), ["run_token_missing", "run_token_missing", "run_token_missing"]);
+    assert.ok(stopped.cycles.every((cycle) => cycle.usageFound === false));
+});
+
+test("server reports an unchanged task file as the failure reason and rate-limits manual restarts", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const script = writeAgentScript(tempRoot, "agent-untouched.js", [
+        "console.error(\"ERROR: currently experiencing high demand\");",
+        "process.exit(1);",
+    ].join("\n"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+        loopTiming: { minRunIntervalMs: 400, failureBackoffBaseMs: 400, failureBackoffMaxMs: 400, maxConsecutiveFailures: 2 },
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "untouched-agent", agentType: "codex", command: script.command, args: script.args, enabled: true },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "文件未变",
+            requirement: "限流",
+            targetFileName: "untouched-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    const waiting = await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "retry_wait");
+    });
+    assert.ok(new Date(waiting.nextRunAt).getTime() - Date.now() > 150, "the first failure already waits the minimum interval");
+    const firstLog = await request(server, `/api/tasks/${created.task.id}/log`);
+    assert.equal(firstLog.events.find((event) => event.type === "retry_wait").metadata.reason, "task_file_unchanged");
+
+    // 用户手动停止后立刻重启：距上次 Agent 结束不足最小间隔，必须先等待而不是立即再发请求。
+    await request(server, `/api/tasks/${created.task.id}/stop`, { method: "POST" });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === created.task.id && item.status === "stopped");
+    });
+    await request(server, `/api/tasks/${created.task.id}/start`, {
+        method: "POST",
+        body: { profileIds: [profile.profile.id] },
+    });
+    const throttled = await waitFor(async () => {
+        const log = await request(server, `/api/tasks/${created.task.id}/log`);
+        return log.events.find((event) => event.type === "rate_limit_wait") || null;
+    });
+    assert.ok(throttled.metadata.delayMs > 0 && throttled.metadata.delayMs <= 400);
+    assert.equal(throttled.metadata.minRunIntervalMs, 400);
+    const stateAfter = await request(server, "/api/state");
+    const throttledTask = stateAfter.tasks.find((item) => item.id === created.task.id);
+    assert.equal(throttledTask.status, "running");
+    assert.equal(throttledTask.runtimeState, RUNTIME_STATE.idleWaiting);
+});
+
+test("server updates task metadata in place and rejects busy, archived, or cross-directory edits", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-other-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+        fs.rmSync(otherRoot, { recursive: true, force: true });
+    });
+    await request(server, "/api/directories", { method: "POST", body: { directory: otherRoot } });
+    const script = writeAgentScript(tempRoot, "agent-edit.js", "await sleep(1500); markTaskFileAllDone();");
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "edit-agent", agentType: "codex", command: script.command, args: script.args, enabled: true },
+    });
+    const secondProfile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "edit-agent-2", agentType: "claude", command: script.command, args: script.args, enabled: true },
+    });
+    const otherProject = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "其他目录项目", directory: otherRoot },
+    });
+    const unboundProject = await request(server, "/api/projects", {
+        method: "POST",
+        body: { name: "不绑定目录" },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "原标题",
+            requirement: "原需求",
+            targetFileName: "edit-task.md",
+            directory: tempRoot,
+            sourceMode: "agent",
+            decomposeProfileId: profile.profile.id,
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    const taskId = created.task.id;
+    const placeholder = fs.readFileSync(created.task.filePath, "utf8");
+    assert.match(placeholder, /原标题/);
+
+    // 空请求：无改动，不产生事件。
+    const noop = await request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: {} });
+    assert.deepEqual(noop.changed, []);
+
+    const updated = await request(server, `/api/tasks/${taskId}`, {
+        method: "PATCH",
+        body: {
+            title: "新标题",
+            requirement: "新需求",
+            runProfileIds: [secondProfile.profile.id, profile.profile.id],
+            projectId: unboundProject.project.id,
+            targetFileName: "should-be-ignored.md",
+            directory: otherRoot,
+        },
+    });
+    assert.deepEqual(updated.changed, ["title", "requirement", "projectId", "runProfileIds"]);
+    assert.equal(updated.task.title, "新标题");
+    assert.equal(updated.task.requirement, "新需求");
+    assert.equal(updated.task.targetFileName, "edit-task.md", "the target file is locked after creation");
+    assert.equal(updated.task.directory, tempRoot, "the working directory is locked after creation");
+    assert.equal(updated.task.projectId, unboundProject.project.id);
+    assert.deepEqual(updated.task.runProfileIds, [secondProfile.profile.id, profile.profile.id]);
+    assert.equal(updated.task.runProfileId, secondProfile.profile.id);
+    assert.equal(updated.placeholderRewritten, true, "an untouched placeholder file follows the new title");
+    const rewritten = fs.readFileSync(created.task.filePath, "utf8");
+    assert.match(rewritten, /新标题/);
+    assert.match(rewritten, /新需求/);
+    assert.doesNotMatch(rewritten, /原标题/);
+
+    const log = await request(server, `/api/tasks/${taskId}/log`);
+    const updateEvent = log.events.find((event) => event.type === "task_updated");
+    assert.deepEqual(updateEvent.metadata.changed, ["title", "requirement", "projectId", "runProfileIds"]);
+
+    // 用户手动编辑过目标文件后，再改标题不能覆盖文件。
+    fs.writeFileSync(created.task.filePath, "# 手工内容\n", "utf8");
+    const afterManual = await request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { title: "第三个标题" } });
+    assert.equal(afterManual.placeholderRewritten, false);
+    assert.equal(fs.readFileSync(created.task.filePath, "utf8"), "# 手工内容\n");
+
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { title: "   " } }), /标题不能为空/);
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { projectId: otherProject.project.id } }), /其他工作目录/);
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { projectId: "missing" } }), /有效项目/);
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { runProfileIds: ["missing-profile"] } }), /执行 Profile/);
+    await assert.rejects(request(server, `/api/tasks/missing`, { method: "PATCH", body: { title: "x" } }), /任务不存在/);
+
+    // 运行中的任务拒绝编辑。
+    await request(server, `/api/tasks/${taskId}/start`, { method: "POST", body: { profileIds: [profile.profile.id] } });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        return state.tasks.find((item) => item.id === taskId && item.status === "running");
+    });
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { title: "运行中改名" } }), /正在运行/);
+    await request(server, `/api/tasks/${taskId}/stop`, { method: "POST" });
+    await waitFor(async () => {
+        const state = await request(server, "/api/state");
+        const task = state.tasks.find((item) => item.id === taskId);
+        return task && !task.isRunning && task.status === "stopped" ? task : null;
+    }, { timeoutMs: 5000 });
+
+    // 归档后只读。
+    await request(server, `/api/tasks/${taskId}/archive`, { method: "POST" });
+    await assert.rejects(request(server, `/api/tasks/${taskId}`, { method: "PATCH", body: { title: "归档改名" } }), /只读/);
+    const finalState = await request(server, "/api/state");
+    assert.equal(finalState.tasks.find((item) => item.id === taskId).title, "第三个标题");
+});
+
+test("server updates media task settings within the working directory", async (t) => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-root-"));
+    const tempData = fs.mkdtempSync(path.join(os.tmpdir(), "claude-loop-data-"));
+    const server = createApp({
+        rootDir: tempRoot,
+        dataDir: tempData,
+        publicDir: path.join(__dirname, "..", "public"),
+        disablePingScheduler: true,
+    });
+    t.after(() => {
+        server.closeRunners();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+        fs.rmSync(tempData, { recursive: true, force: true });
+    });
+    const script = writeAgentScript(tempRoot, "agent-media-edit.js", "console.log('noop');");
+    const profile = await request(server, "/api/profiles", {
+        method: "POST",
+        body: { name: "video-agent", agentType: "custom", command: script.command, args: script.args, outputModalities: ["video"], enabled: true },
+    });
+    const created = await request(server, "/api/tasks", {
+        method: "POST",
+        body: {
+            title: "视频任务",
+            requirement: "生成视频",
+            targetFileName: "video-task.md",
+            directory: tempRoot,
+            sourceMode: "template",
+            taskType: "video",
+            runProfileIds: [profile.profile.id],
+        },
+    });
+    const updated = await request(server, `/api/tasks/${created.task.id}`, {
+        method: "PATCH",
+        body: {
+            artifactDirectoryName: "renders/final",
+            outputFileName: "clip",
+            outputFormat: "webm",
+            aspectRatio: "16:9",
+            resolution: "1920x1080",
+            durationSeconds: "12",
+            referenceFiles: "assets/a.png\nassets/a.png\n\nassets/b.png",
+        },
+    });
+    assert.deepEqual(updated.changed, ["artifactDirectoryName", "output", "aspectRatio", "resolution", "durationSeconds", "referenceFiles"]);
+    assert.equal(updated.task.artifactDirectoryName, path.join("renders", "final"));
+    assert.equal(updated.task.artifactDirectory, path.join(tempRoot, "renders", "final"));
+    assert.equal(updated.task.outputFileName, "clip.webm");
+    assert.equal(updated.task.outputFormat, "webm");
+    assert.equal(updated.task.aspectRatio, "16:9");
+    assert.equal(updated.task.resolution, "1920x1080");
+    assert.equal(updated.task.durationSeconds, 12);
+    assert.deepEqual(updated.task.referenceFiles, [path.join("assets", "a.png"), path.join("assets", "b.png")]);
+    await assert.rejects(request(server, `/api/tasks/${created.task.id}`, { method: "PATCH", body: { artifactDirectoryName: "../outside" } }), /工作目录内/);
+    await assert.rejects(request(server, `/api/tasks/${created.task.id}`, { method: "PATCH", body: { referenceFiles: "../secret.png" } }), /工作目录内/);
 });
