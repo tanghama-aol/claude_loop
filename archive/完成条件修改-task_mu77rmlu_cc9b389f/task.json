@@ -1,0 +1,20 @@
+{
+  "id": "task_mu77rmlu_cc9b389f",
+  "projectId": "project_mu77q3zu_828f8024",
+  "title": "完成条件修改",
+  "requirement": "",
+  "status": "all_done",
+  "targetFileName": "task_list_1.md",
+  "workingDirectory": "D:\\dev\\git\\claude_loop_on_github\\claude_loop",
+  "originalFilePath": "D:\\dev\\git\\claude_loop_on_github\\claude_loop\\task_list_1.md",
+  "archivedFilePath": "D:\\dev\\git\\claude_loop_on_github\\claude_loop\\archive\\完成条件修改-task_mu77rmlu_cc9b389f\\task_list_1.md",
+  "logFiles": [
+    "logs/task_mu77rmlu_cc9b389f-1789751389747-完成条件修改.log",
+    "logs/task_mu77rmlu_cc9b389f-1789751389747-完成条件修改.events.jsonl",
+    "logs/task_mu77rmlu_cc9b389f.run_mu77sev5_c8f297f5.log",
+    "logs/task_mu77rmlu_cc9b389f.run_mu77sev5_c8f297f5.events.jsonl",
+    "logs/task_mu77rmlu_cc9b389f.run_mu7pohzi_3c5ce9d8.log",
+    "logs/task_mu77rmlu_cc9b389f.run_mu7pohzi_3c5ce9d8.events.jsonl"
+  ],
+  "archivedAt": "2026-09-19T09:16:34.438Z"
+}
